@@ -138,6 +138,20 @@ def upload(
     )
 
 
+@app.command()
+def web(
+    host: str = typer.Option("127.0.0.1", "--host", help="监听地址(本地工具, 默认仅回环)"),
+    port: int = typer.Option(8099, "--port", "-p", help="端口"),
+) -> None:
+    """启动 Web 操作台(选题/生成进度/作品库/元数据编辑/上传)。"""
+    import uvicorn
+
+    from .web import create_app
+
+    console.print(f"[bold green]Web 操作台[/] → http://{host}:{port}")
+    uvicorn.run(create_app(load_settings()), host=host, port=port, log_level="warning")
+
+
 def main() -> None:
     """console_scripts 入口(ivb = interview_video.cli:main)。"""
     app()

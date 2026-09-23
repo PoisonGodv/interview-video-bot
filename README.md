@@ -66,6 +66,23 @@ ivb upload output/demo --yes
 生成完成后会 rich 打印产物路径(final.mp4 / cover.png / subtitles.srt)与 BiliMeta
 (标题/标签); 若 `BILI_UPLOAD_ENABLED=true`, 会询问确认后上传(`--yes` 跳过)。
 
+## Web 操作台
+
+```bash
+ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
+```
+
+单页操作台(FastAPI + 原生 JS, 无构建步骤), 三段式:
+
+1. **选题**: 输入行业 → 生成选题清单(LLM), 点击选题自动填入生成框;
+2. **生成视频**: 选 TTS 通道(edge-tts 免费 / 豆包火山)与音色 → 开始生成,
+   8 个节点进度实时可见(选题→配音→渲染→合成→字幕→合成→元数据→落盘);
+   生成单飞(同时只跑一个任务, 避免 TTS 限流), 并发提交返回 409;
+3. **作品库**: 封面墙 → 详情里可播放成片、编辑 B站标题/简介/标签(写回 project.json)、
+   一键上传(未配 cookie 三件套会返回指引)。
+
+> 本地工具, 默认只绑 127.0.0.1; 上传成功后 bvid 记录在项目目录 upload.json。
+
 ## .env 说明
 
 环境变量名与字段名大写一致, **可复用 drivecast 的 `.env`**(同一套 OpenAI 兼容配置):
@@ -137,6 +154,7 @@ output/<slug>-<时间戳>/
 
 ## 路线图
 
+- ~~Web 操作台~~(已落地: `ivb web`)
 - 双音色对话(面试官/求职者交替配音, 更强代入感)
 - 真人数字人形象(替代 HTML 画面帧)
 - 自动定时发布(接 B站 delay_time / cron 定点投递)

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>面试充电站 · 操作台</title>
+<style>
+  :root { --bg:#0f172a; --bg2:#1e293b; --card:#16213a; --line:#334155;
+          --accent:#38bdf8; --text:#e2e8f0; --dim:#94a3b8; --ok:#34d399; --err:#f87171; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: linear-gradient(135deg, var(--bg), var(--bg2)); color: var(--text);
+         font-family: "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+         min-height: 100vh; padding: 24px; }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
+  header h1 { font-size: 22px; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.warn { color: #fbbf24; border-color: #fbbf24; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+          padding: 18px 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 16px; margin-bottom: 14px; color: var(--accent); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  input, select, textarea { background: #0b1226; color: var(--text); border: 1px solid var(--line);
+          border-radius: 8px; padding: 8px 12px; font-size: 14px; font-family: inherit; }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+  button { background: var(--accent); color: #082f49; border: none; border-radius: 8px;
+           padding: 8px 18px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .topic { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px;
+           margin-top: 8px; cursor: pointer; }
+  .topic:hover { border-color: var(--accent); }
+  .topic b { color: var(--accent); }
+  .topic p { color: var(--dim); font-size: 13px; margin-top: 4px; }
+  .stages { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+  .stage { font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); color: var(--dim); }
+  .stage.active { border-color: var(--accent); color: var(--accent); animation: pulse 1s infinite alternate; }
+  .stage.done { border-color: var(--ok); color: var(--ok); }
+  @keyframes pulse { to { background: rgba(56,189,248,.15); } }
+  .proj { display: flex; gap: 14px; padding: 12px 0; border-top: 1px solid var(--line); }
+  .proj img { width: 200px; border-radius: 8px; flex-shrink: 0; }
+  .proj .meta { flex: 1; min-width: 0; }
+  .proj h3 { font-size: 15px; margin-bottom: 6px; }
+  .proj .sub { color: var(--dim); font-size: 12px; }
+  .detail { margin-top: 10px; display: none; }
+  .detail.open { display: block; }
+  video { width: 100%; max-width: 640px; border-radius: 10px; background: #000; }
+  textarea { width: 100%; min-height: 110px; }
+  .w100 { width: 100%; }
+  .msg { font-size: 13px; margin-top: 8px; }
+  .msg.err { color: var(--err); } .msg.ok { color: var(--ok); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="brand">面试充电站 · 操作台</h1>
+    <span class="badge" id="badge-llm">LLM …</span>
+    <span class="badge" id="badge-tts">TTS …</span>
+    <span class="badge" id="badge-upload">上传 …</span>
+  </header>
+
+  <div class="card">
+    <h2>① 选题</h2>
+    <div class="row">
+      <input id="industry" value="互联网" placeholder="行业, 如 护理/汽修/教师">
+      <input id="topic-n" type="number" value="8" min="1" max="20" style="width:70px">
+      <button id="btn-topics">生成选题</button>
+      <span class="msg" id="topics-msg"></span>
+    </div>
+    <div id="topics"></div>
+  </div>
+
+  <div class="card">
+    <h2>② 生成视频</h2>
+    <div class="row">
+      <input id="topic-title" placeholder="选题标题(点上面选题自动填入, 也可手填)" class="w100">
+    </div>
+    <div class="row" style="margin-top:10px">
+      <select id="provider"></select>
+      <select id="voice"></select>
+      <label class="msg"><input type="checkbox" id="use-sample"> 用示例脚本(免 LLM 冒烟)</label>
+      <button id="btn-gen">开始生成</button>
+    </div>
+    <div class="stages" id="stages" style="display:none"></div>
+    <div class="msg" id="gen-msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>③ 作品库 <button class="ghost" id="btn-refresh" style="float:right">刷新</button></h2>
+    <div id="projects"><p class="msg">加载中…</p></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let voices = {}, pollTimer = null;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts.method ? {
+    headers: {"Content-Type": "application/json"}, ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  } : opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+  return data;
+}
+const msg = (id, text, cls = "") => { const el = $(id); el.textContent = text; el.className = "msg " + cls; };
+
+async function init() {
+  const s = await api("/api/settings");
+  $("brand").textContent = s.brand + " · 操作台";
+  const b = (id, ok, okText, noText) => {
+    const el = $(id); el.textContent = ok ? okText : noText; el.className = "badge " + (ok ? "ok" : "warn");
+  };
+  b("badge-llm", s.llm_configured, "LLM 已配置", "LLM 未配置");
+  b("badge-tts", s.tts_provider !== "doubao" || s.doubao_configured,
+    "TTS: " + s.tts_provider, "豆包缺凭证");
+  b("badge-upload", s.upload_enabled, "B站上传已开启", "上传未开启");
+  voices = s.voices;
+  $("provider").innerHTML = Object.keys(voices).map(p =>
+    `<option value="${p}" ${p === s.tts_provider ? "selected" : ""}>${p === "edge" ? "edge-tts(免费)" : "豆包(火山)"}</option>`).join("");
+  fillVoices();
+  $("provider").onchange = fillVoices;
+  loadProjects();
+}
+function fillVoices() {
+  const p = $("provider").value;
+  $("voice").innerHTML = (voices[p] || []).map(v => `<option value="${v.id}">${v.name}</option>`).join("");
+}
+
+$("btn-topics").onclick = async () => {
+  msg("topics-msg", "生成中…"); $("btn-topics").disabled = true;
+  try {
+    const d = await api("/api/topics", {method: "POST",
+      body: {industry: $("industry").value, n: +$("topic-n").value}});
+    $("topics").innerHTML = d.topics.map(t =>
+      `<div class="topic" data-t="${t.title}"><b>${t.title}</b><p>${t.hook || ""}</p></div>`).join("");
+    document.querySelectorAll(".topic").forEach(el =>
+      el.onclick = () => { $("topic-title").value = el.dataset.t; });
+    msg("topics-msg", `${d.topics.length} 条选题, 点击填入生成框`, "ok");
+  } catch (e) { msg("topics-msg", e.message, "err"); }
+  $("btn-topics").disabled = false;
+};
+
+$("btn-gen").onclick = async () => {
+  msg("gen-msg", ""); $("btn-gen").disabled = true;
+  try {
+    const d = await api("/api/jobs", {method: "POST", body: {
+      industry: $("industry").value, topic_title: $("topic-title").value || null,
+      provider: $("provider").value, voice: $("voice").value,
+      use_sample_script: $("use-sample").checked,
+    }});
+    pollJob(d.job_id);
+  } catch (e) { msg("gen-msg", e.message, "err"); $("btn-gen").disabled = false; }
+};
+
+async function pollJob(id) {
+  $("stages").style.display = "flex";
+  clearInterval(pollTimer);
+  const tick = async () => {
+    try {
+      const j = await api("/api/jobs/" + id);
+      $("stages").innerHTML = j.stages.map(s =>
+        `<span class="stage ${s.done ? "done" : s.active ? "active" : ""}">${s.done ? "✓ " : ""}${s.label}</span>`).join("");
+      if (j.status === "done") {
+        clearInterval(pollTimer);
+        msg("gen-msg", `✅ 完成 → ${j.project}`, "ok");
+        $("btn-gen").disabled = false; loadProjects();
+      } else if (j.status === "failed") {
+        clearInterval(pollTimer);
+        msg("gen-msg", "❌ " + (j.error || "失败"), "err");
+        $("btn-gen").disabled = false;
+      }
+    } catch (e) { /* 轮询失败忽略, 下个周期重试 */ }
+  };
+  await tick();
+  pollTimer = setInterval(tick, 1500);
+}
+
+async function loadProjects() {
+  try {
+    const d = await api("/api/projects");
+    if (!d.projects.length) { $("projects").innerHTML = '<p class="msg">暂无作品</p>'; return; }
+    $("projects").innerHTML = d.projects.map(p => `
+      <div class="proj">
+        <img src="${p.cover_url}" loading="lazy">
+        <div class="meta">
+          <h3>${p.title}</h3>
+          <div class="sub">${p.name} · ${p.duration}s · ${p.industry || ""}
+            ${p.bvid ? ` · <a href="https://www.bilibili.com/video/${p.bvid}" target="_blank">${p.bvid}</a>` : ""}</div>
+          <div class="row" style="margin-top:8px">
+            <button class="ghost" onclick="toggleDetail('${p.name}')">详情/编辑</button>
+            <button class="ghost" onclick="upload('${p.name}', this)">上传到B站</button>
+          </div>
+          <div class="detail" id="d-${p.name}"></div>
+        </div>
+      </div>`).join("");
+  } catch (e) { $("projects").innerHTML = `<p class="msg err">${e.message}</p>`; }
+}
+
+async function toggleDetail(name) {
+  const el = $("d-" + name);
+  if (el.classList.contains("open")) { el.classList.remove("open"); return; }
+  const p = await api("/api/projects/" + name);
+  const m = p.meta || {title: "", desc: "", tags: []};
+  el.innerHTML = `
+    <video controls src="${p.video_url}"></video>
+    <div style="margin-top:10px"><label class="sub">B站标题</label>
+      <input class="w100" id="t-${name}" value="${(m.title || "").replace(/"/g, "&quot;")}"></div>
+    <div style="margin-top:8px"><label class="sub">简介</label>
+      <textarea id="desc-${name}">${m.desc || ""}</textarea></div>
+    <div style="margin-top:8px"><label class="sub">标签(逗号分隔)</label>
+      <input class="w100" id="tags-${name}" value="${(m.tags || []).join(",")}"></div>
+    <div class="row" style="margin-top:8px">
+      <button onclick="saveMeta('${name}', this)">保存元数据</button>
+      <span class="msg" id="m-${name}"></span></div>`;
+  el.classList.add("open");
+}
+
+async function saveMeta(name, btn) {
+  btn.disabled = true;
+  try {
+    await api(`/api/projects/${name}/meta`, {method: "PUT", body: {
+      title: $("t-" + name).value,
+      desc: $("desc-" + name).value,
+      tags: $("tags-" + name).value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
+    }});
+    msg("m-" + name, "已保存", "ok");
+  } catch (e) { msg("m-" + name, e.message, "err"); }
+  btn.disabled = false;
+}
+
+async function upload(name, btn) {
+  if (!confirm(`确认把 ${name} 上传到B站?\n发布后请到创作中心补勾"AI生成"标识。`)) return;
+  btn.disabled = true;
+  try {
+    const d = await api(`/api/projects/${name}/upload`, {method: "POST"});
+    alert("上传成功: " + d.url);
+    loadProjects();
+  } catch (e) { alert("上传失败: " + e.message); }
+  btn.disabled = false;
+}
+
+$("btn-refresh").onclick = loadProjects;
+init();
+</script>
+</body>
+</html>
