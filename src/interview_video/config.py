@@ -20,8 +20,22 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
 
     # ---- TTS ----
+    tts_provider: str = "edge"  # edge(免费,词级时间轴) | doubao(火山引擎,估算时间轴)
     tts_voice: str = "zh-CN-YunxiNeural"
     tts_rate: str = "+6%"
+
+    # ---- 豆包 TTS(TTS_PROVIDER=doubao 时生效, seed-tts-2.0 HTTP 单向流式) ----
+    tts_doubao_api_key: SecretStr | None = None   # 新版控制台一个 key 即可
+    tts_doubao_app_key: str | None = None          # 旧版控制台退回 App ID + Access Key 一对
+    tts_doubao_access_key: str | None = None
+    tts_doubao_http_url: str = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+    tts_doubao_resource_id: str = "seed-tts-2.0"   # 2.0 音色配 seed-tts-2.0, 1.0 音色配 seed-tts-1.0
+    tts_doubao_uid: str = "interview-video-bot"
+    tts_doubao_format: str = "mp3"
+    tts_doubao_sample_rate: int = 24000
+    tts_doubao_voice: str = "zh_male_m191_uranus_bigtts"  # 云舟(男); 女声 zh_female_vv_uranus_bigtts
+    tts_doubao_rate: int = 0                              # speech_rate, [-50,100], 0 为原速
+    tts_doubao_recv_timeout: int = 30                     # 流式单次读超时(秒)
 
     # ---- 内容 ----
     brand: str = "面试充电站"

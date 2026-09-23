@@ -1,12 +1,18 @@
-"""TTS 配音模块(edge-tts)。
+"""TTS 配音模块(edge-tts / 火山豆包双通道)。
 
-数据流: 每场景 narration → mp3 + 词级时间轴(WordBoundary, 100ns ticks)
-→ merge_word_cues 合并成字幕条 → SceneMedia.cues(相对场景起点)。
-全局时间轴由 offset_cues 按 SceneMedia.duration 累加平移得到。
+数据流: 每场景 narration → mp3 + 字幕条 cues(相对场景起点)
+→ 全局时间轴由 offset_cues 按 SceneMedia.duration 累加平移得到。
+
+时间轴来源按通道不同:
+- edge:   stream() 的 WordBoundary chunk(词级, 100ns ticks) → merge_word_cues;
+- doubao: seed-tts-2.0 单向流式不返回时间戳 → 按字数/标点权重把音频总时长
+          比例分配到各字幕条(estimate_cues), 中文 TTS 语速均匀, 实测偏差可接受。
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 from pathlib import Path
 
 import edge_tts
@@ -26,6 +32,171 @@ _RETRY_BASE_DELAY = 1.0
 
 # 兜底时长: 最后 cue 结束后再留的余量(秒), 避免画面切太早
 _TAIL_PAD = 0.4
+
+
+# ---------------------------------------------------------------------------
+# 豆包(火山引擎)通道: seed-tts-2.0 · HTTP 单向流式
+# 接口: POST /api/v3/tts/unidirectional, NDJSON 逐行 {code, data(base64)},
+# code=20000000 结束。协议与 drivecast drivecast/tts/doubao.py 一致。
+# ---------------------------------------------------------------------------
+
+_DOUBAO_STATUS_OK = 20000000
+# 句读标点折算的停顿权重(单位: 字数), 用于估算时间轴
+_PAUSE_WEIGHT = 1.5
+
+
+class DoubaoTTSError(RuntimeError):
+    """豆包 TTS 远端/协议错误, message 已含错误码与官方 message。"""
+
+
+def _require_doubao_credentials(settings: Settings) -> None:
+    if settings.tts_doubao_api_key:
+        return
+    if settings.tts_doubao_app_key and settings.tts_doubao_access_key:
+        return
+    raise RuntimeError(
+        "豆包 TTS 缺少凭证: TTS_DOUBAO_API_KEY(新版控制台,推荐,一个 key 即可)"
+        "或 TTS_DOUBAO_APP_KEY+TTS_DOUBAO_ACCESS_KEY(旧版);写入 .env"
+    )
+
+
+def _doubao_headers(settings: Settings) -> dict[str, str]:
+    headers = {
+        "Content-Type": "application/json",
+        "X-Api-Resource-Id": settings.tts_doubao_resource_id,
+    }
+    if settings.tts_doubao_api_key:
+        headers["X-Api-Key"] = settings.tts_doubao_api_key.get_secret_value()
+    else:
+        headers["X-Api-App-Id"] = settings.tts_doubao_app_key or ""
+        headers["X-Api-App-Key"] = settings.tts_doubao_app_key or ""  # 两版文档头名不一, 都带上
+        headers["X-Api-Access-Key"] = settings.tts_doubao_access_key or ""
+    return headers
+
+
+def _doubao_payload(text: str, settings: Settings) -> dict:
+    return {
+        "user": {"uid": settings.tts_doubao_uid},
+        "req_params": {
+            "text": text,
+            "speaker": settings.tts_doubao_voice,
+            "audio_params": {
+                "format": settings.tts_doubao_format,
+                "sample_rate": settings.tts_doubao_sample_rate,
+                "speech_rate": max(-50, min(100, settings.tts_doubao_rate)),
+            },
+        },
+    }
+
+
+def parse_ndjson_line(line: str) -> dict:
+    """一行 NDJSON → dict; 坏行抛错(流协议, 吞掉会静默丢音频)。"""
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise DoubaoTTSError(f"NDJSON 坏行: {line[:200]}") from exc
+
+
+async def _doubao_audio_bytes(text: str, settings: Settings) -> bytes:
+    """POST 全文 → 流式收 NDJSON → 拼 base64 音频块。"""
+    import httpx
+
+    audio = bytearray()
+    timeout = httpx.Timeout(10.0, read=settings.tts_doubao_recv_timeout)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            settings.tts_doubao_http_url,
+            headers=_doubao_headers(settings),
+            json=_doubao_payload(text, settings),
+        ) as resp:
+            if resp.status_code != 200:
+                body = (await resp.aread()).decode("utf-8", "ignore")
+                raise DoubaoTTSError(f"HTTP {resp.status_code}: {body[:300]}")
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                item = parse_ndjson_line(line)
+                code = item.get("code")
+                if code == _DOUBAO_STATUS_OK:
+                    break  # 合成结束
+                if code not in (0, None):
+                    raise DoubaoTTSError(f"status={code} {item.get('message', '')}")
+                data = item.get("data")
+                if data:
+                    try:
+                        audio += base64.b64decode(data)
+                    except (ValueError, TypeError) as exc:
+                        raise DoubaoTTSError("音频块 base64 解码失败") from exc
+    if not audio:
+        raise DoubaoTTSError("豆包 TTS 产物为空")
+    return bytes(audio)
+
+
+def _split_subtitle_units(text: str, max_chars: int = 16) -> list[str]:
+    """文本 → 字幕条文本单元: 句读标点处断(标点随前句), 超长再按 max_chars 硬断。"""
+    text = text.strip()
+    if not text:
+        return []
+    sentences: list[str] = []
+    buf = ""
+    for ch in text:
+        buf += ch
+        if ch in _SENTENCE_END_PUNCT:
+            sentences.append(buf)
+            buf = ""
+    if buf:
+        sentences.append(buf)
+    units: list[str] = []
+    for s in sentences:
+        while len(s) > max_chars:
+            units.append(s[:max_chars])
+            s = s[max_chars:]
+        if s:
+            units.append(s)
+    return units
+
+
+def estimate_cues(text: str, total_duration: float, max_chars: int = 16) -> list[Cue]:
+    """按字数+标点停顿权重, 把音频总时长比例分配到各字幕条(豆包无时间戳用)。
+
+    权重 = 字数 + 句读标点数 * _PAUSE_WEIGHT; 最后一条 end 精确对齐 total_duration。
+    """
+    units = _split_subtitle_units(text, max_chars)
+    if not units or total_duration <= 0:
+        return []
+    weights = [
+        len(u) + _PAUSE_WEIGHT * sum(1 for ch in u if ch in _SENTENCE_END_PUNCT)
+        for u in units
+    ]
+    total_w = sum(weights)
+    cues: list[Cue] = []
+    t = 0.0
+    for u, w in zip(units, weights):
+        dur = total_duration * w / total_w
+        cues.append(Cue(start=round(t, 3), end=round(t + dur, 3), text=u))
+        t += dur
+    cues[-1].end = round(total_duration, 3)  # 消除浮点累计误差
+    return cues
+
+
+async def synthesize_text_doubao(
+    text: str, mp3_path: Path, settings: Settings
+) -> list[Cue]:
+    """豆包通道合成单段文本: 写 mp3, 返回估算时间轴的字幕条 cues。"""
+    _require_doubao_credentials(settings)
+    audio = await _doubao_audio_bytes(text, settings)
+    mp3_path.parent.mkdir(parents=True, exist_ok=True)
+    mp3_path.write_bytes(audio)
+    from .assemble import ffprobe_duration  # 延迟导入, 避免模块级耦合
+
+    return estimate_cues(text, ffprobe_duration(mp3_path))
+
+
+# ---------------------------------------------------------------------------
+# edge-tts 通道(默认)
+# ---------------------------------------------------------------------------
 
 
 async def synthesize_text(
@@ -143,6 +314,8 @@ async def _synthesize_with_retry(
     last_err: Exception | None = None
     for attempt in range(_MAX_ATTEMPTS):
         try:
+            if settings.tts_provider == "doubao":
+                return await synthesize_text_doubao(text, mp3_path, settings)
             return await synthesize_text(
                 text, mp3_path, settings.tts_voice, settings.tts_rate
             )

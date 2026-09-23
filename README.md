@@ -8,7 +8,7 @@ AI 面试求职短视频流水线: 给一条行业(如「互联网」「护理�
 
 ```
 industry ──chains/topic.py──▶ Topic ──chains/script.py──▶ Script(scenes[])
-Script ──tts.py(edge-tts)──▶ 每场景 mp3 + 词级 cues
+Script ──tts.py(edge-tts / 火山豆包双通道)──▶ 每场景 mp3 + cues(edge=词级时间轴, doubao=估算时间轴)
 Script ──render.py(Jinja2+Playwright)──▶ cover.png + scene_XXX.png (1920x1080)
         ──assemble.py(build_scene_clips)──▶ 每场景 mp4(ffprobe 回填精确时长)
 全局cues(tts.offset_cues)──subtitle_bars.py(Pillow)──▶ 每 cue 一张 1920x1080 透明字幕条 PNG
@@ -77,8 +77,12 @@ LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
 
 # TTS / 内容 / 视频(均有默认值, 可省略)
+TTS_PROVIDER=edge          # edge(免费) | doubao(火山引擎豆包 seed-tts-2.0)
 TTS_VOICE=zh-CN-YunxiNeural
 TTS_RATE=+6%
+# doubao 通道凭证(TTS_PROVIDER=doubao 时必填, 火山引擎控制台→豆包语音→API Key):
+# TTS_DOUBAO_API_KEY=
+# TTS_DOUBAO_VOICE=zh_male_m191_uranus_bigtts   # 女声: zh_female_vv_uranus_bigtts
 BRAND=面试充电站
 TARGET_DURATION_SEC=100
 

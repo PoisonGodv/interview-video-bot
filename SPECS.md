@@ -216,3 +216,4 @@ AI 内容合规标注提示、目录结构、测试(含 --run-integration)、路
 - graph 节点对同步阻塞调用(playwright 截图/ffmpeg/Pillow)一律 `asyncio.to_thread`; render 节点负责把 frames 回填 `SceneMedia.png`
 - edge-tts 需显式 `boundary="WordBoundary"`(默认 SentenceBoundary); 本机无 PingFang.ttc, 字幕字体落到 STHeiti/Hiragino
 - 端到端已验证: script-file 冒烟 25.8s + 真实 LLM(护理行业) 96.7s 成片, BiliMeta 真实生成
+- TTS 双通道(2026-09-23 增补): `tts_provider=edge|doubao`; 豆包走 seed-tts-2.0 单向流式(协议同 drivecast), 无词级时间戳 → `estimate_cues` 按字数+标点权重把 ffprobe 总时长比例分配; edge 仍为默认(时间轴精确)。doubao 凭证走 TTS_DOUBAO_API_KEY
