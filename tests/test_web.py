@@ -174,3 +174,57 @@ def test_meta_edit_and_upload_guard(portal_app, monkeypatch):
 
 def test_project_name_traversal_blocked(client):
     assert client.get("/api/projects/..%2F..%2Fetc").status_code in (400, 404)
+
+
+# ---------- 系列模式 ----------
+
+def test_series_job(portal_app, monkeypatch, settings):
+    """系列任务: 假多 agent 生成 2 集 → 每集各跑一次假流水线 → 分集目录落盘。"""
+    from interview_video.models import EpisodeOutline, EpisodePlan, Scene, Script
+    from interview_video.chains.series import ChapterSpec
+    from interview_video.models import SeriesPlan
+
+    plan = SeriesPlan(
+        theme="程序员面试", title="通关", synopsis="s",
+        episodes=[EpisodePlan(index=1, title="第一集"),
+                  EpisodePlan(index=2, title="第二集")],
+    )
+
+    async def fake_generate_series(settings, theme, episodes, episode_sec, on_event=None):
+        scripts = []
+        for i, ep in enumerate(plan.episodes):
+            outline = EpisodeOutline(episode_index=ep.index, title=ep.title,
+                                     chapters=[ChapterSpec(title="c", est_sec=150)])
+            if on_event:
+                on_event("outline_done", ep_idx=i, outline=outline)
+                on_event("chapter_done", ep_idx=i, ch_idx=0, ch_total=1, draft=None)
+            script = Script(title=ep.title, scenes=[Scene(header="开场", narration="你好。")])
+            if on_event:
+                on_event("script_done", ep_idx=i, script=script)
+            scripts.append(script)
+        return plan, scripts
+
+    async def fake_execute(settings_, out_dir, industry, topic_title, script_file,
+                           on_stage, script=None):
+        assert script is not None, "系列模式应预制脚本直通"
+        return _write_manifest(out_dir, settings_, industry)
+
+    monkeypatch.setattr("interview_video.series.generate_series", fake_generate_series)
+    monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        r = client.post("/api/jobs", json={
+            "mode": "series", "theme": "程序员面试", "episodes": 2, "duration_min": 10,
+        })
+        assert r.status_code == 202
+        _drive(client, scheduled)
+        job = _wait_job(client, r.json()["job_id"])
+        assert job["status"] == "done", job["error"]
+        assert job["series"]["episode"] == 2
+        root = settings.out_root.resolve() / job["project"]
+        assert (root / "series.json").exists()
+        eps = [d for d in root.iterdir() if d.is_dir() and (d / "project.json").exists()]
+        assert len(eps) == 2
+        # 分集出现在作品库
+        names = [p["name"] for p in client.get("/api/projects").json()["projects"]]
+        assert any(n.startswith("ep01-") for n in names)

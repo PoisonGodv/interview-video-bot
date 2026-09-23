@@ -92,6 +92,51 @@ class Chapter(BaseModel):
     start: float
 
 
+# ---------- 系列长视频(多 agent 编排产物) ----------
+
+class EpisodePlan(BaseModel):
+    """系列中的一集规划。"""
+
+    index: int = Field(description="集序号, 从 1 开始")
+    title: str
+    summary: str = Field(default="", description="本集内容概要")
+    key_points: list[str] = Field(default_factory=list)
+    target_sec: int = Field(default=900, description="本集目标时长(秒)")
+
+
+class SeriesPlan(BaseModel):
+    """系列总规划(策划 agent 产出)。"""
+
+    theme: str
+    title: str = Field(description="系列名")
+    synopsis: str = Field(default="", description="系列圣经: 主线/风格/受众, 供所有章节共享")
+    episodes: list[EpisodePlan]
+
+
+class ChapterSpec(BaseModel):
+    """一章的规格(上下文切分单元: 章节写手只看本章规格+滚动摘要)。"""
+
+    title: str
+    goal: str = Field(default="", description="本章要解决的问题/讲清的点")
+    key_points: list[str] = Field(default_factory=list)
+    est_sec: int = Field(default=150, description="本章预计时长(秒)")
+
+
+class EpisodeOutline(BaseModel):
+    """一集的章节大纲(分集编剧产出)。"""
+
+    episode_index: int
+    title: str
+    chapters: list[ChapterSpec]
+
+
+class ChapterDraft(BaseModel):
+    """一章的分镜草稿(章节写手产出) + 供下一章用的滚动摘要。"""
+
+    scenes: list[Scene]
+    summary: str = Field(default="", description="本章内容摘要(<=120字), 传给下一章做上下文")
+
+
 # ---------- 发布层 ----------
 
 class BiliMeta(BaseModel):

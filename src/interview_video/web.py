@@ -11,7 +11,7 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import Settings, load_settings
-from .models import BiliMeta, ProjectManifest
+from .models import BiliMeta, ProjectManifest, Script
 
 # 流水线节点 → 中文阶段名(与 graph.py 的节点名一一对应)
 STAGES: list[tuple[str, str]] = [
@@ -67,6 +67,11 @@ class JobRequest(BaseModel):
     provider: str = "edge"           # edge | doubao
     voice: str | None = None          # 不传用该 provider 默认音色
     use_sample_script: bool = False   # 免 LLM 冒烟: 用 examples/sample_script.json
+    # 系列模式(多 agent 长视频)
+    mode: Literal["single", "series"] = "single"
+    theme: str | None = None          # 系列主题
+    episodes: int = Field(default=3, ge=1, le=20)
+    duration_min: float = Field(default=15.0, ge=3.0, le=60.0)  # 每集目标时长(分钟)
 
 
 class MetaRequest(BaseModel):
@@ -87,7 +92,8 @@ class Job:
         self.current_stage: str | None = None
         self.done_stages: list[str] = []
         self.error: str | None = None
-        self.project: str | None = None  # out_dir 名
+        self.project: str | None = None  # out_dir 名(系列模式=系列根目录名)
+        self.series: dict[str, Any] | None = None  # 系列进度 {episode,episodes,chapter,chapters,phase}
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +103,7 @@ class Job:
             "done_stages": self.done_stages,
             "error": self.error,
             "project": self.project,
+            "series": self.series,
             "stages": [
                 {"key": k, "label": label, "done": k in self.done_stages,
                  "active": k == self.current_stage and self.status == "running"}
@@ -127,6 +134,7 @@ async def _execute_pipeline(
     topic_title: str | None,
     script_file: Path | None,
     on_stage,  # Callable[[str], None], 节点完成回调
+    script: Script | None = None,  # 预制脚本(系列模式), 跳过 LLM 生成
 ) -> ProjectManifest:
     """build_graph + astream(updates) 跑流水线, 逐节点回调进度。"""
     from . import graph as graph_mod
@@ -139,6 +147,8 @@ async def _execute_pipeline(
         "topic_title": topic_title,
         "script_file": Path(script_file) if script_file else None,
     }
+    if script is not None:
+        initial["script"] = script
     async for chunk in graph.astream(initial, stream_mode="updates"):
         for node_name in chunk:
             on_stage(node_name)
@@ -220,6 +230,11 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
     async def _run_job(job: Job, script_file: Path | None) -> None:
         from .cli import _default_out_dir  # 复用 CLI 的目录命名
 
+        def _on_stage(node: str) -> None:
+            if job.current_stage and job.current_stage not in job.done_stages:
+                job.done_stages.append(job.current_stage)
+            job.current_stage = node
+
         try:
             job_settings = settings.model_copy()
             job_settings.tts_provider = job.params.provider
@@ -228,23 +243,22 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
                     job_settings.tts_doubao_voice = job.params.voice
                 else:
                     job_settings.tts_voice = job.params.voice
-            out_dir = _default_out_dir(
-                job_settings, script_file, job.params.topic_title, job.params.industry
-            )
             try:
-                def _on_stage(node: str) -> None:
-                    if job.current_stage and job.current_stage not in job.done_stages:
-                        job.done_stages.append(job.current_stage)
-                    job.current_stage = node
-
-                await _execute_pipeline(
-                    job_settings, out_dir, job.params.industry,
-                    job.params.topic_title, script_file, _on_stage,
-                )
+                if job.params.mode == "series":
+                    await _run_series_job(job, job_settings, _on_stage)
+                else:
+                    out_dir = _default_out_dir(
+                        job_settings, script_file,
+                        job.params.topic_title, job.params.industry,
+                    )
+                    await _execute_pipeline(
+                        job_settings, out_dir, job.params.industry,
+                        job.params.topic_title, script_file, _on_stage,
+                    )
+                    job.project = out_dir.name
                 if job.current_stage and job.current_stage not in job.done_stages:
                     job.done_stages.append(job.current_stage)
                 job.status = "done"
-                job.project = out_dir.name
             except asyncio.CancelledError:
                 job.status, job.error = "failed", "任务被取消"
                 raise
@@ -252,6 +266,49 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
                 job.status, job.error = "failed", str(exc)
         finally:
             manager.active = False
+
+    async def _run_series_job(job: Job, job_settings: Settings, on_stage) -> None:
+        """系列模式: 多 agent 生成每集脚本 → 逐集走媒体流水线。"""
+        from . import series as series_mod
+        from .cli import _slug
+
+        req = job.params
+        theme = req.theme or req.topic_title or "面试求职"
+        job.series = {
+            "episodes": req.episodes, "episode": 0,
+            "chapter": 0, "chapters": 0, "phase": "策划中",
+        }
+
+        def on_event(name: str, **p) -> None:
+            s = job.series
+            assert s is not None
+            if name == "plan_done":
+                s.update(phase="策划完成", episodes=len(p["plan"].episodes))
+            elif name == "outline_done":
+                s.update(episode=p["ep_idx"] + 1, phase="拆分章节",
+                         chapter=0, chapters=len(p["outline"].chapters))
+            elif name == "chapter_done":
+                s.update(phase="写章节", chapter=p["ch_idx"] + 1)
+            elif name == "script_done":
+                s.update(phase="脚本完成")
+
+        plan, scripts = await series_mod.generate_series(
+            job_settings, theme, episodes=req.episodes,
+            episode_sec=int(req.duration_min * 60), on_event=on_event,
+        )
+        root = out_root / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "series.json").write_text(
+            plan.model_dump_json(indent=2), encoding="utf-8"
+        )
+        for i, script in enumerate(scripts):
+            job.series.update(episode=i + 1, phase="媒体合成")
+            job.done_stages, job.current_stage = [], None  # 每集重置节点进度
+            out_dir = root / f"ep{i + 1:02d}-{_slug(script.title)}"
+            await _execute_pipeline(
+                job_settings, out_dir, theme, None, None, on_stage, script=script,
+            )
+        job.project = root.name
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str) -> dict[str, Any]:
@@ -265,9 +322,15 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         if not _NAME_RE.match(name):
             raise HTTPException(400, "非法项目名")
         d = out_root / name
-        if not d.is_dir() or not (d / "project.json").exists():
-            raise HTTPException(404, "项目不存在或缺 project.json")
-        return d
+        if d.is_dir() and (d / "project.json").exists():
+            return d
+        # 系列分集: 在系列根目录(含 series.json)下再查一层
+        for series_dir in out_root.iterdir():
+            if series_dir.is_dir() and (series_dir / "series.json").exists():
+                ep = series_dir / name
+                if ep.is_dir() and (ep / "project.json").exists():
+                    return ep
+        raise HTTPException(404, "项目不存在或缺 project.json")
 
     def _project_summary(d: Path) -> dict[str, Any]:
         m = ProjectManifest.model_validate_json(
@@ -277,6 +340,7 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         sidecar = d / "upload.json"
         if sidecar.exists():
             bvid = json.loads(sidecar.read_text("utf-8")).get("bvid")
+        rel = d.relative_to(out_root).as_posix()  # 系列分集是嵌套路径(系列根/ep01-xx)
         return {
             "name": d.name,
             "title": m.script.title,
@@ -285,17 +349,23 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
             "created_at": m.created_at.isoformat(),
             "has_meta": m.meta is not None,
             "bvid": bvid,
-            "cover_url": f"/files/{d.name}/cover.png",
-            "video_url": f"/files/{d.name}/final.mp4",
+            "cover_url": f"/files/{rel}/cover.png",
+            "video_url": f"/files/{rel}/final.mp4",
         }
 
     @app.get("/api/projects")
     async def list_projects() -> dict[str, Any]:
-        items = [
-            _project_summary(d)
-            for d in sorted(out_root.iterdir(), reverse=True)
-            if d.is_dir() and (d / "project.json").exists()
-        ]
+        items: list[dict[str, Any]] = []
+        for d in sorted(out_root.iterdir(), reverse=True):
+            if not d.is_dir():
+                continue
+            if (d / "project.json").exists():
+                items.append(_project_summary(d))
+            elif (d / "series.json").exists():
+                # 系列根目录: 展开分集(ep01/02 正序)
+                for ep in sorted(d.iterdir()):
+                    if ep.is_dir() and (ep / "project.json").exists():
+                        items.append(_project_summary(ep))
         return {"projects": items}
 
     @app.get("/api/projects/{name}")
@@ -306,7 +376,7 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         )
         data = m.model_dump(mode="json")
         data.update(_project_summary(d))
-        data["srt_url"] = f"/files/{d.name}/subs/subtitles.srt"
+        data["srt_url"] = f"/files/{d.relative_to(out_root).as_posix()}/subs/subtitles.srt"
         return data
 
     @app.put("/api/projects/{name}/meta")

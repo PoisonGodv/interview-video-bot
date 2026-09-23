@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     brand: str = "面试充电站"
     target_duration_sec: int = 100
 
+    # ---- 系列长视频 ----
+    series_review: bool = True       # 审稿 agent 开关(关掉每章省一次 LLM 调用)
+    series_chapter_sec: int = 150    # 章节目标时长(秒), 即上下文切分粒度
+
     # ---- 视频 ----
     video_width: int = 1920
     video_height: int = 1080

@@ -79,11 +79,20 @@
       <input id="topic-title" placeholder="选题标题(点上面选题自动填入, 也可手填)" class="w100">
     </div>
     <div class="row" style="margin-top:10px">
+      <select id="mode">
+        <option value="single">单集短视频</option>
+        <option value="series">系列长视频(多agent)</option>
+      </select>
+      <span id="series-opts" style="display:none">
+        集数 <input id="episodes" type="number" value="3" min="1" max="20" style="width:64px">
+        每集 <input id="duration" type="number" value="15" min="3" max="60" step="1" style="width:64px"> 分钟
+      </span>
       <select id="provider"></select>
       <select id="voice"></select>
-      <label class="msg"><input type="checkbox" id="use-sample"> 用示例脚本(免 LLM 冒烟)</label>
+      <label class="msg" id="sample-wrap"><input type="checkbox" id="use-sample"> 用示例脚本(免 LLM 冒烟)</label>
       <button id="btn-gen">开始生成</button>
     </div>
+    <div class="msg" id="series-progress"></div>
     <div class="stages" id="stages" style="display:none"></div>
     <div class="msg" id="gen-msg"></div>
   </div>
@@ -145,14 +154,30 @@ $("btn-topics").onclick = async () => {
   $("btn-topics").disabled = false;
 };
 
+$("mode").onchange = () => {
+  const series = $("mode").value === "series";
+  $("series-opts").style.display = series ? "inline" : "none";
+  $("sample-wrap").style.display = series ? "none" : "inline";
+  $("topic-title").placeholder = series
+    ? "系列主题, 如「程序员面试通关」「护理转行指南」"
+    : "选题标题(点上面选题自动填入, 也可手填)";
+};
+
 $("btn-gen").onclick = async () => {
-  msg("gen-msg", ""); $("btn-gen").disabled = true;
+  msg("gen-msg", ""); $("series-progress").textContent = ""; $("btn-gen").disabled = true;
+  const series = $("mode").value === "series";
   try {
-    const d = await api("/api/jobs", {method: "POST", body: {
+    const body = series ? {
+      mode: "series", theme: $("topic-title").value || $("industry").value,
+      industry: $("industry").value,
+      episodes: +$("episodes").value, duration_min: +$("duration").value,
+      provider: $("provider").value, voice: $("voice").value,
+    } : {
       industry: $("industry").value, topic_title: $("topic-title").value || null,
       provider: $("provider").value, voice: $("voice").value,
       use_sample_script: $("use-sample").checked,
-    }});
+    };
+    const d = await api("/api/jobs", {method: "POST", body});
     pollJob(d.job_id);
   } catch (e) { msg("gen-msg", e.message, "err"); $("btn-gen").disabled = false; }
 };
@@ -163,6 +188,12 @@ async function pollJob(id) {
   const tick = async () => {
     try {
       const j = await api("/api/jobs/" + id);
+      if (j.series) {
+        const s = j.series;
+        $("series-progress").textContent =
+          `系列进度: 第 ${s.episode}/${s.episodes} 集 · ${s.phase}` +
+          (s.chapters ? ` · 第 ${s.chapter}/${s.chapters} 章` : "");
+      }
       $("stages").innerHTML = j.stages.map(s =>
         `<span class="stage ${s.done ? "done" : s.active ? "active" : ""}">${s.done ? "✓ " : ""}${s.label}</span>`).join("");
       if (j.status === "done") {

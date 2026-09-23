@@ -217,3 +217,22 @@ AI 内容合规标注提示、目录结构、测试(含 --run-integration)、路
 - edge-tts 需显式 `boundary="WordBoundary"`(默认 SentenceBoundary); 本机无 PingFang.ttc, 字幕字体落到 STHeiti/Hiragino
 - 端到端已验证: script-file 冒烟 25.8s + 真实 LLM(护理行业) 96.7s 成片, BiliMeta 真实生成
 - TTS 双通道(2026-09-23 增补): `tts_provider=edge|doubao`; 豆包走 seed-tts-2.0 单向流式(协议同 drivecast), 无词级时间戳 → `estimate_cues` 按字数+标点权重把 ffprobe 总时长比例分配; edge 仍为默认(时间轴精确)。doubao 凭证走 TTS_DOUBAO_API_KEY
+
+## 9. 系列长视频(多 agent, 2026-09-23 增补)
+
+- 新模型(models.py): `SeriesPlan/EpisodePlan/EpisodeOutline/ChapterSpec/ChapterDraft`
+- `chains/series.py`: 策划 `plan_series` → 分集编剧 `write_episode_outline` → 章节写手
+  `write_chapter` → 审稿 `review_chapter`; `roll_context`(600 字滚动摘要窗口)做上下文切分:
+  章节间传递上一章摘要, 集边界全量重置; `build_episode_script` 汇总场景(首镜 point/末镜 ending
+  确定性修正); `_fix_draft` 归一 kind + narration 截断; 解析均走 structured_output → JSON 回退
+- `series.py`: `build_series_graph` 双循环(plan → episode_setup → outline → chapter
+  ⇄ review → build_script → 下一集), 事件 plan_done/outline_done/chapter_done/script_done;
+  `generate_series(settings, theme, episodes, episode_sec, on_event) -> (SeriesPlan, list[Script])`
+- config: `series_review=true`, `series_chapter_sec=150`
+- `graph.py`: state 预置 `script` 时 gen_script 直通(不碰 LLM/script_file), `run_pipeline(..., script=)`
+- `cli.py`: `ivb series <theme> --episodes N --duration M`(M=分钟); web: JobRequest 加
+  `mode=single|series + theme/episodes/duration_min`, `_run_series_job` 逐集跑 `_execute_pipeline`,
+  系列根目录存 series.json, 分集 `ep01-*`; list_projects/_project_dir 下钻系列根一层(作品库展开分集),
+  分集 URL 用相对 out_root 路径(嵌套也能播放)
+- 测试: tests/test_series.py(链解析/滚动上下文/双循环编排/review 开关/预制脚本直通);
+  fake_media fixture 上移至 conftest.py; 110 passed + 6 skipped 全绿

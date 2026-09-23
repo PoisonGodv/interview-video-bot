@@ -139,6 +139,62 @@ def upload(
 
 
 @app.command()
+def series(
+    theme: str = typer.Argument(..., help="系列主题, 如 程序员面试通关"),
+    episodes: int = typer.Option(3, "--episodes", "-e", help="集数"),
+    duration: float = typer.Option(15.0, "--duration", "-d", help="每集目标时长(分钟)"),
+) -> None:
+    """多 agent 系列长视频: 一个主题 → N 集 × M 分钟(策划/编剧/章节写手/审稿)。"""
+    settings = load_settings()
+    asyncio.run(_series_main(settings, theme, episodes, duration))
+
+
+async def _series_main(
+    settings: Settings, theme: str, episodes: int, duration_min: float
+) -> Path:
+    """系列生成主流程: 多 agent 出脚本 → 逐集走媒体流水线。"""
+    from .series import generate_series
+
+    def on_event(name: str, **p) -> None:
+        if name == "plan_done":
+            plan = p["plan"]
+            console.print(f"[bold cyan]系列策划[/]《{plan.title}》共 {len(plan.episodes)} 集:")
+            for ep in plan.episodes:
+                console.print(f"  {ep.index}. {ep.title} [dim]{ep.summary[:40]}[/]")
+        elif name == "outline_done":
+            console.print(
+                f"[dim]第 {p['ep_idx'] + 1} 集大纲: {len(p['outline'].chapters)} 章[/]"
+            )
+        elif name == "chapter_done":
+            console.print(
+                f"[dim]  第 {p['ep_idx'] + 1} 集 第 {p['ch_idx'] + 1}/{p['ch_total']} 章完成[/]"
+            )
+        elif name == "script_done":
+            console.print(
+                f"[green]第 {p['ep_idx'] + 1} 集脚本完成({len(p['script'].scenes)} 镜)[/]"
+            )
+
+    plan, scripts = await generate_series(
+        settings, theme, episodes=episodes,
+        episode_sec=int(duration_min * 60), on_event=on_event,
+    )
+    root = (
+        settings.out_root
+        / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "series.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+    for i, script in enumerate(scripts):
+        out_dir = root / f"ep{i + 1:02d}-{_slug(script.title)}"
+        console.print(f"[bold]第 {i + 1}/{len(scripts)} 集媒体合成[/] → {out_dir}")
+        await run_pipeline(settings, out_dir, industry=theme, script=script)
+    console.print(
+        Panel(f"共 {len(scripts)} 集 → {root}", title="系列生成完成", border_style="green")
+    )
+    return root
+
+
+@app.command()
 def web(
     host: str = typer.Option("127.0.0.1", "--host", help="监听地址(本地工具, 默认仅回环)"),
     port: int = typer.Option(8099, "--port", "-p", help="端口"),

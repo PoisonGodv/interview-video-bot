@@ -64,7 +64,12 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
         """
         out_dir: Path = state["out_dir"]
         script_file = state.get("script_file")
-        if script_file is not None:
+        preset = state.get("script")
+        if preset is not None:
+            # 系列模式: 脚本由 series.py 多 agent 编排预生成, 本节点直通
+            script = preset
+            logger.info("使用预生成脚本(系列模式): %s", script.title)
+        elif script_file is not None:
             script = Script.model_validate_json(
                 Path(script_file).read_text(encoding="utf-8")
             )
@@ -246,8 +251,12 @@ async def run_pipeline(
     industry: str = "互联网",
     topic_title: str | None = None,
     script_file: Path | None = None,
+    script: Script | None = None,
 ) -> ProjectManifest:
-    """async 便捷入口: 跑完整流水线, 返回 ProjectManifest(已落盘 project.json)。"""
+    """async 便捷入口: 跑完整流水线, 返回 ProjectManifest(已落盘 project.json)。
+
+    script 预制传入时跳过 LLM 生成(系列模式用)。
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     graph = build_graph(settings)
@@ -257,6 +266,8 @@ async def run_pipeline(
         "topic_title": topic_title,
         "script_file": Path(script_file) if script_file is not None else None,
     }
+    if script is not None:
+        initial["script"] = script
     final = await graph.ainvoke(initial)
     manifest_path = Path(final["manifest_path"])
     return ProjectManifest.model_validate_json(

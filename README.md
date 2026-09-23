@@ -63,6 +63,27 @@ ivb generate --script-file examples/sample_script.json --out output/demo
 ivb upload output/demo --yes
 ```
 
+## 系列长视频(多 agent)
+
+一个主题 → 多 agent(LangGraph)自动生成多集长视频(每集 10-20 分钟):
+
+```bash
+# 生成 3 集 × 每集约 15 分钟的系列(主题自拟)
+ivb series "程序员面试通关" --episodes 3 --duration 15
+```
+
+多 agent 角色与协作(`chains/series.py` + `series.py` 双循环图):
+
+1. **策划**(`plan_series`): 主题 → 系列圣经(总标题/简介) + 分集规划(每集标题/要点/目标时长);
+2. **分集编剧**(`write_episode_outline`): 每集 → 章节大纲(按 `SERIES_CHAPTER_SEC` 切章, 默认 150s/章);
+3. **章节写手**(`write_chapter`): 逐章写场景与口播, **滚动摘要**(`roll_context`, 600 字窗口)
+   把上一章摘要传给下一章——上下文在章节边界切分, 集与集之间全量重置, 避免超长上下文漂移;
+4. **审稿**(`review_chapter`): 逐章审校(红线/口语化/与摘要一致性), 可用 `SERIES_REVIEW=false` 关闭。
+
+每集脚本写完即走完整媒体流水线(配音→渲染→合成→字幕→元数据),
+产物在 `output/<主题>-series-<时间戳>/ep01-*/ …`, 系列规划存 `series.json`;
+作品库会把系列分集展开列出, 可逐集播放/编辑元数据/上传 B站。
+
 生成完成后会 rich 打印产物路径(final.mp4 / cover.png / subtitles.srt)与 BiliMeta
 (标题/标签); 若 `BILI_UPLOAD_ENABLED=true`, 会询问确认后上传(`--yes` 跳过)。
 
@@ -75,11 +96,13 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
 单页操作台(FastAPI + 原生 JS, 无构建步骤), 三段式:
 
 1. **选题**: 输入行业 → 生成选题清单(LLM), 点击选题自动填入生成框;
-2. **生成视频**: 选 TTS 通道(edge-tts 免费 / 豆包火山)与音色 → 开始生成,
+2. **生成视频**: 模式可选**单集短视频**或**系列长视频(多agent)**(填系列主题、集数、每集分钟数),
+   选 TTS 通道(edge-tts 免费 / 豆包火山)与音色 → 开始生成,
    8 个节点进度实时可见(选题→配音→渲染→合成→字幕→合成→元数据→落盘);
+   系列模式额外显示「第 x/N 集 · 阶段 · 第 y/M 章」;
    生成单飞(同时只跑一个任务, 避免 TTS 限流), 并发提交返回 409;
-3. **作品库**: 封面墙 → 详情里可播放成片、编辑 B站标题/简介/标签(写回 project.json)、
-   一键上传(未配 cookie 三件套会返回指引)。
+3. **作品库**: 封面墙(系列分集自动展开为独立条目) → 详情里可播放成片、
+   编辑 B站标题/简介/标签(写回 project.json)、一键上传(未配 cookie 三件套会返回指引)。
 
 > 本地工具, 默认只绑 127.0.0.1; 上传成功后 bvid 记录在项目目录 upload.json。
 
@@ -102,6 +125,10 @@ TTS_RATE=+6%
 # TTS_DOUBAO_VOICE=zh_male_m191_uranus_bigtts   # 女声: zh_female_vv_uranus_bigtts
 BRAND=面试充电站
 TARGET_DURATION_SEC=100
+
+# 系列长视频(均有默认值, 可省略)
+SERIES_REVIEW=true        # 章节审稿 agent 开关
+SERIES_CHAPTER_SEC=150    # 每章目标时长(秒), 决定上下文切分粒度
 
 # B站上传(默认关闭)
 BILI_UPLOAD_ENABLED=false
