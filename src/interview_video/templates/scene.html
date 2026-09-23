@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block extra_css %}
+.scene-header {
+  font-size: 72px;           /* header ≥56px */
+  font-weight: 800;
+  line-height: 1.2;
+  margin-bottom: 64px;
+  letter-spacing: 2px;
+}
+.scene-header .idx {
+  color: {{ accent }};
+  margin-right: 28px;
+}
+.bullets {
+  display: flex;
+  flex-direction: column;
+  gap: 34px;
+}
+.bullet {
+  display: flex;
+  align-items: center;
+  background: rgba(148, 163, 184, .12);
+  border: 1px solid rgba(148, 163, 184, .25);
+  border-radius: 24px;
+  padding: 30px 44px;
+  font-size: 40px;           /* bullets ≥34px */
+  line-height: 1.35;
+}
+.bullet .dot {
+  flex: none;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: {{ accent }};
+  margin-right: 30px;
+  box-shadow: 0 0 18px {{ accent }};
+}
+{% endblock %}
+{% block content %}
+<div class="topbar">
+  <div class="brand">{{ brand }}</div>
+  <div class="progress">{{ index + 1 }} / {{ total }}</div>
+</div>
+<div class="scene-header"><span class="idx">{{ '%02d' % (index + 1) }}</span>{{ scene.header }}</div>
+<div class="bullets">
+  {% for b in scene.bullets %}
+  <div class="bullet"><span class="dot"></span>{{ b }}</div>
+  {% endfor %}
+</div>
+{% endblock %}

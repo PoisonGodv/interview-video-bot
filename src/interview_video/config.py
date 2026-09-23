@@ -1,0 +1,60 @@
+"""配置: pydantic-settings, 环境变量 = 字段名大写(与 drivecast 命名一致)。"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    # ---- LLM(OpenAI 兼容) ----
+    llm_model: str = "deepseek-chat"
+    llm_api_key: SecretStr | None = None
+    llm_base_url: str | None = None
+    llm_timeout: int = 300
+    llm_temperature: float = 0.7
+
+    # ---- TTS ----
+    tts_voice: str = "zh-CN-YunxiNeural"
+    tts_rate: str = "+6%"
+
+    # ---- 内容 ----
+    brand: str = "面试充电站"
+    target_duration_sec: int = 100
+
+    # ---- 视频 ----
+    video_width: int = 1920
+    video_height: int = 1080
+    fps: int = 30
+
+    # ---- 字幕(Pillow 字幕条) ----
+    subtitle_fontsize: int = 52
+    subtitle_bottom: int = 96          # 字幕条距底边像素
+    subtitle_box: bool = True          # 半透明底条
+    subtitle_font_path: str | None = None  # None=自动探测系统中文字体
+
+    # ---- 响度 ----
+    loudness_i: float = -16.0
+    loudness_tp: float = -1.5
+    loudness_lra: float = 11.0
+
+    # ---- B站 ----
+    bili_tid: int = 36
+    bili_upload_enabled: bool = False
+    bili_sessdata: str | None = None
+    bili_jct: str | None = None
+    bili_buvid3: str | None = None
+
+    # ---- 输出 ----
+    out_root: Path = Path("output")
+
+
+def load_settings(env_file: str | None = None) -> Settings:
+    if env_file:
+        return Settings(_env_file=env_file)  # type: ignore[call-arg]
+    return Settings()

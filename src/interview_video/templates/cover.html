@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block extra_css %}
+.cover {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.cover-title {
+  font-size: 108px;          /* 主标题 ≥80px */
+  font-weight: 800;
+  line-height: 1.25;
+  letter-spacing: 2px;
+  margin-bottom: 48px;
+  text-shadow: 0 6px 30px rgba(0, 0, 0, .45);
+}
+.cover-title .hl { color: {{ accent }}; }
+.cover-hook {
+  font-size: 44px;
+  line-height: 1.5;
+  color: #cbd5e1;
+  max-width: 1400px;
+  border-left: 8px solid {{ accent }};
+  padding-left: 32px;
+}
+.cover-meta {
+  margin-top: 72px;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+.cover-brand {
+  font-size: 40px;
+  font-weight: 700;
+  color: #f8fafc;
+}
+{% endblock %}
+{% block content %}
+<div class="topbar">
+  <div class="brand">{{ brand }}</div>
+  {% if industry %}<div class="chip">{{ industry }}</div>{% endif %}
+</div>
+<div class="cover">
+  <div class="cover-title">{{ title }}</div>
+  {% if script.summary %}<div class="cover-hook">{{ script.summary }}</div>{% endif %}
+  <div class="cover-meta">
+    <div class="cover-brand">@{{ brand }}</div>
+  </div>
+</div>
+{% endblock %}

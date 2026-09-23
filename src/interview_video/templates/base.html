@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+/* ===== 视觉规范(SPECS §4) =====
+   深色渐变底 #0f172a → #1e293b, 点缀色 {{ accent }},
+   大字号, 底部 180px 为字幕条留白区(不得放任何内容)。 */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 1920px;
+  height: 1080px;
+  overflow: hidden;
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  color: #f8fafc;
+}
+body {
+  position: relative;
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+}
+/* 点缀光斑: 纯装饰, 位于安全区之上 */
+body::before {
+  content: "";
+  position: absolute;
+  top: -260px; right: -200px;
+  width: 720px; height: 720px;
+  border-radius: 50%;
+  background: radial-gradient(circle, {{ accent }}33 0%, transparent 70%);
+  pointer-events: none;
+}
+.page {
+  position: absolute;
+  inset: 0;
+  padding: 90px 130px 180px;  /* 底部 180px 字幕条留白 */
+  display: flex;
+  flex-direction: column;
+}
+/* 底部字幕条安全区: 物理占位, 保证任何内容都不会侵入 */
+.subtitle-safe {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 180px;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 56px;
+}
+.brand {
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: 4px;
+  color: {{ accent }};
+}
+.chip {
+  font-size: 30px;
+  padding: 10px 30px;
+  border: 2px solid {{ accent }};
+  border-radius: 999px;
+  color: {{ accent }};
+}
+.progress {
+  font-size: 30px;
+  color: #94a3b8;
+  letter-spacing: 2px;
+}
+{% block extra_css %}{% endblock %}
+</style>
+</head>
+<body>
+<div class="page">
+  {% block content %}{% endblock %}
+</div>
+<div class="subtitle-safe"></div>
+</body>
+</html>

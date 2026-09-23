@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block extra_css %}
+.ending {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+.ending-header {
+  font-size: 76px;
+  font-weight: 800;
+  line-height: 1.25;
+  letter-spacing: 2px;
+  margin-bottom: 44px;
+}
+.ending-bullets {
+  font-size: 40px;
+  color: #cbd5e1;
+  line-height: 1.6;
+  margin-bottom: 72px;
+}
+.cta {
+  font-size: 52px;
+  font-weight: 700;
+  color: #0f172a;
+  background: {{ accent }};
+  border-radius: 999px;
+  padding: 26px 88px;
+  box-shadow: 0 10px 40px {{ accent }}66;
+}
+.cta-sub {
+  margin-top: 40px;
+  font-size: 34px;
+  color: #94a3b8;
+  letter-spacing: 2px;
+}
+{% endblock %}
+{% block content %}
+<div class="topbar">
+  <div class="brand">{{ brand }}</div>
+  <div class="progress">{{ index + 1 }} / {{ total }}</div>
+</div>
+<div class="ending">
+  <div class="ending-header">{{ scene.header }}</div>
+  {% if scene.bullets %}
+  <div class="ending-bullets">
+    {% for b in scene.bullets %}<div>{{ b }}</div>{% endfor %}
+  </div>
+  {% endif %}
+  <div class="cta">点赞 · 关注 · 收藏</div>
+  <div class="cta-sub">@{{ brand }} —— 不错过每一期面试干货</div>
+</div>
+{% endblock %}

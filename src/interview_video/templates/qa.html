@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block extra_css %}
+.qa-header {
+  font-size: 60px;
+  font-weight: 800;
+  line-height: 1.2;
+  margin-bottom: 52px;
+  letter-spacing: 2px;
+}
+.qa-header .idx { color: {{ accent }}; margin-right: 28px; }
+.qa-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 44px;
+}
+.qa-card {
+  display: flex;
+  align-items: flex-start;
+  border-radius: 28px;
+  padding: 40px 48px;
+}
+.qa-card .tag {
+  flex: none;
+  font-size: 48px;
+  font-weight: 800;
+  margin-right: 36px;
+  line-height: 1.2;
+}
+.qa-card .body {
+  font-size: 42px;           /* ≥34px */
+  line-height: 1.5;
+}
+.q-card {
+  background: rgba(56, 189, 248, .14);
+  border: 2px solid {{ accent }};
+}
+.q-card .tag { color: {{ accent }}; }
+.a-card {
+  background: rgba(148, 163, 184, .12);
+  border: 1px solid rgba(148, 163, 184, .3);
+}
+.a-card .tag { color: #fbbf24; }
+{% endblock %}
+{% block content %}
+<div class="topbar">
+  <div class="brand">{{ brand }}</div>
+  <div class="progress">{{ index + 1 }} / {{ total }}</div>
+</div>
+<div class="qa-header"><span class="idx">{{ '%02d' % (index + 1) }}</span>{{ scene.header }}</div>
+<div class="qa-cards">
+  <div class="qa-card q-card">
+    <div class="tag">Q</div>
+    <div class="body">{{ scene.question }}</div>
+  </div>
+  <div class="qa-card a-card">
+    <div class="tag">A</div>
+    <div class="body">{{ scene.answer }}</div>
+  </div>
+</div>
+{% endblock %}
