@@ -1,14 +1,14 @@
 """脚本链: 由选题生成 5~8 个分镜的完整口播脚本(含 narration 字数校验修正)。"""
 from __future__ import annotations
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from typing import Any
 
 from ..config import Settings
 from ..models import Script, Topic
+from ..prompts import ChatPromptTemplate
 from . import parse_json_lenient
-from .topic import RED_LINES
+from ._invoke import invoke_structured
+from .redlines import RED_LINES
 
 # narration 字数约束(与 models.Scene.narration 描述一致: 每场景 65~110 字)
 MAX_NARRATION_CHARS = 110
@@ -46,7 +46,7 @@ def truncate_narration(
     # 2) 停顿标点截断(收为句末)
     cut = max(window.rfind(p) for p in _PAUSE_END)
     if cut + 1 >= min_chars:
-        return window[:cut] + "。"
+        return window[: cut] + "。"
 
     # 3) 硬截断兜底(预留 1 字给收尾句号, 保证总长度 <= max_chars)
     hard = window[: max_chars - 1].rstrip(_PAUSE_END + _SENTENCE_END)
@@ -78,15 +78,19 @@ def fix_script_narration(
     return script
 
 
-def _build_prompt(brand: str, target_sec: int) -> ChatPromptTemplate:
-    """脚本 prompt: 中文 system(角色+红线) + 分镜结构/字数/JSON 格式要求。"""
+def _build_prompt() -> ChatPromptTemplate:
+    """脚本 prompt: 中文 system(角色+红线) + 分镜结构/字数/JSON 格式要求。
+
+    brand/target_sec 一律走模板变量: 值里的 ``{}`` 不会被二次格式化
+    (旧实现 f-string 预拼, BRAND 含花括号时 KeyError)。
+    """
     return ChatPromptTemplate.from_messages(
         [
             ("system", RED_LINES),
             (
                 "user",
                 "选题信息(JSON):\n{topic_json}\n\n"
-                f"请围绕该选题为「{brand}」写一条约 {target_sec} 秒的面试求职短视频脚本。\n"
+                "请围绕该选题为「{brand}」写一条约 {target_sec} 秒的面试求职短视频脚本。\n"
                 "要求:\n"
                 "- 5~8 个分镜; 第 1 镜为 point 开场(必须包含选题 hook);\n"
                 "  中间 point/qa 混排; 最后一镜 kind=ending(关注/下期引导);\n"
@@ -94,7 +98,7 @@ def _build_prompt(brand: str, target_sec: int) -> ChatPromptTemplate:
                 "bullets(屏显要点, 每条 <=14字, 0~4 条), narration(口播);\n"
                 "- qa 镜额外填 question(面试问题)与 answer(答案要点屏显);\n"
                 f"- narration 口语化, 每场景 {MIN_NARRATION_CHARS}~{MAX_NARRATION_CHARS} 字"
-                f"(约 15~25 秒), 全片时长向 {target_sec} 秒靠拢;\n"
+                "(约 15~25 秒), 全片时长向 {target_sec} 秒靠拢;\n"
                 "- 遵守 system 中的内容红线。\n\n"
                 "只输出如下结构的 JSON(不要任何其他文字):\n"
                 '{{"title": "...", "summary": "...", "scenes": ['
@@ -105,23 +109,19 @@ def _build_prompt(brand: str, target_sec: int) -> ChatPromptTemplate:
     )
 
 
-async def write_script(llm: BaseChatModel, topic: Topic, settings: Settings) -> Script:
-    """由选题写脚本。主路径 with_structured_output, 失败回退文本 JSON 解析,
-    两条路径都经过 fix_script_narration 校验修正。"""
-    prompt = _build_prompt(settings.brand, settings.target_duration_sec)
-    payload = {"topic_json": topic.model_dump_json()}
-
-    try:
-        structured = prompt | llm.with_structured_output(Script)
-        result = await structured.ainvoke(payload)
-        if isinstance(result, Script):
-            return fix_script_narration(result)
-    except Exception:
-        pass  # 回退到文本 JSON 路径
-
-    chain = prompt | llm | StrOutputParser()
-    text = await chain.ainvoke(payload)
-    return fix_script_narration(parse_script_json(text))
+async def write_script(llm: Any, topic: Topic, settings: Settings) -> Script:
+    """由选题写脚本。invoke_structured 三级策略, 结果经 fix_script_narration 修正。"""
+    payload = {
+        "topic_json": topic.model_dump_json(),
+        "brand": settings.brand,
+        "target_sec": settings.target_duration_sec,
+    }
+    script = await invoke_structured(
+        _build_prompt(), llm, payload, Script, parse_script_json,
+        stage="script",
+    )
+    assert isinstance(script, Script)
+    return fix_script_narration(script)
 
 
 def parse_script_json(text: str) -> Script:

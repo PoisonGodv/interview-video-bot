@@ -1,10 +1,6 @@
 """豆包 TTS 通道测试: 纯函数全测(不联网), 真实合成打 integration。"""
 from __future__ import annotations
 
-import base64
-import json
-from pathlib import Path
-
 import pytest
 
 from interview_video.config import Settings
@@ -56,12 +52,20 @@ def test_headers_old_console():
     assert h["X-Api-Access-Key"] == "acc1"
 
 
-def test_payload_rate_clamped():
-    p = _doubao_payload("你好", _settings(tts_doubao_rate=500))
+def test_payload_rate_validated_by_settings():
+    """范围校验移到 Settings(Field ge/le): 越界直接配置报错, 不再静默夹取。"""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    p = _doubao_payload("你好", _settings(tts_doubao_rate=100))
     assert p["req_params"]["audio_params"]["speech_rate"] == 100
-    p = _doubao_payload("你好", _settings(tts_doubao_rate=-99))
+    p = _doubao_payload("你好", _settings(tts_doubao_rate=-50))
     assert p["req_params"]["audio_params"]["speech_rate"] == -50
     assert p["req_params"]["speaker"] == "zh_male_m191_uranus_bigtts"
+    with _pytest.raises(ValidationError):
+        _settings(tts_doubao_rate=500)  # 拼错/越界 fail-fast
+    with _pytest.raises(ValidationError):
+        _settings(tts_doubao_rate=-99)
 
 
 # ---------- NDJSON 解析 ----------

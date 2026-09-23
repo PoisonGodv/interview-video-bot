@@ -158,3 +158,8 @@ class ProjectManifest(BaseModel):
     meta: BiliMeta | None = None
     voice: str = ""
     duration_total: float = 0.0
+    # 生成溯源(新产物都写; 旧 project.json 无此字段, 向后兼容)
+    generation: dict[str, str] | None = Field(
+        default=None,
+        description="llm_model/temperature/prompt 版本等溯源信息",
+    )

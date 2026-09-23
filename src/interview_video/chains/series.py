@@ -5,12 +5,14 @@
   不看全集历史分镜, 控制单次上下文长度;
 - 集边界全量重置: 新集只带系列圣经 + 本集规划, 不带上一集摘要;
 - 滚动摘要由每章 ChapterDraft.summary 提供, 拼接后截断到 600 字。
+
+成本护栏(不信任 LLM 自觉的确定性 clamp):
+- 单章分镜数上限 MAX_SCENES_PER_CHAPTER, 防失控大纲一章产出 300 镜。
 """
 from __future__ import annotations
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+import logging
+from typing import Any
 
 from ..config import Settings
 from ..models import (
@@ -19,14 +21,22 @@ from ..models import (
     EpisodeOutline,
     EpisodePlan,
     Scene,
+    Script,
     SeriesPlan,
 )
+from ..prompts import ChatPromptTemplate
 from . import parse_json_lenient
+from ._invoke import invoke_structured, invoke_text
+from .redlines import RED_LINES
 from .script import MAX_NARRATION_CHARS, truncate_narration
-from .topic import RED_LINES
+
+logger = logging.getLogger(__name__)
 
 # 滚动摘要窗口(字), 超出截断保尾
 CONTEXT_WINDOW_CHARS = 600
+
+# 单章分镜数上限(写手 prompt 的 scene_count 也被夹在此值内)
+MAX_SCENES_PER_CHAPTER = 30
 
 _PLAN_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -113,10 +123,8 @@ _REVIEW_PROMPT = ChatPromptTemplate.from_messages(
 def parse_series_plan_json(text: str) -> SeriesPlan:
     return SeriesPlan.model_validate(parse_json_lenient(text))
 
-
 def parse_outline_json(text: str) -> EpisodeOutline:
     return EpisodeOutline.model_validate(parse_json_lenient(text))
-
 
 def parse_chapter_json(text: str) -> ChapterDraft:
     return ChapterDraft.model_validate(parse_json_lenient(text))
@@ -127,7 +135,7 @@ def parse_chapter_json(text: str) -> ChapterDraft:
 # ---------------------------------------------------------------------------
 
 async def plan_series(
-    llm: BaseChatModel, theme: str, episodes: int, episode_sec: int
+    llm: Any, theme: str, episodes: int, episode_sec: int
 ) -> SeriesPlan:
     """策划 agent: 主题 → 系列规划(N 集 + 系列圣经)。"""
     payload = {
@@ -135,19 +143,16 @@ async def plan_series(
         "episodes": episodes,
         "episode_min": round(episode_sec / 60),
     }
-    try:
-        structured = _PLAN_PROMPT | llm.with_structured_output(SeriesPlan)
-        result = await structured.ainvoke(payload)
-        if isinstance(result, SeriesPlan) and result.episodes:
-            return result
-    except Exception:
-        pass
-    text = await (_PLAN_PROMPT | llm | StrOutputParser()).ainvoke(payload)
-    return parse_series_plan_json(text)
+    plan = await invoke_structured(
+        _PLAN_PROMPT, llm, payload, SeriesPlan, parse_series_plan_json,
+        stage="series.plan",
+    )
+    assert isinstance(plan, SeriesPlan)
+    return plan
 
 
 async def write_episode_outline(
-    llm: BaseChatModel, plan: SeriesPlan, episode: EpisodePlan, chapter_sec: int
+    llm: Any, plan: SeriesPlan, episode: EpisodePlan, chapter_sec: int
 ) -> EpisodeOutline:
     """分集编剧: 一集规划 → 章节大纲。"""
     payload = {
@@ -156,19 +161,16 @@ async def write_episode_outline(
         "chapter_sec": chapter_sec,
         "episode_index": episode.index,
     }
-    try:
-        structured = _OUTLINE_PROMPT | llm.with_structured_output(EpisodeOutline)
-        result = await structured.ainvoke(payload)
-        if isinstance(result, EpisodeOutline) and result.chapters:
-            return result
-    except Exception:
-        pass
-    text = await (_OUTLINE_PROMPT | llm | StrOutputParser()).ainvoke(payload)
-    return parse_outline_json(text)
+    outline = await invoke_structured(
+        _OUTLINE_PROMPT, llm, payload, EpisodeOutline, parse_outline_json,
+        stage="series.outline",
+    )
+    assert isinstance(outline, EpisodeOutline)
+    return outline
 
 
 async def write_chapter(
-    llm: BaseChatModel,
+    llm: Any,
     plan: SeriesPlan,
     outline: EpisodeOutline,
     chapter: ChapterSpec,
@@ -177,7 +179,8 @@ async def write_chapter(
     settings: Settings,
 ) -> ChapterDraft:
     """章节写手: 本章规格 + 滚动摘要 → 分镜草稿。narration 逐镜确定性截断。"""
-    scene_count = max(4, round(chapter.est_sec / 20))
+    # 成本护栏: 分镜数夹在 [4, MAX_SCENES_PER_CHAPTER], 防失控大纲
+    scene_count = min(MAX_SCENES_PER_CHAPTER, max(4, round(chapter.est_sec / 20)))
     payload = {
         "synopsis": plan.synopsis,
         "episode_title": outline.title,
@@ -189,39 +192,39 @@ async def write_chapter(
         "min_narr": 65,
         "max_narr": MAX_NARRATION_CHARS,
     }
-    draft: ChapterDraft | None = None
-    try:
-        structured = _CHAPTER_PROMPT | llm.with_structured_output(ChapterDraft)
-        result = await structured.ainvoke(payload)
-        if isinstance(result, ChapterDraft) and result.scenes:
-            draft = result
-    except Exception:
-        pass
-    if draft is None:
-        text = await (_CHAPTER_PROMPT | llm | StrOutputParser()).ainvoke(payload)
-        draft = parse_chapter_json(text)
+    draft = await invoke_structured(
+        _CHAPTER_PROMPT, llm, payload, ChapterDraft, parse_chapter_json,
+        stage=f"series.ch{ch_no}",
+    )
+    assert isinstance(draft, ChapterDraft)
     return _fix_draft(draft)
 
 
 async def review_chapter(
-    llm: BaseChatModel,
+    llm: Any,
     draft: ChapterDraft,
     chapter: ChapterSpec,
     prev_summary: str,
 ) -> ChapterDraft:
-    """审稿 agent: 红线/重复/冗长修订; 审稿失败降级为原草稿。"""
+    """审稿 agent: 红线/重复/冗长修订; 审稿失败降级为原草稿(留痕, 不静默)。"""
     payload = {
         "chapter_json": chapter.model_dump_json(),
         "prev_summary": prev_summary or "无",
         "draft_json": draft.model_dump_json(),
     }
     try:
-        text = await (_REVIEW_PROMPT | llm | StrOutputParser()).ainvoke(payload)
-        reviewed = parse_chapter_json(text)
-        if reviewed.scenes:
+        reviewed = await invoke_text(
+            _REVIEW_PROMPT, llm, payload, parse_chapter_json,
+            stage="series.review",
+        )
+        if isinstance(reviewed, ChapterDraft) and reviewed.scenes:
             return _fix_draft(reviewed)
-    except Exception:
-        pass
+        logger.warning("[series.review] 审稿返回空草稿, 使用原草稿")
+    except Exception as exc:
+        logger.warning(
+            "[series.review] 审稿未生效, 使用未审稿草稿(%s: %.200s)",
+            type(exc).__name__, exc,
+        )
     return draft
 
 
@@ -240,10 +243,8 @@ def roll_context(prev_summary: str, draft: ChapterDraft) -> str:
     return merged[-CONTEXT_WINDOW_CHARS:]
 
 
-def build_episode_script(episode: EpisodePlan, outline: EpisodeOutline, scenes: list[Scene]) -> "Script":
+def build_episode_script(episode: EpisodePlan, outline: EpisodeOutline, scenes: list[Scene]) -> Script:
     """章节分镜汇总成单集 Script: 首镜 point 开场、末镜 ending(确定性)。"""
-    from ..models import Script
-
     if not scenes:
         raise ValueError(f"第 {episode.index} 集没有任何分镜")
     scenes[0].kind = "point"

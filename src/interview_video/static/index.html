@@ -91,6 +91,7 @@
       <select id="voice"></select>
       <label class="msg" id="sample-wrap"><input type="checkbox" id="use-sample"> 用示例脚本(免 LLM 冒烟)</label>
       <button id="btn-gen">开始生成</button>
+      <button class="ghost" id="btn-cancel" style="display:none">取消任务</button>
     </div>
     <div class="msg" id="series-progress"></div>
     <div class="stages" id="stages" style="display:none"></div>
@@ -105,7 +106,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let voices = {}, pollTimer = null;
+let voices = {}, pollTimer = null, currentJobId = null;
 
 async function api(path, opts = {}) {
   const r = await fetch(path, opts.method ? {
@@ -183,6 +184,7 @@ $("btn-gen").onclick = async () => {
 };
 
 async function pollJob(id) {
+  currentJobId = id;
   $("stages").style.display = "flex";
   clearInterval(pollTimer);
   const tick = async () => {
@@ -196,13 +198,14 @@ async function pollJob(id) {
       }
       $("stages").innerHTML = j.stages.map(s =>
         `<span class="stage ${s.done ? "done" : s.active ? "active" : ""}">${s.done ? "✓ " : ""}${s.label}</span>`).join("");
+      $("btn-cancel").style.display = j.cancellable ? "inline-block" : "none";
       if (j.status === "done") {
         clearInterval(pollTimer);
         msg("gen-msg", `✅ 完成 → ${j.project}`, "ok");
         $("btn-gen").disabled = false; loadProjects();
-      } else if (j.status === "failed") {
+      } else if (j.status === "failed" || j.status === "cancelled") {
         clearInterval(pollTimer);
-        msg("gen-msg", "❌ " + (j.error || "失败"), "err");
+        msg("gen-msg", (j.status === "cancelled" ? "⛔ " : "❌ ") + (j.error || j.status), "err");
         $("btn-gen").disabled = false;
       }
     } catch (e) { /* 轮询失败忽略, 下个周期重试 */ }
@@ -210,6 +213,13 @@ async function pollJob(id) {
   await tick();
   pollTimer = setInterval(tick, 1500);
 }
+
+$("btn-cancel").onclick = async () => {
+  try {
+    await api("/api/jobs/" + currentJobId + "/cancel", {method: "POST"});
+    msg("gen-msg", "已请求取消, 等待任务停止…");
+  } catch (e) { msg("gen-msg", e.message, "err"); }
+};
 
 async function loadProjects() {
   try {

@@ -3,25 +3,11 @@ from __future__ import annotations
 
 import json
 import re
-import sys
-import types
 from pathlib import Path
 
 import pytest
 from PIL import Image
 from typer.testing import CliRunner
-
-# --- 兼容 shim(不改只读契约) ---
-# 已装 langchain_core 1.6.4 中 GenericFakeChatModel 位于 fake_chat_models 子模块,
-# 而只读契约 llm.py 从旧路径 fake_chat 导入(已不存在); 详见 tests/test_graph.py 注释。
-try:
-    import langchain_core.language_models.fake_chat as _fake_chat  # noqa: F401
-except ModuleNotFoundError:
-    from langchain_core.language_models import fake_chat_models as _fake_chat_models
-
-    _shim = types.ModuleType("langchain_core.language_models.fake_chat")
-    _shim.GenericFakeChatModel = _fake_chat_models.GenericFakeChatModel
-    sys.modules["langchain_core.language_models.fake_chat"] = _shim
 
 from interview_video import assemble as assemble_mod
 from interview_video import llm as llm_mod

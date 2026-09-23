@@ -1,27 +1,12 @@
-"""chains 模块单元测试: 全程 fake_chat_model, 不联网、不调真实 LLM。
-
-注意: 已装的 langchain_core 1.6.x 中 ``langchain_core.language_models.fake_chat``
-已更名为 ``fake_chat_models``, 而只读契约 llm.py 仍从旧路径导入 GenericFakeChatModel。
-此处用 sys.modules shim 兼容(不改契约文件), 使 ``interview_video.llm`` 可导入。
-"""
+"""chains 模块单元测试: 全程 fake_chat_model, 不联网、不调真实 LLM。"""
 from __future__ import annotations
 
 import json
-import sys
-import types
 from pathlib import Path
 
 import pytest
 
-# ---- 兼容 shim: 必须在 import interview_video.llm 之前安装 ----
-import langchain_core.language_models.fake_chat_models as _fake_chat_models
-
-if "langchain_core.language_models.fake_chat" not in sys.modules:
-    _shim = types.ModuleType("langchain_core.language_models.fake_chat")
-    _shim.GenericFakeChatModel = _fake_chat_models.GenericFakeChatModel
-    sys.modules["langchain_core.language_models.fake_chat"] = _shim
-
-from interview_video.chains import (  # noqa: E402
+from interview_video.chains import (
     fix_script_narration,
     generate_topics,
     parse_metadata_json,

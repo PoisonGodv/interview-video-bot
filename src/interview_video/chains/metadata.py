@@ -1,14 +1,14 @@
 """元数据链: 由脚本与章节生成 B 站投稿元数据(标题/简介/标签)。"""
 from __future__ import annotations
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from typing import Any
 
 from ..config import Settings
 from ..models import BiliMeta, Chapter, Script
+from ..prompts import ChatPromptTemplate
 from . import parse_json_lenient
-from .topic import RED_LINES
+from ._invoke import invoke_structured
+from .redlines import RED_LINES
 
 # 标题长度上限(与 models.BiliMeta 描述一致)
 MAX_TITLE_CHARS = 80
@@ -27,18 +27,22 @@ def _mmss(seconds: float) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-def _build_prompt(brand: str, chapter_lines: str) -> ChatPromptTemplate:
-    """元数据 prompt: 中文 system(角色+红线) + 标题/简介/标签要求。"""
+def _build_prompt() -> ChatPromptTemplate:
+    """元数据 prompt: 中文 system(角色+红线) + 标题/简介/标签要求。
+
+    brand/chapter_lines 一律走模板变量: 章节标题来自 LLM 生成的 scene.header,
+    含 ``HashMap{K,V}`` 类花括号时也不会触发模板二次格式化(已端到端复现过崩溃)。
+    """
     return ChatPromptTemplate.from_messages(
         [
             ("system", RED_LINES),
             (
                 "user",
-                f"品牌: {brand}\n"
+                "品牌: {brand}\n"
                 "视频标题: {title}\n"
                 "视频内容概要: {summary}\n\n"
                 "章节行(必须原样逐行写进 desc, 格式 MM:SS 标题):\n"
-                f"{chapter_lines}\n\n"
+                "{chapter_lines}\n\n"
                 "请为该视频生成 B 站投稿元数据 JSON, 要求:\n"
                 f"- title: <= {MAX_TITLE_CHARS} 字, B 站风格(数字/悬念/利益点), "
                 "不做标题党、不造谣;\n"
@@ -82,31 +86,24 @@ def _finalize_meta(meta: BiliMeta) -> BiliMeta:
 
 
 async def write_metadata(
-    llm: BaseChatModel,
+    llm: Any,
     script: Script,
     chapters: list[Chapter],
     settings: Settings,
 ) -> BiliMeta:
-    """生成 B 站元数据。主路径 with_structured_output, 失败回退文本 JSON 解析,
-    两条路径都经过 _finalize_meta 确定性修正。"""
-    chapter_lines = "\n".join(f"{_mmss(c.start)} {c.title}" for c in chapters)
-    prompt = _build_prompt(settings.brand, chapter_lines)
+    """生成 B 站元数据。invoke_structured 三级策略, 结果经 _finalize_meta 修正。"""
     payload = {
+        "brand": settings.brand,
         "title": script.title,
         "summary": script.summary or script.scenes[0].narration if script.scenes else script.title,
+        "chapter_lines": "\n".join(f"{_mmss(c.start)} {c.title}" for c in chapters),
     }
-
-    try:
-        structured = prompt | llm.with_structured_output(BiliMeta)
-        result = await structured.ainvoke(payload)
-        if isinstance(result, BiliMeta):
-            return _finalize_meta(result)
-    except Exception:
-        pass  # 回退到文本 JSON 路径
-
-    chain = prompt | llm | StrOutputParser()
-    text = await chain.ainvoke(payload)
-    return _finalize_meta(parse_metadata_json(text))
+    meta = await invoke_structured(
+        _build_prompt(), llm, payload, BiliMeta, parse_metadata_json,
+        stage="metadata",
+    )
+    assert isinstance(meta, BiliMeta)
+    return _finalize_meta(meta)
 
 
 def parse_metadata_json(text: str) -> BiliMeta:

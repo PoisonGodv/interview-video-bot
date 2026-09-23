@@ -13,12 +13,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from pathlib import Path
 
 import edge_tts
 
 from .config import Settings
 from .models import Cue, SceneMedia, Script
+
+logger = logging.getLogger(__name__)
 
 # WordBoundary 的 offset/duration 单位是 100ns ticks, 秒 = ticks / 1e7
 _TICKS_PER_SECOND = 10_000_000.0
@@ -70,7 +73,10 @@ def _doubao_headers(settings: Settings) -> dict[str, str]:
     else:
         headers["X-Api-App-Id"] = settings.tts_doubao_app_key or ""
         headers["X-Api-App-Key"] = settings.tts_doubao_app_key or ""  # 两版文档头名不一, 都带上
-        headers["X-Api-Access-Key"] = settings.tts_doubao_access_key or ""
+        headers["X-Api-Access-Key"] = (
+            settings.tts_doubao_access_key.get_secret_value()
+            if settings.tts_doubao_access_key else ""
+        )
     return headers
 
 
@@ -83,7 +89,8 @@ def _doubao_payload(text: str, settings: Settings) -> dict:
             "audio_params": {
                 "format": settings.tts_doubao_format,
                 "sample_rate": settings.tts_doubao_sample_rate,
-                "speech_rate": max(-50, min(100, settings.tts_doubao_rate)),
+                # 范围校验由 Settings.tts_doubao_rate 的 Field(ge=-50, le=100) 保证
+                "speech_rate": settings.tts_doubao_rate,
             },
         },
     }
@@ -332,13 +339,71 @@ async def synthesize_scenes(
 ) -> list[SceneMedia]:
     """顺序合成所有场景(避免并发被限流), 产出 scene_%03d.mp3 与 merge 后 cues。
 
+    幂等缓存: mp3 与旁车 scene_%03d.cues.json 都在、且口播文本指纹一致时
+    直接复用(断点续跑/失败重试不重复付 TTS 费); 删掉 mp3 或改了文本会重合成。
     duration 兜底 = 最后 cue end + 0.4s; 无 cue 时仅留 0.4s。
     """
     scenes_dir.mkdir(parents=True, exist_ok=True)
     media: list[SceneMedia] = []
     for i, scene in enumerate(script.scenes):
         mp3_path = scenes_dir / f"scene_{i:03d}.mp3"
-        cues = await _synthesize_with_retry(i, scene.narration, mp3_path, settings)
-        duration = cues[-1].end + _TAIL_PAD if cues else _TAIL_PAD
+        cached = _load_scene_cache(mp3_path, scene.narration)
+        if cached is not None:
+            cues, duration = cached
+            logger.info("场景 %d TTS 命中缓存, 跳过合成", i)
+        else:
+            cues = await _synthesize_with_retry(i, scene.narration, mp3_path, settings)
+            duration = cues[-1].end + _TAIL_PAD if cues else _TAIL_PAD
+            _save_scene_cache(mp3_path, scene.narration, cues, duration)
         media.append(SceneMedia(index=i, mp3=mp3_path, cues=cues, duration=duration))
     return media
+
+
+# ---------------------------------------------------------------------------
+# 幂等缓存(旁车 scene_XXX.cues.json: 口播指纹 + cues + duration)
+# ---------------------------------------------------------------------------
+
+def _cache_path(mp3_path: Path) -> Path:
+    return mp3_path.with_suffix(".cues.json")
+
+
+def _narration_fingerprint(narration: str) -> str:
+    import hashlib
+
+    return hashlib.sha1(narration.strip().encode("utf-8")).hexdigest()
+
+
+def _save_scene_cache(
+    mp3_path: Path, narration: str, cues: list[Cue], duration: float
+) -> None:
+    try:
+        _cache_path(mp3_path).write_text(
+            json.dumps(
+                {
+                    "narration_sha1": _narration_fingerprint(narration),
+                    "duration": duration,
+                    "cues": [c.model_dump() for c in cues],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # 缓存写失败不影响本次合成, 只失去复用
+
+
+def _load_scene_cache(mp3_path: Path, narration: str) -> tuple[list[Cue], float] | None:
+    """mp3 + 旁车都在且口播指纹一致 → (cues, duration); 否则 None。"""
+    if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+        return None
+    cache = _cache_path(mp3_path)
+    if not cache.exists():
+        return None
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        if data.get("narration_sha1") != _narration_fingerprint(narration):
+            return None  # 文本变了, 缓存失效
+        cues = [Cue.model_validate(c) for c in data.get("cues", [])]
+        return cues, float(data.get("duration", 0.0))
+    except (json.JSONDecodeError, ValueError, KeyError):
+        return None

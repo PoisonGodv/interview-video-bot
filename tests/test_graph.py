@@ -5,31 +5,11 @@
 """
 from __future__ import annotations
 
-import sys
-import types
-import warnings
 from pathlib import Path
 
 import pytest
 
-# --- 兼容 shim(不改只读契约) ---
-# 已装 langchain_core 1.6.4 中 GenericFakeChatModel 位于 fake_chat_models 子模块,
-# 而只读契约 llm.py 从旧路径 langchain_core.language_models.fake_chat 导入(已不存在)。
-# 这里在 sys.modules 打补丁兼容, 使 llm.py 可导入; 契约修复应由契约负责人处理。
-try:
-    import langchain_core.language_models.fake_chat as _fake_chat  # noqa: F401
-except ModuleNotFoundError:
-    from langchain_core.language_models import fake_chat_models as _fake_chat_models
-
-    _shim = types.ModuleType("langchain_core.language_models.fake_chat")
-    _shim.GenericFakeChatModel = _fake_chat_models.GenericFakeChatModel
-    sys.modules["langchain_core.language_models.fake_chat"] = _shim
-
-from interview_video import assemble as assemble_mod
 from interview_video import llm as llm_mod
-from interview_video import render as render_mod
-from interview_video import subtitle_bars as bars_mod
-from interview_video import tts as tts_mod
 from interview_video.chains import metadata as metadata_mod
 from interview_video.chains import script as script_mod
 from interview_video.chains import topic as topic_mod
@@ -37,12 +17,7 @@ from interview_video.config import Settings
 from interview_video.graph import build_graph, run_pipeline
 from interview_video.models import (
     BiliMeta,
-    Chapter,
-    Cue,
-    RenderResult,
-    SceneMedia,
     Script,
-    SubtitleBar,
     Topic,
 )
 
@@ -50,7 +25,7 @@ SAMPLE_SCRIPT = Path(__file__).resolve().parent.parent / "examples" / "sample_sc
 
 
 async def test_run_pipeline_script_file_degrades_metadata(
-    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """--script-file 模式: 无 LLM 可用时 metadata 节点降级 meta=None 但不中断。
 
@@ -63,12 +38,11 @@ async def test_run_pipeline_script_file_degrades_metadata(
     monkeypatch.setattr(llm_mod, "get_chat_model", _no_llm)
     settings = Settings()  # llm_api_key=None
     out_dir = tmp_path / "out"
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    with caplog.at_level("WARNING", logger="interview_video.graph"):
         manifest = await run_pipeline(
             settings, out_dir, industry="互联网", script_file=SAMPLE_SCRIPT
         )
-    assert any("降级" in str(w.message) for w in caught), "应发出 metadata 降级 warning"
+    assert any("降级" in r.message for r in caplog.records), "应发出 metadata 降级日志"
     assert manifest.meta is None
     # 产物齐全
     assert (out_dir / "script.json").exists()
@@ -183,3 +157,30 @@ def test_build_graph_compiles() -> None:
         "manifest",
         "__end__",
     } <= node_names
+
+
+async def test_metadata_node_failure_degrades_not_crashes(
+    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """final.mp4 已合成后 metadata LLM 调用失败: 降级 meta=None, 流水线照常落盘。
+
+    (旧行为: write_metadata 异常直接炸掉整图, manifest 不写, 几分钟媒体产物白做。)
+    """
+    monkeypatch.setattr(llm_mod, "get_chat_model", lambda settings: object())
+
+    async def exploding_metadata(llm, script, chapters, settings):
+        raise ValueError("LLM 输出解析失败(模拟)")
+
+    monkeypatch.setattr(metadata_mod, "write_metadata", exploding_metadata)
+    settings = Settings(_env_file=None)
+    out_dir = tmp_path / "out"
+    with caplog.at_level("WARNING", logger="interview_video.graph"):
+        manifest = await run_pipeline(
+            settings, out_dir, industry="互联网", script_file=SAMPLE_SCRIPT
+        )
+    assert manifest.meta is None
+    assert (out_dir / "project.json").exists() and (out_dir / "final.mp4").exists()
+    assert any("metadata" in r.message and "降级" in r.message for r in caplog.records)
+    # 新增生成溯源块
+    assert manifest.generation is not None
+    assert manifest.generation["tts_provider"] == settings.tts_provider

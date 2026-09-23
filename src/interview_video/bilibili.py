@@ -39,9 +39,9 @@ def build_credential(settings: Settings) -> Credential | None:
     """凭证三件套齐全才返回 Credential, 否则 None。"""
     if settings.bili_sessdata and settings.bili_jct and settings.bili_buvid3:
         return Credential(
-            sessdata=settings.bili_sessdata,
-            bili_jct=settings.bili_jct,
-            buvid3=settings.bili_buvid3,
+            sessdata=settings.bili_sessdata.get_secret_value(),
+            bili_jct=settings.bili_jct.get_secret_value(),
+            buvid3=settings.bili_buvid3.get_secret_value(),
         )
     return None
 

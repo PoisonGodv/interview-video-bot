@@ -88,12 +88,13 @@ class Job:
     def __init__(self, job_id: str, params: JobRequest) -> None:
         self.id = job_id
         self.params = params
-        self.status = "running"  # running | done | failed
+        self.status = "running"  # running | done | failed | cancelled
         self.current_stage: str | None = None
         self.done_stages: list[str] = []
         self.error: str | None = None
         self.project: str | None = None  # out_dir 名(系列模式=系列根目录名)
         self.series: dict[str, Any] | None = None  # 系列进度 {episode,episodes,chapter,chapters,phase}
+        self.task: asyncio.Task | None = None  # 后台任务句柄(取消接口用)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +105,7 @@ class Job:
             "error": self.error,
             "project": self.project,
             "series": self.series,
+            "cancellable": self.status == "running" and self.task is not None,
             "stages": [
                 {"key": k, "label": label, "done": k in self.done_stages,
                  "active": k == self.current_stage and self.status == "running"}
@@ -138,6 +140,7 @@ async def _execute_pipeline(
 ) -> ProjectManifest:
     """build_graph + astream(updates) 跑流水线, 逐节点回调进度。"""
     from . import graph as graph_mod
+    from .llm_audit import LLMCallAudit
 
     out_dir.mkdir(parents=True, exist_ok=True)
     graph = graph_mod.build_graph(settings)
@@ -149,7 +152,9 @@ async def _execute_pipeline(
     }
     if script is not None:
         initial["script"] = script
-    async for chunk in graph.astream(initial, stream_mode="updates"):
+    async for chunk in graph.astream(
+        initial, stream_mode="updates", config={"callbacks": [LLMCallAudit(out_dir)]}
+    ):
         for node_name in chunk:
             on_stage(node_name)
     return ProjectManifest.model_validate_json(
@@ -224,11 +229,16 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         job = Job(uuid.uuid4().hex[:8], req)
         manager.jobs[job.id] = job
         manager.active = True
-        scheduler(_run_job, job, script_file)
+        job.task = scheduler(_run_job, job, script_file)
         return {"job_id": job.id}
 
     async def _run_job(job: Job, script_file: Path | None) -> None:
+        import logging
+        import traceback
+
         from .cli import _default_out_dir  # 复用 CLI 的目录命名
+
+        logger = logging.getLogger(__name__)
 
         def _on_stage(node: str) -> None:
             if job.current_stage and job.current_stage not in job.done_stages:
@@ -260,15 +270,36 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
                     job.done_stages.append(job.current_stage)
                 job.status = "done"
             except asyncio.CancelledError:
-                job.status, job.error = "failed", "任务被取消"
+                job.status, job.error = "cancelled", "任务被取消"
                 raise
             except Exception as exc:  # noqa: BLE001 —— 任务失败原因直接回前端
-                job.status, job.error = "failed", str(exc)
+                job.status, job.error = "failed", f"{type(exc).__name__}: {exc}"
+                # 失败现场落盘: 堆栈 + 失败时所在阶段(重启后仍可查)
+                try:
+                    err_path = (
+                        out_root
+                        / (job.project or ".")
+                        / f"error-{job.id}.log"
+                    )
+                    err_path.parent.mkdir(parents=True, exist_ok=True)
+                    err_path.write_text(
+                        f"stage={job.current_stage} series={job.series}\n"
+                        f"{traceback.format_exc()}",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                logger.exception("任务 %s 失败(阶段 %s)", job.id, job.current_stage)
         finally:
             manager.active = False
 
     async def _run_series_job(job: Job, job_settings: Settings, on_stage) -> None:
-        """系列模式: 多 agent 生成每集脚本 → 逐集走媒体流水线。"""
+        """系列模式: 多 agent 生成每集脚本 → 逐集走媒体流水线。
+
+        根目录在调 LLM 前创建并作为 run_dir 传入 generate_series:
+        每章/每集完成即增量落盘(planning/), 失败不丢已花掉的 token;
+        已有 project.json 的分集直接跳过(重试幂等)。
+        """
         from . import series as series_mod
         from .cli import _slug
 
@@ -278,6 +309,9 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
             "episodes": req.episodes, "episode": 0,
             "chapter": 0, "chapters": 0, "phase": "策划中",
         }
+        root = out_root / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
+        root.mkdir(parents=True, exist_ok=True)
+        job.project = root.name  # 先定根目录: 失败时 error.log 也能落到系列目录
 
         def on_event(name: str, **p) -> None:
             s = job.series
@@ -295,9 +329,8 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         plan, scripts = await series_mod.generate_series(
             job_settings, theme, episodes=req.episodes,
             episode_sec=int(req.duration_min * 60), on_event=on_event,
+            run_dir=root,
         )
-        root = out_root / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
-        root.mkdir(parents=True, exist_ok=True)
         (root / "series.json").write_text(
             plan.model_dump_json(indent=2), encoding="utf-8"
         )
@@ -305,10 +338,11 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
             job.series.update(episode=i + 1, phase="媒体合成")
             job.done_stages, job.current_stage = [], None  # 每集重置节点进度
             out_dir = root / f"ep{i + 1:02d}-{_slug(script.title)}"
+            if (out_dir / "project.json").exists():
+                continue  # 已有成片, 重试幂等跳过
             await _execute_pipeline(
                 job_settings, out_dir, theme, None, None, on_stage, script=script,
             )
-        job.project = root.name
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str) -> dict[str, Any]:
@@ -316,6 +350,17 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         if job is None:
             raise HTTPException(404, "任务不存在(重启后内存任务清空)")
         return job.to_dict()
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> dict[str, str]:
+        """取消运行中的任务(长任务失控时的唯一中止手段, 不必杀进程)。"""
+        job = manager.jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, "任务不存在")
+        if job.status != "running" or job.task is None:
+            raise HTTPException(409, f"任务不在运行中(当前状态: {job.status})")
+        job.task.cancel()
+        return {"ok": "已请求取消"}
 
     # ---------- 作品库 ----------
     def _project_dir(name: str) -> Path:

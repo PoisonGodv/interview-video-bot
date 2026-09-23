@@ -4,13 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "interview-video-bot"
-version = "0.1.0"
-description = "AI 面试求职短视频流水线: LangChain 选题/脚本 → edge-tts 配音 → Playwright 渲染 → ffmpeg 合成 → B站发布"
+dynamic = ["version"]  # 单一事实来源: interview_video.__version__
+description = "AI 面试求职短视频流水线: 原生 HTTP API 选题/脚本 + 模型输出边界 → edge-tts 配音 → Playwright 渲染 → ffmpeg 合成 → B站发布"
 requires-python = ">=3.10"
 dependencies = [
-  "langchain>=0.3",
-  "langchain-openai>=0.3",
-  "langgraph>=0.2",
   "edge-tts>=7.0",
   "httpx>=0.27",
   "jinja2>=3.1",
@@ -26,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
 
 [project.scripts]
 ivb = "interview_video.cli:main"
@@ -37,6 +34,22 @@ where = ["src"]
 [tool.setuptools.package-data]
 interview_video = ["templates/*.html", "static/*.html"]
 
+[tool.setuptools.dynamic]
+version = {attr = "interview_video.__version__"}
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+  "E501",  # 长行多为中文注释/字符串, 手工控制
+  "UP045", # `X | None` 与 Optional 混用是渐进迁移
+  "B008",  # typer.Option/Argument 放默认值是框架惯用法
+  "B905",  # 存量 zip() 未写 strict, 行为等价, 不在本次范围
+]

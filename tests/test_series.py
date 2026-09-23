@@ -222,3 +222,165 @@ async def test_pipeline_preset_script_skips_llm(fake_media, tmp_path):
     assert manifest.script.title == "预制脚本"
     assert (tmp_path / "out" / "script.json").exists()
     assert manifest.meta is None  # 无 key → metadata 降级, 不中断
+
+
+# ---------- 章节护栏(clamp) ----------
+
+def test_clamp_outline_truncates_and_clamps_est_sec():
+    from interview_video.series import _clamp_outline
+
+    outline = EpisodeOutline(
+        episode_index=1, title="集1",
+        chapters=[sc.ChapterSpec(title=f"章{i}", est_sec=150) for i in range(50)],
+    )
+    outline.chapters[0].est_sec = 99999
+    outline.chapters[1].est_sec = 1
+    clamped = _clamp_outline(outline, ep_target_sec=900, chapter_sec=150)
+    # 900/150 + 2 = 8 章(≥ _MIN_CHAPTERS=4)
+    assert len(clamped.chapters) == 8
+    assert all(60 <= c.est_sec <= 600 for c in clamped.chapters)
+
+
+def test_clamp_outline_keeps_min_chapters():
+    from interview_video.series import _clamp_outline
+
+    outline = EpisodeOutline(
+        episode_index=1, title="集1",
+        chapters=[sc.ChapterSpec(title=f"章{i}", est_sec=150) for i in range(3)],
+    )
+    clamped = _clamp_outline(outline, ep_target_sec=120, chapter_sec=150)
+    assert len(clamped.chapters) == 3  # 不足下限不补章, 只截上界
+
+
+def test_write_chapter_scene_count_cap():
+    """est_sec 异常大时, 分镜数被夹在 MAX_SCENES_PER_CHAPTER 内。"""
+    from interview_video.chains.series import MAX_SCENES_PER_CHAPTER
+
+    big = sc.ChapterSpec(title="大章", est_sec=6000)
+    scene_count = min(MAX_SCENES_PER_CHAPTER, max(4, round(big.est_sec / 20)))
+    assert scene_count == MAX_SCENES_PER_CHAPTER
+
+
+# ---------- 增量落盘 + 断点续跑 ----------
+
+async def test_series_incremental_persist_and_resume(monkeypatch, tmp_path):
+    """run_dir 模式: 每章/每集落盘; 失败后 resume 从磁盘重建状态,
+    已完成的集不再调 LLM(用假链计数验证)。"""
+    from interview_video import series as series_mod
+
+    plan = SeriesPlan(
+        theme="t", title="系列", synopsis="圣经",
+        episodes=[
+            EpisodePlan(index=1, title="集1", target_sec=300),
+            EpisodePlan(index=2, title="集2", target_sec=300),
+        ],
+    )
+    outline1 = EpisodeOutline(episode_index=1, title="集1", chapters=[
+        sc.ChapterSpec(title="e1c1", est_sec=150),
+        sc.ChapterSpec(title="e1c2", est_sec=150),
+    ])
+    outline2 = EpisodeOutline(episode_index=2, title="集2", chapters=[
+        sc.ChapterSpec(title="e2c1", est_sec=150),
+    ])
+    outlines = {1: outline1, 2: outline2}
+    calls: list[str] = []
+
+    class _Boom(Exception):
+        pass
+
+    async def fake_plan(llm, theme, episodes, episode_sec):
+        calls.append("plan")
+        return plan
+
+    async def fake_outline(llm, plan_, episode, chapter_sec):
+        calls.append(f"outline{episode.index}")
+        return outlines[episode.index]
+
+    async def fake_write(llm, plan_, outline, chapter, ch_no, prev_summary, settings):
+        calls.append(f"write:{outline.title}/{chapter.title}")
+        return ChapterDraft(
+            scenes=[_scene(f"{chapter.title}镜")], summary=f"{chapter.title}摘要"
+        )
+
+    async def fake_review(llm, draft, chapter, prev_summary):
+        return draft
+
+    monkeypatch.setattr(sc, "plan_series", fake_plan)
+    monkeypatch.setattr(sc, "write_episode_outline", fake_outline)
+    monkeypatch.setattr(sc, "write_chapter", fake_write)
+    monkeypatch.setattr(sc, "review_chapter", fake_review)
+    monkeypatch.setattr("interview_video.llm.get_chat_model", lambda s: object())
+
+    settings = _settings()
+    root = tmp_path / "run"
+
+    # 第一次跑: 写到第 2 集大纲后崩(模拟中途失败)
+    real_outline = fake_outline
+
+    async def exploding_outline(llm, plan_, episode, chapter_sec):
+        if episode.index == 2:
+            raise _Boom("模拟中途失败")
+        return await real_outline(llm, plan_, episode, chapter_sec)
+
+    monkeypatch.setattr(sc, "write_episode_outline", exploding_outline)
+    with pytest.raises(_Boom):
+        await series_mod.generate_series(
+            settings, "t", episodes=2, episode_sec=300, run_dir=root,
+        )
+    # 增量落盘: 规划 + 第 1 集完整产物 + 第 2 集无(大纲前就崩了)
+    assert (root / "series.json").exists()
+    assert (root / "planning" / "ep01" / "script.json").exists()
+    assert (root / "planning" / "ep01" / "drafts" / "ch01.json").exists()
+    assert not (root / "planning" / "ep02").exists()
+
+    # resume: 只应补第 2 集(1 次大纲 + 1 次写章), 不再调 plan/第 1 集
+    calls.clear()
+    monkeypatch.setattr(sc, "write_episode_outline", real_outline)
+    _, scripts = await series_mod.generate_series(
+        settings, "t", episodes=2, episode_sec=300, run_dir=root, resume=True,
+    )
+    assert calls == ["outline2", "write:集2/e2c1"]
+    assert [len(s.scenes) for s in scripts] == [2, 1]
+
+
+async def test_restore_state_mid_episode(tmp_path):
+    """第 2 集写到一半(outline + 2 章草稿, 缺 script.json): 重建到该集第 3 章。"""
+    from interview_video import series as series_mod
+
+    root = tmp_path / "run"
+    root.mkdir(parents=True)
+    plan = SeriesPlan(
+        theme="t", title="系列", synopsis="圣经",
+        episodes=[EpisodePlan(index=1, title="集1"), EpisodePlan(index=2, title="集2")],
+    )
+    (root / "series.json").write_text(plan.model_dump_json(), encoding="utf-8")
+
+    # 第 1 集完整
+    ep1 = root / "planning" / "ep01"
+    ep1.mkdir(parents=True)
+    (ep1 / "script.json").write_text(
+        Script(title="集1", scenes=[_scene("a")]).model_dump_json(), encoding="utf-8"
+    )
+    # 第 2 集: 大纲 3 章, 写完 2 章
+    ep2 = root / "planning" / "ep02"
+    (ep2 / "drafts").mkdir(parents=True)
+    (ep2 / "outline.json").write_text(
+        EpisodeOutline(episode_index=2, title="集2", chapters=[
+            sc.ChapterSpec(title="c1", est_sec=150),
+            sc.ChapterSpec(title="c2", est_sec=150),
+            sc.ChapterSpec(title="c3", est_sec=150),
+        ]).model_dump_json(),
+        encoding="utf-8",
+    )
+    for i in (1, 2):
+        (ep2 / "drafts" / f"ch{i:02d}.json").write_text(
+            ChapterDraft(scenes=[_scene(f"s{i}")], summary=f"摘要{i}").model_dump_json(),
+            encoding="utf-8",
+        )
+
+    state = series_mod._restore_state(root, episodes=2)
+    assert state["ep_idx"] == 1  # 第 2 集(0 起)
+    assert state["ch_idx"] == 2  # 前 2 章已完成
+    assert len(state["scripts"]) == 1
+    assert [s.header for s in state["scenes"]] == ["s1", "s2"]
+    assert "摘要1" in state["prev_summary"] and "摘要2" in state["prev_summary"]

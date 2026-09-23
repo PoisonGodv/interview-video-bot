@@ -17,9 +17,10 @@ Script + chapters ──chains/metadata.py──▶ BiliMeta(标题/简介/标�
         ──▶ project.json(manifest); 可选 bilibili.py 上传 B站
 ```
 
-编排层 `graph.py` 用 LangGraph 把以上串成线性 8 节点图:
+编排层 `graph.py` 基于原生异步工作流引擎(`workflow_engine.py`, 零第三方依赖)把以上串成线性 8 节点图:
 `gen_script → tts → render → clips → subs → finalize → metadata → manifest`,
 `run_pipeline()` 是 async 便捷入口; `cli.py` 是 `ivb` 命令行(也是 `python -m interview_video`)。
+LLM 调用完全基于原生 HTTP 客户端(`httpx`, 彻底移除 LangChain/LangGraph 依赖), 并由模型输出边界体系(`boundary.py`)提供强类型、结构与业务红线防护。
 
 本机 ffmpeg **无 libass**(没有 subtitles 滤镜), 因此字幕不走 `subtitles` 滤镜,
 而是 Pillow 生成「底部字幕条透明 PNG + overlay」方案, 兼容性更好。
@@ -65,11 +66,15 @@ ivb upload output/demo --yes
 
 ## 系列长视频(多 agent)
 
-一个主题 → 多 agent(LangGraph)自动生成多集长视频(每集 10-20 分钟):
+一个主题 → 多 agent(原生状态图双循环)自动生成多集长视频(每集 10-20 分钟):
 
 ```bash
 # 生成 3 集 × 每集约 15 分钟的系列(主题自拟)
 ivb series "程序员面试通关" --episodes 3 --duration 15
+
+# 中途失败(断网/限流/解析失败)后断点续跑: 已完成的集与章节不重跑、
+# 已有成片的分集跳过媒体合成, 不再重复付 LLM/TTS 费用
+ivb series "程序员面试通关" --resume output/程序员面试通关-series-20260923-1600
 ```
 
 多 agent 角色与协作(`chains/series.py` + `series.py` 双循环图):
@@ -80,12 +85,38 @@ ivb series "程序员面试通关" --episodes 3 --duration 15
    把上一章摘要传给下一章——上下文在章节边界切分, 集与集之间全量重置, 避免超长上下文漂移;
 4. **审稿**(`review_chapter`): 逐章审校(红线/口语化/与摘要一致性), 可用 `SERIES_REVIEW=false` 关闭。
 
+**崩溃恢复**: 每章/每集完成即增量落盘到系列根目录的 `planning/`
+(`series.json` / `epXX/outline.json` / `epXX/drafts/chXX.json` / `epXX/script.json`),
+配 `--resume` 从磁盘重建图状态续跑; 失败的 LLM 调用由
+`chains/_invoke.py` 统一兜底(结构化输出 → 本地重解析 → 带错误反馈的修复重问,
+鉴权类错误立即失败, 所有回退留痕日志)。
+
 每集脚本写完即走完整媒体流水线(配音→渲染→合成→字幕→元数据),
 产物在 `output/<主题>-series-<时间戳>/ep01-*/ …`, 系列规划存 `series.json`;
 作品库会把系列分集展开列出, 可逐集播放/编辑元数据/上传 B站。
 
 生成完成后会 rich 打印产物路径(final.mp4 / cover.png / subtitles.srt)与 BiliMeta
 (标题/标签); 若 `BILI_UPLOAD_ENABLED=true`, 会询问确认后上传(`--yes` 跳过)。
+
+## 可观测性与成本
+
+- **LLM 审计**: 每次调用的 token/耗时/输入输出规模追加到产物目录 `llm_calls.jsonl`
+  (CLI/Web 都注入), 一次系列花了多少 token 一查便知;
+- **日志**: 统一 INFO 控制台 + `output/ivb.log` 文件双通道, 回退/降级/重试全部留痕;
+- **Web 失败诊断**: 任务失败时堆栈与所在阶段落盘 `error-<jobid>.log`;
+- **生成溯源**: `project.json` 的 `generation` 块记录模型/温度/TTS 通道/prompt 版本;
+- **TTS 幂等缓存**: mp3 与 `scene_XXX.cues.json` 旁车(口播指纹)命中则跳过合成,
+  重跑不重复付费; **备用模型**: 配 `LLM_FALLBACK_*` 三个变量即可主备自动切换。
+
+## 生成质量评测
+
+```bash
+ivb eval --limit 3            # 跑 golden 用例(需 LLM_API_KEY): 契约+红线检查
+ivb eval --no-judge           # 关掉 LLM-as-judge(钩子/口语化/连贯 1~5 打分)
+ivb eval -o eval-report.json  # 报告落盘, 改 prompt 后对比基线
+```
+
+红线词表(`chains/redlines.py`)prompt 与评测共用: prompt 只是叮嘱, 扫描器才是闸门。
 
 ## Web 操作台
 
@@ -103,6 +134,9 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
    生成单飞(同时只跑一个任务, 避免 TTS 限流), 并发提交返回 409;
 3. **作品库**: 封面墙(系列分集自动展开为独立条目) → 详情里可播放成片、
    编辑 B站标题/简介/标签(写回 project.json)、一键上传(未配 cookie 三件套会返回指引)。
+
+生成中的长任务可点**取消任务**(或 `POST /api/jobs/{id}/cancel`), 不必杀进程;
+任务失败时堆栈与所在阶段落盘 `error-<jobid>.log`。
 
 > 本地工具, 默认只绑 127.0.0.1; 上传成功后 bvid 记录在项目目录 upload.json。
 
@@ -161,27 +195,44 @@ BILI_TID=36
 ```
 output/<slug>-<时间戳>/
   script.json            # Script.model_dump_json(indent=2)
-  scenes/scene_000.mp3   scene_000.png ...   # 每场景配音 + 画面帧
+  scenes/scene_000.mp3   scene_000.cues.json   # 每场景配音 + 幂等缓存旁车(口播指纹+cues)
   clips/scene_000.mp4 ...                     # 每场景合成片段
   subs/bar_000.png ...   subtitles.srt        # 字幕条 PNG + 全局 srt
   cover.png
   final.mp4                                     # 成片
-  project.json                                  # ProjectManifest(含 BiliMeta)
+  project.json                                  # ProjectManifest(含 BiliMeta + generation 溯源)
+  llm_calls.jsonl                               # LLM 调用审计(token/耗时)
+
+# 系列模式额外(增量落盘, --resume 的依据):
+output/<主题>-series-<时间戳>/
+  series.json                              # 策划 agent 产出(plan 一出即落盘)
+  planning/ep01/outline.json               # 分集编剧产出
+  planning/ep01/drafts/ch01.json ...       # 章节写手/审稿后草稿(每章落盘)
+  planning/ep01/script.json                # 该集脚本完成标记
+  ep01-<slug>/ ...                         # 分集媒体产物(同上单集结构)
+  error-<jobid>.log                        # Web 任务失败现场(如有)
 ```
 
-## 测试
+## 测试与 CI
 
 ```bash
-.venv/bin/pytest                  # 单元测试(不联网/不调真实 LLM/不起 chromium)
+.venv/bin/pytest                  # 单元测试(不联网/不调真实 LLM/不起 chromium), 147 个
 .venv/bin/pytest --run-integration  # 额外跑需要 ffmpeg/网络/chromium 的集成测试
+make test                         # 等价入口(make lint / make integration / make eval)
+.venv/bin/ruff check src tests    # 静态检查(CI 同款)
 ```
 
 单元测试将 tts/render/assemble/subtitle_bars monkeypatch 成本地假实现;
 依赖 ffmpeg 的素材合成测试打 `@pytest.mark.integration`, 缺二进制时自动 skip。
+CI(GitHub Actions / Gitea 镜像, `.github/workflows/ci.yml`)在每次 push 跑
+ruff + 全量离线单测; 依赖由 `uv.lock` 锁定(`uv sync --extra dev` 复现环境)。
+变更记录见 `CHANGELOG.md`。
 
 ## 路线图
 
 - ~~Web 操作台~~(已落地: `ivb web`)
+- ~~系列断点续跑 / LLM 调用健壮化 / 可观测性 / evals~~(0.2.0 已落地)
 - 双音色对话(面试官/求职者交替配音, 更强代入感)
 - 真人数字人形象(替代 HTML 画面帧)
 - 自动定时发布(接 B站 delay_time / cron 定点投递)
+- LangGraph interrupt() 人工审稿介入(策划确认后再跑全集)

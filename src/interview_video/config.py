@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,23 +19,29 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_timeout: int = 300
     llm_temperature: float = 0.7
+    llm_max_tokens: int | None = None   # None=用网关默认; 显式设置可防长输出截断
+    llm_max_retries: int = 2            # 客户端层网络/限流重试次数
+    # 备用模型(主模型限流/宕机时自动切换, chains 层零改动)
+    llm_fallback_model: str | None = None
+    llm_fallback_base_url: str | None = None
+    llm_fallback_api_key: SecretStr | None = None
 
     # ---- TTS ----
-    tts_provider: str = "edge"  # edge(免费,词级时间轴) | doubao(火山引擎,估算时间轴)
+    tts_provider: Literal["edge", "doubao"] = "edge"  # 拼错直接配置报错, 不再静默回退
     tts_voice: str = "zh-CN-YunxiNeural"
     tts_rate: str = "+6%"
 
     # ---- 豆包 TTS(TTS_PROVIDER=doubao 时生效, seed-tts-2.0 HTTP 单向流式) ----
     tts_doubao_api_key: SecretStr | None = None   # 新版控制台一个 key 即可
     tts_doubao_app_key: str | None = None          # 旧版控制台退回 App ID + Access Key 一对
-    tts_doubao_access_key: str | None = None
+    tts_doubao_access_key: SecretStr | None = None
     tts_doubao_http_url: str = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
     tts_doubao_resource_id: str = "seed-tts-2.0"   # 2.0 音色配 seed-tts-2.0, 1.0 音色配 seed-tts-1.0
     tts_doubao_uid: str = "interview-video-bot"
     tts_doubao_format: str = "mp3"
     tts_doubao_sample_rate: int = 24000
     tts_doubao_voice: str = "zh_male_m191_uranus_bigtts"  # 云舟(男); 女声 zh_female_vv_uranus_bigtts
-    tts_doubao_rate: int = 0                              # speech_rate, [-50,100], 0 为原速
+    tts_doubao_rate: int = Field(default=0, ge=-50, le=100)  # speech_rate, 0 为原速
     tts_doubao_recv_timeout: int = 30                     # 流式单次读超时(秒)
 
     # ---- 内容 ----
@@ -64,9 +71,9 @@ class Settings(BaseSettings):
     # ---- B站 ----
     bili_tid: int = 36
     bili_upload_enabled: bool = False
-    bili_sessdata: str | None = None
-    bili_jct: str | None = None
-    bili_buvid3: str | None = None
+    bili_sessdata: SecretStr | None = None
+    bili_jct: SecretStr | None = None
+    bili_buvid3: SecretStr | None = None
 
     # ---- 输出 ----
     out_root: Path = Path("output")

@@ -150,6 +150,62 @@ def test_job_not_found(client):
     assert client.get("/api/jobs/nope").status_code == 404
 
 
+def test_job_failure_sets_error_and_releases_lock(portal_app, settings, monkeypatch):
+    """任务失败: status=failed + error 带原因, 锁释放后新任务可提交(202)。"""
+    async def boom(settings, out_dir, industry, topic_title, script_file, on_stage):
+        raise RuntimeError("TTS boom")
+
+    monkeypatch.setattr("interview_video.web._execute_pipeline", boom)
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        r1 = client.post("/api/jobs", json={"industry": "互联网"})
+        assert r1.status_code == 202
+        _drive(client, scheduled)
+        job = _wait_job(client, r1.json()["job_id"])
+        assert job["status"] == "failed"
+        assert "TTS boom" in job["error"]
+        # 失败现场落盘
+        err_logs = list(settings.out_root.glob("error-*.log"))
+        assert err_logs and "TTS boom" in err_logs[0].read_text("utf-8")
+        # 锁已释放: 新任务能再进(不再 409)
+        monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
+        r2 = client.post("/api/jobs", json={"industry": "互联网"})
+        assert r2.status_code == 202
+
+
+def test_job_cancel(settings, monkeypatch):
+    """取消接口: 运行中任务可取消, 状态 cancelled 且锁释放。"""
+    import asyncio
+
+    async def slow_execute(settings, out_dir, industry, topic_title, script_file, on_stage):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("interview_video.web._execute_pipeline", slow_execute)
+
+    # 调度器在 handler(跑在 portal 的 asyncio loop)内直接 create_task,
+    # 与 uvicorn 下"任务跨请求存活"等价, 拿到真 Task 句柄供取消。
+    def scheduler(fn, *a):
+        return asyncio.get_running_loop().create_task(fn(*a))
+
+    app = create_app(settings, scheduler=scheduler)
+    with TestClient(app) as client:
+        job_id = client.post("/api/jobs", json={"industry": "互联网"}).json()["job_id"]
+        assert client.get(f"/api/jobs/{job_id}").json()["status"] == "running"
+
+        rc = client.post(f"/api/jobs/{job_id}/cancel")
+        assert rc.status_code == 200
+        job = _wait_job(client, job_id, timeout=5)
+        assert job["status"] == "cancelled"
+        assert "取消" in job["error"]
+        # 锁已释放: 新任务可提交; 已结束的任务再取消 → 409
+        assert client.post("/api/jobs", json={"industry": "x"}).status_code == 202
+        assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 409
+
+
+def test_cancel_not_found(client):
+    assert client.post("/api/jobs/nope/cancel").status_code == 404
+
+
 # ---------- 元数据与上传 ----------
 
 def test_meta_edit_and_upload_guard(portal_app, monkeypatch):
@@ -180,9 +236,8 @@ def test_project_name_traversal_blocked(client):
 
 def test_series_job(portal_app, monkeypatch, settings):
     """系列任务: 假多 agent 生成 2 集 → 每集各跑一次假流水线 → 分集目录落盘。"""
-    from interview_video.models import EpisodeOutline, EpisodePlan, Scene, Script
     from interview_video.chains.series import ChapterSpec
-    from interview_video.models import SeriesPlan
+    from interview_video.models import EpisodeOutline, EpisodePlan, Scene, Script, SeriesPlan
 
     plan = SeriesPlan(
         theme="程序员面试", title="通关", synopsis="s",
@@ -190,7 +245,8 @@ def test_series_job(portal_app, monkeypatch, settings):
                   EpisodePlan(index=2, title="第二集")],
     )
 
-    async def fake_generate_series(settings, theme, episodes, episode_sec, on_event=None):
+    async def fake_generate_series(settings, theme, episodes, episode_sec,
+                                   on_event=None, run_dir=None, resume=False):
         scripts = []
         for i, ep in enumerate(plan.episodes):
             outline = EpisodeOutline(episode_index=ep.index, title=ep.title,

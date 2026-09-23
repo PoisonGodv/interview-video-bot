@@ -1,4 +1,4 @@
-"""命令行入口: ``ivb topics / generate / upload``(console_scripts 需要 main 包装)。"""
+"""命令行入口: ``ivb topics / generate / upload / series / eval / web``。"""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +13,7 @@ from rich.panel import Panel
 
 from .config import Settings, load_settings
 from .graph import run_pipeline
+from .logging_setup import setup_logging
 from .models import ProjectManifest, Topic
 
 app = typer.Typer(
@@ -143,16 +144,31 @@ def series(
     theme: str = typer.Argument(..., help="系列主题, 如 程序员面试通关"),
     episodes: int = typer.Option(3, "--episodes", "-e", help="集数"),
     duration: float = typer.Option(15.0, "--duration", "-d", help="每集目标时长(分钟)"),
+    resume: Path | None = typer.Option(
+        None, "--resume",
+        help="断点续跑: 传上次系列的根目录(含 series.json), 已完成的集/章不重跑",
+    ),
 ) -> None:
     """多 agent 系列长视频: 一个主题 → N 集 × M 分钟(策划/编剧/章节写手/审稿)。"""
     settings = load_settings()
-    asyncio.run(_series_main(settings, theme, episodes, duration))
+    if resume is not None and not (resume / "series.json").exists():
+        console.print(f"[red]--resume 目录缺 series.json: {resume}[/]")
+        raise typer.Exit(1)
+    asyncio.run(_series_main(settings, theme, episodes, duration, resume_dir=resume))
 
 
 async def _series_main(
-    settings: Settings, theme: str, episodes: int, duration_min: float
+    settings: Settings,
+    theme: str,
+    episodes: int,
+    duration_min: float,
+    resume_dir: Path | None = None,
 ) -> Path:
-    """系列生成主流程: 多 agent 出脚本 → 逐集走媒体流水线。"""
+    """系列生成主流程: 多 agent 出脚本 → 逐集走媒体流水线。
+
+    根目录在调用 LLM 前创建, 每章/每集完成即增量落盘; 失败后可用
+    ``--resume <root>`` 续跑(已完成集的媒体产物按 project.json 跳过)。
+    """
     from .series import generate_series
 
     def on_event(name: str, **p) -> None:
@@ -174,24 +190,60 @@ async def _series_main(
                 f"[green]第 {p['ep_idx'] + 1} 集脚本完成({len(p['script'].scenes)} 镜)[/]"
             )
 
+    if resume_dir is not None:
+        root = Path(resume_dir)
+        console.print(f"[yellow]断点续跑[/] → {root}")
+    else:
+        root = (
+            settings.out_root
+            / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
+        )
+    root.mkdir(parents=True, exist_ok=True)
     plan, scripts = await generate_series(
         settings, theme, episodes=episodes,
         episode_sec=int(duration_min * 60), on_event=on_event,
+        run_dir=root, resume=resume_dir is not None,
     )
-    root = (
-        settings.out_root
-        / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
-    )
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "series.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
     for i, script in enumerate(scripts):
         out_dir = root / f"ep{i + 1:02d}-{_slug(script.title)}"
+        if (out_dir / "project.json").exists():
+            console.print(f"[yellow]第 {i + 1} 集已有成片, 跳过[/] → {out_dir}")
+            continue
         console.print(f"[bold]第 {i + 1}/{len(scripts)} 集媒体合成[/] → {out_dir}")
         await run_pipeline(settings, out_dir, industry=theme, script=script)
     console.print(
         Panel(f"共 {len(scripts)} 集 → {root}", title="系列生成完成", border_style="green")
     )
     return root
+
+
+@app.command()
+def eval(
+    limit: int = typer.Option(3, "--limit", "-l", help="评测用例数(截取 golden 集)"),
+    judge: bool = typer.Option(True, "--judge/--no-judge", help="是否跑 LLM-as-judge 打分"),
+    out: Path | None = typer.Option(None, "--out", "-o", help="报告 JSON 落盘路径"),
+) -> None:
+    """生成质量评测: 真实模型跑 golden 用例 → 契约/红线检查(+可选 judge)。"""
+    settings = load_settings()
+    from .evals import GOLDEN_CASES, run_evals
+
+    report = asyncio.run(run_evals(settings, GOLDEN_CASES[:limit], judge=judge))
+    for r in report["results"]:
+        status = "OK" if not (r.get("issues") or r.get("fatal")) else "FAIL"
+        console.print(
+            f"[{'green' if status == 'OK' else 'red'}]{status}[/] "
+            f"{r['industry']}/{r['topic']}"
+            + (f" [dim]{'; '.join(r.get('issues') or [r.get('fatal', '')])}[/]" if status == "FAIL" else "")
+        )
+    console.print(
+        f"评测完成: {report['total'] - report['failed']}/{report['total']} 通过"
+        f"(模型 {report['llm_model']}, judge={'on' if report['judge'] else 'off'})"
+    )
+    if out is not None:
+        out.write_text(report["report_json"], encoding="utf-8")
+        console.print(f"报告 → {out}")
+    if report["failed"]:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -210,7 +262,20 @@ def web(
 
 def main() -> None:
     """console_scripts 入口(ivb = interview_video.cli:main)。"""
-    app()
+    from .config import load_settings as _ls
+
+    try:  # 日志文件目录跟随 out_root; 失败退化为仅控制台
+        setup_logging(_ls().out_root)
+    except Exception:  # noqa: BLE001
+        setup_logging()
+    try:
+        app()
+    except (typer.Exit, typer.Abort):
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 顶层兜底: 红字替代裸 traceback
+        console.print(f"[bold red]失败:[/] {type(exc).__name__}: {exc}")
+        console.print("[dim]详情见 output/ivb.log(或上方日志)[/]")
+        raise typer.Exit(1) from exc
 
 
 if __name__ == "__main__":

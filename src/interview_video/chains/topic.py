@@ -1,23 +1,17 @@
 """选题链: 按行业生成求职面试短视频选题清单。"""
 from __future__ import annotations
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from typing import Any
+
 from pydantic import BaseModel
 
 from ..models import Topic
+from ..prompts import ChatPromptTemplate
 from . import parse_json_lenient
+from ._invoke import invoke_structured
+from .redlines import RED_LINES
 
-# 内容红线(全链共用, 与 SPECS §2 一致)
-RED_LINES = (
-    "你是一名资深求职内容策划, 擅长为短视频平台策划高转化的求职面试内容。\n"
-    "选题与文案必须真实、积极、可执行, 并严格遵守以下红线:\n"
-    "1. 不编造具体薪资数字, 涉及待遇时用『因城市/公司差异大』类表述;\n"
-    "2. 不含有年龄/性别/学历等歧视性内容;\n"
-    "3. 不承诺『包过/必上岸』等结果;\n"
-    "4. 不诋毁任何具体公司或个人。"
-)
+__all__ = ["RED_LINES", "generate_topics", "parse_topics_json"]
 
 
 class _TopicList(BaseModel):
@@ -45,36 +39,33 @@ def _build_prompt() -> ChatPromptTemplate:
     )
 
 
+def _parse_topic_list(text: str) -> _TopicList:
+    """回退解析(包装成与结构化路径同型, 供 invoke_structured 统一处理)。"""
+    return _TopicList(topics=parse_topics_json(text))
+
+
 async def generate_topics(
-    llm: BaseChatModel,
+    llm: Any,
     industry: str,
     n: int = 5,
     avoid: list[str] | None = None,
 ) -> list[Topic]:
-    """生成 n 个选题。主路径走 with_structured_output, 不支持的模型回退文本 JSON 解析。"""
-    prompt = _build_prompt()
+    """生成 n 个选题。统一走 invoke_structured: 结构化 → 本地重解析 → 修复重问。"""
     payload = {
         "industry": industry,
         "n": n,
         "avoid": "、".join(avoid) if avoid else "无",
     }
-
-    # 主路径: 结构化输出(假模型/不支持的 provider 会在构造期抛异常)
-    try:
-        structured = prompt | llm.with_structured_output(_TopicList)
-        result = await structured.ainvoke(payload)
-        if isinstance(result, _TopicList) and result.topics:
-            return result.topics[:n]
-    except Exception:
-        pass  # 回退到文本 JSON 路径
-
-    chain = prompt | llm | StrOutputParser()
-    text = await chain.ainvoke(payload)
-    return parse_topics_json(text)[:n]
+    result = await invoke_structured(
+        _build_prompt(), llm, payload, _TopicList, _parse_topic_list,
+        stage="topics",
+    )
+    assert isinstance(result, _TopicList)  # 两条路径都保证同型
+    return result.topics[:n]
 
 
 def parse_topics_json(text: str) -> list[Topic]:
-    """回退解析: 容忍围栏/前后废话, 兼容数组或 {{\"topics\": [...]}} 两种结构。"""
+    """回退解析: 容忍围栏/前后废话, 兼容数组或 {\"topics\": [...]} 两种结构。"""
     data = parse_json_lenient(text)
     if isinstance(data, dict):
         data = data.get("topics")

@@ -13,13 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
-
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.state import CompiledStateGraph
 
 from .config import Settings
 from .models import (
@@ -31,6 +27,7 @@ from .models import (
     Script,
     SubtitleBar,
 )
+from .workflow_engine import END, START, CompiledStateGraph, StateGraph
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +163,9 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
     async def metadata_node(state: PipelineState) -> PipelineState:
         """第 7 节点: 章节 + BiliMeta。
 
-        get_chat_model 抛 RuntimeError(未配 LLM key)时降级 meta=None 并 warning,
-        不中断流水线(如 --script-file 模式)。
+        两级降级, 均不中断流水线(final.mp4 已在手, 不能因元数据白做):
+        1. get_chat_model 抛 RuntimeError(未配 key) → meta=None;
+        2. write_metadata 本身失败(LLM 输出解析/网络) → logger.warning + meta=None。
         """
         from . import assemble as assemble_mod
         from . import llm as llm_mod
@@ -178,16 +176,19 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
         )
         try:
             llm = llm_mod.get_chat_model(settings)
-        except RuntimeError as exc:
-            warnings.warn(
-                f"metadata 降级为 meta=None(无法初始化 LLM): {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        except Exception as exc:  # noqa: BLE001 —— 客户端构造失败也走降级(空 key/坏配置)
+            logger.warning("metadata 降级为 meta=None(无法初始化 LLM): %s", exc)
             return {"chapters": chapters, "meta": None}
-        meta = await metadata_mod.write_metadata(
-            llm, state["script"], chapters, settings
-        )
+        try:
+            meta = await metadata_mod.write_metadata(
+                llm, state["script"], chapters, settings
+            )
+        except Exception as exc:  # noqa: BLE001 —— 元数据是可降级项
+            logger.warning(
+                "metadata 生成失败, 降级为 meta=None(%s: %s)",
+                type(exc).__name__, exc,
+            )
+            meta = None
         return {"chapters": chapters, "meta": meta}
 
     async def manifest_node(state: PipelineState) -> PipelineState:
@@ -213,6 +214,12 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
             meta=state.get("meta"),
             voice=settings.tts_voice,
             duration_total=sum(m.duration for m in scene_media),
+            generation={
+                "llm_model": settings.llm_model,
+                "llm_temperature": str(settings.llm_temperature),
+                "tts_provider": settings.tts_provider,
+                "prompt_versions": "topic1/script2/metadata2/series2",
+            },
         )
         manifest_path = out_dir / "project.json"
         manifest_path.write_text(
@@ -268,7 +275,11 @@ async def run_pipeline(
     }
     if script is not None:
         initial["script"] = script
-    final = await graph.ainvoke(initial)
+    from .llm_audit import LLMCallAudit
+
+    final = await graph.ainvoke(
+        initial, config={"callbacks": [LLMCallAudit(out_dir)]}
+    )
     manifest_path = Path(final["manifest_path"])
     return ProjectManifest.model_validate_json(
         manifest_path.read_text(encoding="utf-8")
