@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -11,6 +14,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from . import __version__
 from .config import Settings, load_settings
 from .graph import run_pipeline
 from .logging_setup import setup_logging
@@ -22,6 +26,34 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+logger = logging.getLogger(__name__)
+
+
+def _version_cb(value: bool) -> None:
+    if value:
+        console.print(f"ivb {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: bool = typer.Option(
+        False, "--version", "-V", callback=_version_cb, is_eager=True, help="显示版本并退出",
+    ),
+) -> None:
+    """AI 面试求职短视频流水线: 选题 → 脚本 → TTS → 渲染 → 合成 → B站。"""
+
+
+def _usage_line(out_dir: Path) -> str | None:
+    from .llm_audit import summarize_usage
+
+    u = summarize_usage(out_dir)
+    if not u["calls"]:
+        return None
+    return (
+        f"LLM: {u['calls']} 次调用, tokens 入 {u['input_tokens']} / 出 {u['output_tokens']}"
+        f" / 共 {u['total_tokens']}(明细 {Path(out_dir) / 'llm_calls.jsonl'})"
+    )
 
 
 def _slug(text: str) -> str:
@@ -48,7 +80,7 @@ def _default_out_dir(settings: Settings, script_file: Path | None, topic: str | 
 @app.command()
 def topics(
     industry: str = typer.Option("互联网", "--industry", "-i", help="目标行业, 如 护理/互联网/汽修"),
-    n: int = typer.Option(8, "--n", help="生成选题条数"),
+    n: int = typer.Option(8, "--n", "-n", help="生成选题条数"),
 ) -> None:
     """生成选题清单(需 LLM), 存 output/topics-<slug>-<时间戳>.json。"""
     settings = load_settings()
@@ -75,25 +107,53 @@ def generate(
     script_file: Path | None = typer.Option(None, "--script-file", help="跳过 LLM, 直接用现成脚本 JSON"),
     voice: str | None = typer.Option(None, "--voice", help="edge-tts 音色, 如 zh-CN-XiaoxiaoNeural"),
     out: Path | None = typer.Option(None, "--out", "-o", help="输出目录(默认 output/<slug>-<YYYYmmdd-HHMM>/)"),
+    resume: Path | None = typer.Option(
+        None, "--resume",
+        help="断点续跑: 传上次的输出目录, 复用其 script.json(不再调 LLM)与 TTS 缓存",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="BILI_UPLOAD_ENABLED 时跳过上传确认"),
 ) -> None:
     """跑完整流水线生成视频。--script-file 模式全程不需要 LLM key。"""
     settings = load_settings()
     if voice:
         settings.tts_voice = voice
-    out_dir = Path(out) if out else _default_out_dir(settings, script_file, topic, industry)
+    preset = None
+    if resume is not None:
+        out_dir = Path(resume)
+        script_json = out_dir / "script.json"
+        if script_json.exists():
+            from .models import Script
+
+            preset = Script.model_validate_json(script_json.read_text(encoding="utf-8"))
+            console.print(f"[yellow]断点续跑[/]: 复用 {script_json}")
+        elif not out_dir.is_dir():
+            console.print(f"[red]--resume 目录不存在: {out_dir}[/]")
+            raise typer.Exit(1)
+        else:
+            console.print(f"[yellow]断点续跑[/]: {out_dir} 无 script.json, 重新生成脚本")
+    else:
+        out_dir = Path(out) if out else _default_out_dir(settings, script_file, topic, industry)
     out_dir.mkdir(parents=True, exist_ok=True)
     console.print(f"[bold]输出目录:[/] {out_dir}")
 
-    manifest: ProjectManifest = asyncio.run(
-        run_pipeline(
-            settings,
-            out_dir,
-            industry=industry,
-            topic_title=topic,
-            script_file=script_file,
+    try:
+        manifest: ProjectManifest = asyncio.run(
+            run_pipeline(
+                settings,
+                out_dir,
+                industry=industry,
+                topic_title=topic,
+                script_file=script_file,
+                script=preset,
+            )
         )
-    )
+    except Exception:
+        if (out_dir / "script.json").exists():
+            console.print(
+                f"[yellow]脚本已保存, 修复问题后可续跑(不再付 LLM 费用):[/] "
+                f"ivb generate --resume {out_dir}"
+            )
+        raise
 
     # rich 打印产物清单
     lines = [
@@ -111,6 +171,9 @@ def generate(
         ]
     else:
         lines += ["", "[yellow]BiliMeta: 未生成(无 LLM key, 已降级)[/]"]
+    usage = _usage_line(out_dir)
+    if usage:
+        lines += ["", usage]
     console.print(Panel("\n".join(lines), title="生成完成", border_style="green"))
 
     if settings.bili_upload_enabled:
@@ -154,6 +217,9 @@ def series(
     if resume is not None and not (resume / "series.json").exists():
         console.print(f"[red]--resume 目录缺 series.json: {resume}[/]")
         raise typer.Exit(1)
+    from .doctor import preflight
+
+    preflight(settings)
     asyncio.run(_series_main(settings, theme, episodes, duration, resume_dir=resume))
 
 
@@ -211,9 +277,11 @@ async def _series_main(
             continue
         console.print(f"[bold]第 {i + 1}/{len(scripts)} 集媒体合成[/] → {out_dir}")
         await run_pipeline(settings, out_dir, industry=theme, script=script)
-    console.print(
-        Panel(f"共 {len(scripts)} 集 → {root}", title="系列生成完成", border_style="green")
-    )
+    body = f"共 {len(scripts)} 集 → {root}"
+    usage = _usage_line(root)
+    if usage:
+        body += f"\n策划/编剧 {usage}"
+    console.print(Panel(body, title="系列生成完成", border_style="green"))
     return root
 
 
@@ -247,6 +315,25 @@ def eval(
 
 
 @app.command()
+def doctor(
+    ping: bool = typer.Option(False, "--ping", help="额外发一次极小 LLM 请求验证 key/base_url"),
+) -> None:
+    """环境自检: ffmpeg/ffprobe、chromium、中文字体、.env、LLM/TTS/B站配置。"""
+    from . import doctor as doctor_mod
+
+    settings = load_settings()
+    checks = doctor_mod.run_doctor(settings)
+    if ping and settings.llm_ready():
+        checks.append(asyncio.run(doctor_mod.ping_llm(settings)))
+    for c in checks:
+        mark = "[green]OK[/]" if c.ok else ("[red]FAIL[/]" if c.required else "[yellow]WARN[/]")
+        console.print(f"{mark:<18} {c.name:<14} [dim]{c.detail}[/]")
+    if any(c.required and not c.ok for c in checks):
+        raise typer.Exit(1)
+    console.print("[bold green]必需项全部通过[/]")
+
+
+@app.command()
 def web(
     host: str = typer.Option("127.0.0.1", "--host", help="监听地址(本地工具, 默认仅回环)"),
     port: int = typer.Option(8099, "--port", "-p", help="端口"),
@@ -262,20 +349,22 @@ def web(
 
 def main() -> None:
     """console_scripts 入口(ivb = interview_video.cli:main)。"""
-    from .config import load_settings as _ls
-
+    log_hint = "上方日志"
     try:  # 日志文件目录跟随 out_root; 失败退化为仅控制台
-        setup_logging(_ls().out_root)
+        out_root = load_settings().out_root
+        setup_logging(out_root)
+        log_hint = str(out_root / "ivb.log")
     except Exception:  # noqa: BLE001
         setup_logging()
     try:
-        app()
-    except (typer.Exit, typer.Abort):
-        raise
+        app()  # standalone: 用法错误/Exit/Abort 由 click 自行处理并 sys.exit
     except Exception as exc:  # noqa: BLE001 —— 顶层兜底: 红字替代裸 traceback
+        if os.environ.get("IVB_DEBUG"):
+            raise
+        logger.debug("顶层异常", exc_info=exc)
         console.print(f"[bold red]失败:[/] {type(exc).__name__}: {exc}")
-        console.print("[dim]详情见 output/ivb.log(或上方日志)[/]")
-        raise typer.Exit(1) from exc
+        console.print(f"[dim]完整堆栈见 {log_hint}(或设 IVB_DEBUG=1 直接打印)[/]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -83,9 +83,12 @@ def fake_media(monkeypatch: pytest.MonkeyPatch) -> None:
         return path
 
     # 不允许真实 LLM 调用: 项目根 .env 可能配了真 key, 强制走降级路径
-    def _no_llm(settings: Settings):
+    def _no_llm(settings: Settings, audit=None):
         raise RuntimeError("未配置 LLM_API_KEY(测试注入)")
 
+    from interview_video import doctor as doctor_mod
+
+    monkeypatch.setattr(doctor_mod, "preflight", lambda settings: None)
     monkeypatch.setattr(llm_mod, "get_chat_model", _no_llm)
     monkeypatch.setattr(tts_mod, "synthesize_scenes", fake_synthesize_scenes)
     monkeypatch.setattr(render_mod, "render_project", fake_render_project)
@@ -148,6 +151,62 @@ def test_generate_auto_out_dir(fake_media: None, tmp_path: Path, monkeypatch: py
     assert len(dirs) == 1
     assert re.match(r"^.+-\d{8}-\d{4}$", dirs[0].name), dirs[0].name
     assert (dirs[0] / "project.json").exists()
+
+
+def test_version_flag() -> None:
+    from interview_video import __version__
+
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0 and __version__ in result.output
+
+
+def test_topics_short_n_option() -> None:
+    result = runner.invoke(app, ["topics", "--help"])
+    assert result.exit_code == 0 and "-n" in result.output
+
+
+def test_generate_resume_reuses_script(fake_media: None, tmp_path: Path) -> None:
+    """--resume <dir>: 复用 script.json(不调 LLM), 产物写回同一目录。"""
+    out_dir = tmp_path / "prev"
+    out_dir.mkdir()
+    (out_dir / "script.json").write_text(SAMPLE_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    result = runner.invoke(app, ["generate", "--resume", str(out_dir)])
+    assert result.exit_code == 0, result.output
+    assert "断点续跑" in result.output
+    assert (out_dir / "final.mp4").exists() and (out_dir / "project.json").exists()
+
+
+def test_generate_failure_prints_resume_hint(
+    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a, **kw):
+        raise RuntimeError("ffmpeg 挂了")
+
+    monkeypatch.setattr(assemble_mod, "finalize_video", boom)
+    out_dir = tmp_path / "out"
+    result = runner.invoke(
+        app, ["generate", "--script-file", str(SAMPLE_SCRIPT), "--out", str(out_dir)]
+    )
+    assert result.exit_code != 0
+    assert "--resume" in result.output and str(out_dir) in result.output.replace("\n", "")
+
+
+def test_main_short_error_no_traceback(monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path) -> None:
+    from interview_video import cli as cli_mod
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("IVB_DEBUG", raising=False)
+    monkeypatch.setattr("sys.argv", ["ivb", "topics", "-n", "2"])
+
+    def _no_llm(settings, audit=None):
+        raise RuntimeError("未配置 LLM_API_KEY(测试注入)")
+
+    monkeypatch.setattr(llm_mod, "get_chat_model", _no_llm)
+    with pytest.raises(SystemExit) as ei:
+        cli_mod.main()
+    assert ei.value.code == 1
+    out = capsys.readouterr().out
+    assert "LLM_API_KEY" in out and "Traceback" not in out
 
 
 def test_slug_ascii() -> None:

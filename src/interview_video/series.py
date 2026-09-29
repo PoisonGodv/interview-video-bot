@@ -277,5 +277,10 @@ async def generate_series(
     if resume and run_dir is not None and (run_dir / "series.json").exists():
         initial.update(_restore_state(run_dir, episodes))
     graph = build_series_graph(settings, on_event, run_dir=run_dir)
-    final = await graph.ainvoke(initial)
+    config = None
+    if run_dir is not None:
+        from .llm_audit import LLMCallAudit
+
+        config = {"callbacks": [LLMCallAudit(run_dir)]}
+    final = await graph.ainvoke(initial, config=config)
     return final["plan"], final["scripts"]

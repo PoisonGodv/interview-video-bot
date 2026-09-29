@@ -7,9 +7,24 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 _FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+
+class _ConsoleFormatter(logging.Formatter):
+    """控制台不打印堆栈(完整堆栈只进 ivb.log); IVB_DEBUG=1 时保留。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        if os.environ.get("IVB_DEBUG") or not (record.exc_info or record.exc_text):
+            return super().format(record)
+        saved = record.exc_info, record.exc_text, record.stack_info
+        record.exc_info = record.exc_text = record.stack_info = None
+        try:
+            return super().format(record) + "  (堆栈见 ivb.log)"
+        finally:
+            record.exc_info, record.exc_text, record.stack_info = saved
 
 
 def setup_logging(out_root: Path | None = None, level: int = logging.INFO) -> None:
@@ -36,8 +51,7 @@ def setup_logging(out_root: Path | None = None, level: int = logging.INFO) -> No
 
     console = handlers[0]
     console.setLevel(level)
-    formatter = logging.Formatter(_FMT)
-    console.setFormatter(formatter)
+    console.setFormatter(_ConsoleFormatter(_FMT))
     console._ivb_managed = True
 
     root.setLevel(logging.DEBUG)

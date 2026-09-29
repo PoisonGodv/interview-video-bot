@@ -74,11 +74,12 @@ async def test_run_pipeline_script_file_degrades_metadata(
 async def test_run_pipeline_llm_path_with_fakes(
     fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """LLM 路径: fake get_chat_model + fake chains, 验证 topic 选择 / meta 写入。"""
+    """LLM 路径: 未给 topic_title → 生成选题取首条; meta 写入; topic.json 落盘。"""
     fake_llm = object()
     monkeypatch.setattr(
-        llm_mod, "get_chat_model", lambda settings: fake_llm
+        llm_mod, "get_chat_model", lambda settings, audit=None: fake_llm
     )
+    picked: list[Topic] = []
 
     async def fake_generate_topics(llm, industry, n=5, avoid=None):
         assert llm is fake_llm
@@ -88,6 +89,7 @@ async def test_run_pipeline_llm_path_with_fakes(
         ]
 
     async def fake_write_script(llm, topic, settings):
+        picked.append(topic)
         return Script.model_validate_json(SAMPLE_SCRIPT.read_text(encoding="utf-8"))
 
     async def fake_write_metadata(llm, script, chapters, settings):
@@ -99,28 +101,24 @@ async def test_run_pipeline_llm_path_with_fakes(
 
     settings = Settings(llm_api_key="sk-fake")  # 有 key 也不联网, 因为 get_chat_model 被替换
     out_dir = tmp_path / "out"
-    manifest = await run_pipeline(
-        settings,
-        out_dir,
-        industry="互联网",
-        topic_title="离职原因",  # 应选中第 2 条选题
-    )
+    manifest = await run_pipeline(settings, out_dir, industry="互联网")
+    assert picked[0].title == "自我介绍怎么说"
     assert manifest.meta is not None
     assert manifest.meta.title == "测试标题"
     assert manifest.industry == "互联网"
-    # 无降级 warning 之外, 流水线照常落盘
     assert (out_dir / "script.json").exists()
+    assert (out_dir / "topic.json").exists()
 
 
-async def test_run_pipeline_topic_title_no_match_uses_first(
+async def test_run_pipeline_topic_title_used_verbatim(
     fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """topic_title 匹配不到时退回第一条选题(仍走通全流程)。"""
-    monkeypatch.setattr(llm_mod, "get_chat_model", lambda settings: object())
+    """给了 topic_title 时原样作为选题, 不再调选题链。"""
+    monkeypatch.setattr(llm_mod, "get_chat_model", lambda settings, audit=None: object())
     picked: list[Topic] = []
 
-    async def fake_generate_topics(llm, industry, n=5, avoid=None):
-        return [Topic(title="A题", industry=industry), Topic(title="B题", industry=industry)]
+    async def fake_generate_topics(llm, industry, n=5, avoid=None):  # pragma: no cover
+        raise AssertionError("指定选题时不应再生成选题")
 
     async def fake_write_script(llm, topic, settings):
         picked.append(topic)
@@ -134,11 +132,49 @@ async def test_run_pipeline_topic_title_no_match_uses_first(
     monkeypatch.setattr(metadata_mod, "write_metadata", fake_write_metadata)
 
     settings = Settings(llm_api_key="sk-fake")
-    manifest = await run_pipeline(
-        settings, tmp_path / "out", topic_title="完全不存在的提示词"
+    out_dir = tmp_path / "out"
+    await run_pipeline(settings, out_dir, industry="护理", topic_title="护士转行面试怎么答")
+    assert picked[0].title == "护士转行面试怎么答" and picked[0].industry == "护理"
+    saved = Topic.model_validate_json((out_dir / "topic.json").read_text(encoding="utf-8"))
+    assert saved.title == "护士转行面试怎么答"
+
+
+async def test_pipeline_llm_audit_wired_via_workflow_config(
+    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """真实 get_chat_model + 桩 transport: 节点内 LLM 调用写入 out_dir/llm_calls.jsonl。"""
+    import json
+
+    import httpx
+
+    from interview_video.llm_audit import summarize_usage
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "model": "m",
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        })
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
     )
-    assert picked[0].title == "A题"
-    assert manifest.meta is None or manifest.meta is not None  # 不中断即可
+
+    async def fake_write_metadata(llm, script, chapters, settings):
+        await llm.ainvoke("hi")
+        return BiliMeta(title="t", desc="", tags=["面试"])
+
+    monkeypatch.setattr(metadata_mod, "write_metadata", fake_write_metadata)
+    out_dir = tmp_path / "out"
+    await run_pipeline(
+        Settings(_env_file=None, llm_api_key="sk-fake", llm_base_url="https://x.test/v1"),
+        out_dir, script_file=SAMPLE_SCRIPT,
+    )
+    lines = (out_dir / "llm_calls.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0])["total_tokens"] == 10
+    assert summarize_usage(out_dir)["calls"] == 1
 
 
 def test_build_graph_compiles() -> None:
@@ -166,7 +202,7 @@ async def test_metadata_node_failure_degrades_not_crashes(
 
     (旧行为: write_metadata 异常直接炸掉整图, manifest 不写, 几分钟媒体产物白做。)
     """
-    monkeypatch.setattr(llm_mod, "get_chat_model", lambda settings: object())
+    monkeypatch.setattr(llm_mod, "get_chat_model", lambda settings, audit=None: object())
 
     async def exploding_metadata(llm, script, chapters, settings):
         raise ValueError("LLM 输出解析失败(模拟)")

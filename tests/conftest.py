@@ -147,6 +147,9 @@ def fake_media(monkeypatch: pytest.MonkeyPatch) -> None:
             t += m.duration
         return chapters
 
+    from interview_video import doctor as doctor_mod
+
+    monkeypatch.setattr(doctor_mod, "preflight", lambda settings: None)
     monkeypatch.setattr(tts_mod, "synthesize_scenes", fake_synthesize_scenes)
     monkeypatch.setattr(tts_mod, "offset_cues", fake_offset_cues)
     monkeypatch.setattr(tts_mod, "build_srt", fake_build_srt)

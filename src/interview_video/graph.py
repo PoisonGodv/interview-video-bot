@@ -26,6 +26,7 @@ from .models import (
     SceneMedia,
     Script,
     SubtitleBar,
+    Topic,
 )
 from .workflow_engine import END, START, CompiledStateGraph, StateGraph
 
@@ -57,15 +58,15 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
         """第 1 节点: 拿到 Script 并落盘 script.json。
 
         有 script_file 直接 ``Script.model_validate_json``(全程不需要 LLM);
-        否则 LLM 生成选题(给了 topic_title 则作为选题提示) → write_script。
+        否则给了 topic_title 直接以其为选题, 未给则 LLM 生成选题取首条 → write_script。
         """
         out_dir: Path = state["out_dir"]
         script_file = state.get("script_file")
         preset = state.get("script")
         if preset is not None:
-            # 系列模式: 脚本由 series.py 多 agent 编排预生成, 本节点直通
+            # 系列模式 / --resume: 脚本已预生成, 本节点直通
             script = preset
-            logger.info("使用预生成脚本(系列模式): %s", script.title)
+            logger.info("使用预生成脚本: %s", script.title)
         elif script_file is not None:
             script = Script.model_validate_json(
                 Path(script_file).read_text(encoding="utf-8")
@@ -78,15 +79,15 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
 
             llm = llm_mod.get_chat_model(settings)
             industry = state.get("industry", "互联网")
-            topics = await topic_mod.generate_topics(llm, industry)
-            topic_title = state.get("topic_title")
-            topic = topics[0]
+            topic_title = (state.get("topic_title") or "").strip()
             if topic_title:
-                # 有标题提示时优先匹配包含该提示的选题, 找不到退回第一条
-                for t in topics:
-                    if topic_title in t.title:
-                        topic = t
-                        break
+                # 用户指定的选题原样使用, 不再随机生成再模糊匹配
+                topic = Topic(title=topic_title, industry=industry)
+            else:
+                topic = (await topic_mod.generate_topics(llm, industry))[0]
+            (out_dir / "topic.json").write_text(
+                topic.model_dump_json(indent=2), encoding="utf-8"
+            )
             script = await script_mod.write_script(llm, topic, settings)
         (out_dir / "script.json").write_text(
             script.model_dump_json(indent=2), encoding="utf-8"
@@ -262,8 +263,12 @@ async def run_pipeline(
 ) -> ProjectManifest:
     """async 便捷入口: 跑完整流水线, 返回 ProjectManifest(已落盘 project.json)。
 
-    script 预制传入时跳过 LLM 生成(系列模式用)。
+    script 预制传入时跳过 LLM 生成(系列模式 / --resume 用)。
+    启动前先跑 doctor.preflight(ffmpeg/chromium/字体), 避免付费步骤后才发现缺依赖。
     """
+    from . import doctor as doctor_mod
+
+    await asyncio.to_thread(doctor_mod.preflight, settings)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     graph = build_graph(settings)

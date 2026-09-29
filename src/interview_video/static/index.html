@@ -106,6 +106,10 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c =>
+  ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
+// 项目名 → 合法 DOM id 片段(中文/字母数字/-_ 原样, 其余转码)
+const pid = (name) => encodeURIComponent(name).replace(/%/g, "_");
 let voices = {}, pollTimer = null, currentJobId = null;
 
 async function api(path, opts = {}) {
@@ -131,14 +135,14 @@ async function init() {
   b("badge-upload", s.upload_enabled, "B站上传已开启", "上传未开启");
   voices = s.voices;
   $("provider").innerHTML = Object.keys(voices).map(p =>
-    `<option value="${p}" ${p === s.tts_provider ? "selected" : ""}>${p === "edge" ? "edge-tts(免费)" : "豆包(火山)"}</option>`).join("");
+    `<option value="${esc(p)}" ${p === s.tts_provider ? "selected" : ""}>${p === "edge" ? "edge-tts(免费)" : "豆包(火山)"}</option>`).join("");
   fillVoices();
   $("provider").onchange = fillVoices;
   loadProjects();
 }
 function fillVoices() {
   const p = $("provider").value;
-  $("voice").innerHTML = (voices[p] || []).map(v => `<option value="${v.id}">${v.name}</option>`).join("");
+  $("voice").innerHTML = (voices[p] || []).map(v => `<option value="${esc(v.id)}">${esc(v.name)}</option>`).join("");
 }
 
 $("btn-topics").onclick = async () => {
@@ -147,7 +151,7 @@ $("btn-topics").onclick = async () => {
     const d = await api("/api/topics", {method: "POST",
       body: {industry: $("industry").value, n: +$("topic-n").value}});
     $("topics").innerHTML = d.topics.map(t =>
-      `<div class="topic" data-t="${t.title}"><b>${t.title}</b><p>${t.hook || ""}</p></div>`).join("");
+      `<div class="topic" data-t="${esc(t.title)}"><b>${esc(t.title)}</b><p>${esc(t.hook)}</p></div>`).join("");
     document.querySelectorAll(".topic").forEach(el =>
       el.onclick = () => { $("topic-title").value = el.dataset.t; });
     msg("topics-msg", `${d.topics.length} 条选题, 点击填入生成框`, "ok");
@@ -197,11 +201,13 @@ async function pollJob(id) {
           (s.chapters ? ` · 第 ${s.chapter}/${s.chapters} 章` : "");
       }
       $("stages").innerHTML = j.stages.map(s =>
-        `<span class="stage ${s.done ? "done" : s.active ? "active" : ""}">${s.done ? "✓ " : ""}${s.label}</span>`).join("");
+        `<span class="stage ${s.done ? "done" : s.active ? "active" : ""}">${s.done ? "✓ " : ""}${esc(s.label)}</span>`).join("");
       $("btn-cancel").style.display = j.cancellable ? "inline-block" : "none";
       if (j.status === "done") {
         clearInterval(pollTimer);
-        msg("gen-msg", `✅ 完成 → ${j.project}`, "ok");
+        const u = j.usage && j.usage.calls
+          ? ` · LLM ${j.usage.calls} 次 / ${j.usage.total_tokens} tokens` : "";
+        msg("gen-msg", `✅ 完成 → ${j.project}${u}`, "ok");
         $("btn-gen").disabled = false; loadProjects();
       } else if (j.status === "failed" || j.status === "cancelled") {
         clearInterval(pollTimer);
@@ -226,51 +232,65 @@ async function loadProjects() {
     const d = await api("/api/projects");
     if (!d.projects.length) { $("projects").innerHTML = '<p class="msg">暂无作品</p>'; return; }
     $("projects").innerHTML = d.projects.map(p => `
-      <div class="proj">
-        <img src="${p.cover_url}" loading="lazy">
+      <div class="proj" data-name="${esc(p.name)}">
+        <img src="${esc(p.cover_url)}" loading="lazy">
         <div class="meta">
-          <h3>${p.title}</h3>
-          <div class="sub">${p.name} · ${p.duration}s · ${p.industry || ""}
-            ${p.bvid ? ` · <a href="https://www.bilibili.com/video/${p.bvid}" target="_blank">${p.bvid}</a>` : ""}</div>
+          <h3>${esc(p.title)}</h3>
+          <div class="sub">${esc(p.name)} · ${esc(p.duration)}s · ${esc(p.industry)}
+            ${p.bvid ? ` · <a href="https://www.bilibili.com/video/${encodeURIComponent(p.bvid)}" target="_blank" rel="noopener">${esc(p.bvid)}</a>` : ""}</div>
           <div class="row" style="margin-top:8px">
-            <button class="ghost" onclick="toggleDetail('${p.name}')">详情/编辑</button>
-            <button class="ghost" onclick="upload('${p.name}', this)">上传到B站</button>
+            <button class="ghost" data-act="detail">详情/编辑</button>
+            <button class="ghost" data-act="upload">上传到B站</button>
           </div>
-          <div class="detail" id="d-${p.name}"></div>
+          <div class="detail" id="d-${pid(p.name)}"></div>
         </div>
       </div>`).join("");
-  } catch (e) { $("projects").innerHTML = `<p class="msg err">${e.message}</p>`; }
+  } catch (e) { $("projects").innerHTML = `<p class="msg err">${esc(e.message)}</p>`; }
 }
 
+$("projects").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  const name = btn.closest("[data-name]").dataset.name;
+  if (btn.dataset.act === "detail") toggleDetail(name);
+  else if (btn.dataset.act === "upload") upload(name, btn);
+  else if (btn.dataset.act === "save") saveMeta(name, btn);
+});
+
 async function toggleDetail(name) {
-  const el = $("d-" + name);
+  const k = pid(name);
+  const el = $("d-" + k);
   if (el.classList.contains("open")) { el.classList.remove("open"); return; }
-  const p = await api("/api/projects/" + name);
+  const p = await api("/api/projects/" + encodeURIComponent(name));
   const m = p.meta || {title: "", desc: "", tags: []};
   el.innerHTML = `
-    <video controls src="${p.video_url}"></video>
+    <video controls src="${esc(p.video_url)}"></video>
     <div style="margin-top:10px"><label class="sub">B站标题</label>
-      <input class="w100" id="t-${name}" value="${(m.title || "").replace(/"/g, "&quot;")}"></div>
+      <input class="w100" id="t-${k}"></div>
     <div style="margin-top:8px"><label class="sub">简介</label>
-      <textarea id="desc-${name}">${m.desc || ""}</textarea></div>
+      <textarea id="desc-${k}"></textarea></div>
     <div style="margin-top:8px"><label class="sub">标签(逗号分隔)</label>
-      <input class="w100" id="tags-${name}" value="${(m.tags || []).join(",")}"></div>
+      <input class="w100" id="tags-${k}"></div>
     <div class="row" style="margin-top:8px">
-      <button onclick="saveMeta('${name}', this)">保存元数据</button>
-      <span class="msg" id="m-${name}"></span></div>`;
+      <button data-act="save">保存元数据</button>
+      <span class="msg" id="m-${k}"></span></div>`;
+  $("t-" + k).value = m.title || "";
+  $("desc-" + k).value = m.desc || "";
+  $("tags-" + k).value = (m.tags || []).join(",");
   el.classList.add("open");
 }
 
 async function saveMeta(name, btn) {
+  const k = pid(name);
   btn.disabled = true;
   try {
-    await api(`/api/projects/${name}/meta`, {method: "PUT", body: {
-      title: $("t-" + name).value,
-      desc: $("desc-" + name).value,
-      tags: $("tags-" + name).value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
+    await api(`/api/projects/${encodeURIComponent(name)}/meta`, {method: "PUT", body: {
+      title: $("t-" + k).value,
+      desc: $("desc-" + k).value,
+      tags: $("tags-" + k).value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
     }});
-    msg("m-" + name, "已保存", "ok");
-  } catch (e) { msg("m-" + name, e.message, "err"); }
+    msg("m-" + k, "已保存", "ok");
+  } catch (e) { msg("m-" + k, e.message, "err"); }
   btn.disabled = false;
 }
 
@@ -278,7 +298,7 @@ async function upload(name, btn) {
   if (!confirm(`确认把 ${name} 上传到B站?\n发布后请到创作中心补勾"AI生成"标识。`)) return;
   btn.disabled = true;
   try {
-    const d = await api(`/api/projects/${name}/upload`, {method: "POST"});
+    const d = await api(`/api/projects/${encodeURIComponent(name)}/upload`, {method: "POST"});
     alert("上传成功: " + d.url);
     loadProjects();
   } catch (e) { alert("上传失败: " + e.message); }

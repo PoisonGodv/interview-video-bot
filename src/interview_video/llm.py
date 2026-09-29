@@ -71,9 +71,13 @@ class RateLimitError(LLMAPIError):
         super().__init__(message, status_code=429, response_text=response_text)
 
 
+class LLMConnectionError(LLMError):
+    """base_url 非法或服务不可达(配置类错误, 不重试)。"""
+
+
 def is_fatal_error(exc: BaseException) -> bool:
     """判断是否为致命鉴权/权限/配置错误 (此类错误重试毫无意义，应直接熔断)。"""
-    if isinstance(exc, (AuthenticationError, PermissionDeniedError, NotFoundError)):
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError, NotFoundError, LLMConnectionError)):
         return True
     # 兼容通过 monkeypatch 或环境注入的 openai 异常
     exc_type = type(exc).__name__
@@ -190,7 +194,7 @@ class HTTPChatClient:
                 **kwargs,
             )
         except Exception as exc:
-            if is_fatal_error(exc):
+            if is_fatal_error(exc) and not isinstance(exc, LLMConnectionError):
                 raise
             if self.fallbacks:
                 logger.warning(
@@ -242,8 +246,20 @@ class HTTPChatClient:
         for attempt in range(self.max_retries + 1):
             t0 = time.perf_counter()
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.post(endpoint, json=body, headers=headers)
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        resp = await client.post(endpoint, json=body, headers=headers)
+                except (httpx.InvalidURL, httpx.UnsupportedProtocol,
+                        httpx.ConnectError, httpx.ConnectTimeout) as conn_exc:
+                    # 连接失败/超时可能是瞬时网络抖动: 未到最后一次先按普通错误重试;
+                    # URL 非法/协议不支持属配置错误, 立即熔断
+                    transient = isinstance(conn_exc, (httpx.ConnectError, httpx.ConnectTimeout))
+                    if transient and attempt < self.max_retries:
+                        raise
+                    raise LLMConnectionError(
+                        f"无法连接 LLM 服务 base_url={self.base_url!r}"
+                        f"({type(conn_exc).__name__}: {conn_exc}); 请检查 .env 的 LLM_BASE_URL 与网络"
+                    ) from conn_exc
 
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -378,6 +394,17 @@ def fake_chat_model(responses: list[str]) -> FakeChatModel:
 # 5. LLM 工厂
 # ===========================================================================
 
+def _audit_from_workflow_config() -> LLMCallAudit | None:
+    """未显式传 audit 时, 取当前工作流 config.callbacks 里的 LLMCallAudit。"""
+    from .workflow_engine import get_current_workflow_config
+
+    cfg = get_current_workflow_config() or {}
+    for cb in cfg.get("callbacks") or []:
+        if isinstance(cb, LLMCallAudit):
+            return cb
+    return None
+
+
 def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTTPChatClient:
     """根据 settings 构建真实模型客户端 (支持主备模型降级)。"""
     if settings.llm_api_key is None or not settings.llm_api_key.get_secret_value().strip():
@@ -386,6 +413,8 @@ def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTT
             "请 cp .env.example .env 并填写 LLM_API_KEY/LLM_BASE_URL/LLM_MODEL"
         )
 
+    if audit is None:
+        audit = _audit_from_workflow_config()
     base_url = settings.llm_base_url or "https://api.openai.com/v1"
     primary = HTTPChatClient(
         model=settings.llm_model,
@@ -423,6 +452,7 @@ __all__ = [
     "PermissionDeniedError",
     "NotFoundError",
     "RateLimitError",
+    "LLMConnectionError",
     "is_fatal_error",
     "ChatResponse",
     "HTTPChatClient",

@@ -18,6 +18,13 @@ _FONT_CANDIDATES: list[tuple[str, list[int]]] = [
     ("/System/Library/Fonts/PingFang.ttc", [0, 1, 2, 3, 4, 5]),
     ("/System/Library/Fonts/STHeiti Medium.ttc", [0]),
     ("/System/Library/Fonts/Hiragino Sans GB.ttc", [0]),
+    # Linux: fonts-noto-cjk / fonts-wqy-*
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", [2, 0]),
+    ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", [2, 0]),
+    ("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", [2, 0]),
+    ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", [0]),
+    ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", [0]),
+    ("/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc", [0]),
 ]
 
 # 字幕描边宽度(像素, SPECS 要求 ≥3)
@@ -31,7 +38,8 @@ _BOX_COLOR = (0, 0, 0, 120)
 
 _FONT_LOAD_ERR_GUIDE = (
     "未找到可用的中文字体。请设置环境变量 SUBTITLE_FONT_PATH 指向一个 .ttf/.ttc 中文字体, "
-    "例如 SUBTITLE_FONT_PATH=/System/Library/Fonts/PingFang.ttc"
+    "例如 SUBTITLE_FONT_PATH=/System/Library/Fonts/PingFang.ttc; "
+    "Linux 可 apt install fonts-noto-cjk 后自动识别"
 )
 
 

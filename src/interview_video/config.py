@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -77,6 +77,42 @@ class Settings(BaseSettings):
 
     # ---- 输出 ----
     out_root: Path = Path("output")
+
+    @field_validator(
+        "llm_api_key", "llm_base_url", "llm_max_tokens",
+        "llm_fallback_model", "llm_fallback_base_url", "llm_fallback_api_key",
+        "tts_doubao_api_key", "tts_doubao_app_key", "tts_doubao_access_key",
+        "subtitle_font_path", "bili_sessdata", "bili_jct", "bili_buvid3",
+        mode="before",
+    )
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        """空值/误把行内注释当值(``KEY=   # 说明``) → None。"""
+        if isinstance(v, SecretStr):
+            v = v.get_secret_value()
+        if isinstance(v, str):
+            v = v.strip()
+            if not v or v.startswith("#"):
+                return None
+        return v
+
+    @field_validator("llm_base_url", "llm_fallback_base_url")
+    @classmethod
+    def _check_url(cls, v: str | None) -> str | None:
+        if v is not None and not v.startswith(("http://", "https://")):
+            raise ValueError(f"必须以 http:// 或 https:// 开头, 当前: {v!r}")
+        return v
+
+    def llm_ready(self) -> bool:
+        return self.llm_api_key is not None and bool(self.llm_api_key.get_secret_value())
+
+    def doubao_ready(self) -> bool:
+        if self.tts_doubao_api_key is not None:
+            return True
+        return bool(self.tts_doubao_app_key and self.tts_doubao_access_key)
+
+    def bili_ready(self) -> bool:
+        return all((self.bili_sessdata, self.bili_jct, self.bili_buvid3))
 
 
 def load_settings(env_file: str | None = None) -> Settings:

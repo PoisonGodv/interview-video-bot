@@ -3,6 +3,23 @@
 本文件记录值得注意的变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/),
 版本号遵循语义化版本(单文件未发布前以 0.x 滚动)。
 
+## [Unreleased]
+
+### 新增
+
+- `ivb doctor [--ping]` / `GET /api/doctor` 环境自检; generate/series/Web 任务启动前预检 ffmpeg/chromium/字体;
+- `ivb generate --resume <dir>`: 复用 script.json + TTS 缓存续跑, 失败时打印续跑命令;
+- `ivb --version`, `ivb topics -n`; CLI/Web 完成时显示 LLM 调用次数与 token 合计。
+
+### 修复
+
+- `.env.example` 行内注释被读成配置值(LLM_BASE_URL/BILI_JCT 等); 空值/`#...` 视为未配置, base_url 校验协议;
+- LLM 连接失败(非法 URL/拒连)不再进入解析修复链, 直接报错并给出 base_url;
+- LLM 审计从未生效(llm_calls.jsonl 为空): 客户端自动取工作流 config 中的 LLMCallAudit;
+- 手填/点击的选题被忽略(重新生成选题并常取第 1 条); 现原样作为选题并存 topic.json;
+- Web 节点进度落后一格; Web 徽标对空 key/豆包旧版凭证判断错误; 作品库/选题 innerHTML 未转义;
+- 顶层错误只打印一行原因, 堆栈进日志; 字体探测增加 Linux Noto CJK / 文泉驿路径。
+
 ## [0.2.0] - 2026-09-23
 
 从「LLM 脚本流水线」向「可恢复的 agent 项目」补齐关键件: 可靠性 / 断点续跑 / 可观测性 / 评测 / 工程化。

@@ -71,6 +71,7 @@ def test_index(client):
 def test_settings_endpoint(client):
     d = client.get("/api/settings").json()
     assert d["llm_configured"] is False
+    assert d["doubao_configured"] is False and d["bili_configured"] is False
     assert d["tts_provider"] == "edge"
     assert "edge" in d["voices"] and "doubao" in d["voices"]
 
@@ -122,6 +123,48 @@ def test_job_lifecycle(portal_app, monkeypatch):
         assert any(p["name"] == job["project"] for p in projects)
 
 
+def test_job_stage_progress_not_lagging(portal_app, monkeypatch):
+    """节点回调是"刚完成"语义: active 应指向下一个节点, 首节点运行中即为 active。"""
+    import asyncio
+
+    snapshots: list[tuple[list[str], str | None]] = []
+    gate = asyncio.Event()
+
+    async def fake_execute(settings, out_dir, industry, topic_title, script_file, on_stage):
+        await gate.wait()
+        on_stage("gen_script")
+        await asyncio.sleep(0.3)
+        for node, _ in STAGES[1:]:
+            on_stage(node)
+        return _write_manifest(out_dir, settings, industry)
+
+    monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        job_id = client.post("/api/jobs", json={"industry": "护理"}).json()["job_id"]
+        _drive(client, scheduled)
+        time.sleep(0.1)
+        j = client.get(f"/api/jobs/{job_id}").json()
+        snapshots.append((j["done_stages"], j["current_stage"]))
+        client.portal.call(gate.set)
+        time.sleep(0.15)
+        j = client.get(f"/api/jobs/{job_id}").json()
+        snapshots.append((j["done_stages"], j["current_stage"]))
+        final = _wait_job(client, job_id)
+    assert snapshots[0] == ([], "gen_script")
+    assert snapshots[1] == (["gen_script"], "tts")
+    assert final["current_stage"] is None and len(final["done_stages"]) == len(STAGES)
+
+
+def test_doctor_endpoint(client, monkeypatch):
+    from interview_video import doctor as doctor_mod
+
+    monkeypatch.setattr(doctor_mod, "check_chromium", lambda: doctor_mod.Check("chromium", True, "x"))
+    d = client.get("/api/doctor").json()
+    names = [c["name"] for c in d["checks"]]
+    assert "ffmpeg" in names and "LLM_API_KEY" in names
+
+
 def test_job_single_flight(portal_app, monkeypatch):
     import asyncio
 
@@ -165,8 +208,9 @@ def test_job_failure_sets_error_and_releases_lock(portal_app, settings, monkeypa
         assert job["status"] == "failed"
         assert "TTS boom" in job["error"]
         # 失败现场落盘
-        err_logs = list(settings.out_root.glob("error-*.log"))
+        err_logs = list(settings.out_root.rglob("error-*.log"))
         assert err_logs and "TTS boom" in err_logs[0].read_text("utf-8")
+        assert err_logs[0].read_text("utf-8").startswith("stage=gen_script")
         # 锁已释放: 新任务能再进(不再 409)
         monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
         r2 = client.post("/api/jobs", json={"industry": "互联网"})

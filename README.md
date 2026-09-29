@@ -40,9 +40,16 @@ uv venv && uv pip install -e ".[dev]"
 # 3. 配置(见下文 .env 说明)
 cp .env.example .env
 
-# 4. 无需 LLM key 的冒烟: 用现成脚本跑通全流程
+# 4. 环境自检: ffmpeg/ffprobe、chromium、中文字体、.env、LLM/豆包/B站配置
+.venv/bin/ivb doctor            # --ping 额外发一次极小请求验证 LLM key/base_url
+
+# 5. 无需 LLM key 的冒烟: 用现成脚本跑通全流程
 .venv/bin/ivb generate --script-file examples/sample_script.json
 ```
+
+`generate`/`series`/Web 任务启动时会先做廉价预检(ffmpeg/chromium/字体),
+缺依赖直接报错, 不会先花掉 LLM/TTS 费用。Linux 需安装中文字体(如 `apt install fonts-noto-cjk`)
+或设 `SUBTITLE_FONT_PATH`。
 
 ## 三条命令
 
@@ -52,6 +59,7 @@ ivb topics --industry 护理 -n 8
 
 # ② 跑完整流水线生成视频
 #    未给 --out 时自动生成 output/<slug>-<YYYYmmdd-HHMM>/
+#    --topic 给定时原样作为选题(不再随机生成选题), 选题存 topic.json
 #    --script-file 模式全程不需要 LLM key(metadata 自动降级)
 ivb generate --industry 互联网 \
              --topic "应届生自我介绍" \
@@ -59,6 +67,8 @@ ivb generate --industry 互联网 \
              --out output/self-intro
 # 或直接复用现成脚本:
 ivb generate --script-file examples/sample_script.json --out output/demo
+# 中途失败(ffmpeg/渲染/TTS)后断点续跑: 复用该目录的 script.json 与 TTS 缓存, 不再付 LLM 费用
+ivb generate --resume output/self-intro
 
 # ③ 读 project.json 上传 B站(需开启 BILI_UPLOAD_ENABLED 并配置 cookie)
 ivb upload output/demo --yes
@@ -101,8 +111,9 @@ ivb series "程序员面试通关" --resume output/程序员面试通关-series-
 ## 可观测性与成本
 
 - **LLM 审计**: 每次调用的 token/耗时/输入输出规模追加到产物目录 `llm_calls.jsonl`
-  (CLI/Web 都注入), 一次系列花了多少 token 一查便知;
+  (单集写在产物目录, 系列策划/编剧写在系列根目录); CLI 完成面板与 Web 完成提示直接显示调用次数与 token 合计;
 - **日志**: 统一 INFO 控制台 + `output/ivb.log` 文件双通道, 回退/降级/重试全部留痕;
+  命令失败只打印一行原因, 完整堆栈写入日志(设 `IVB_DEBUG=1` 直接打印);
 - **Web 失败诊断**: 任务失败时堆栈与所在阶段落盘 `error-<jobid>.log`;
 - **生成溯源**: `project.json` 的 `generation` 块记录模型/温度/TTS 通道/prompt 版本;
 - **TTS 幂等缓存**: mp3 与 `scene_XXX.cues.json` 旁车(口播指纹)命中则跳过合成,
@@ -129,20 +140,24 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
 1. **选题**: 输入行业 → 生成选题清单(LLM), 点击选题自动填入生成框;
 2. **生成视频**: 模式可选**单集短视频**或**系列长视频(多agent)**(填系列主题、集数、每集分钟数),
    选 TTS 通道(edge-tts 免费 / 豆包火山)与音色 → 开始生成,
-   8 个节点进度实时可见(选题→配音→渲染→合成→字幕→合成→元数据→落盘);
+   8 个节点进度实时可见(选题→配音→渲染→合成→字幕→合成→元数据→落盘), 完成后显示 LLM token 用量;
    系列模式额外显示「第 x/N 集 · 阶段 · 第 y/M 章」;
    生成单飞(同时只跑一个任务, 避免 TTS 限流), 并发提交返回 409;
 3. **作品库**: 封面墙(系列分集自动展开为独立条目) → 详情里可播放成片、
    编辑 B站标题/简介/标签(写回 project.json)、一键上传(未配 cookie 三件套会返回指引)。
 
 生成中的长任务可点**取消任务**(或 `POST /api/jobs/{id}/cancel`), 不必杀进程;
-任务失败时堆栈与所在阶段落盘 `error-<jobid>.log`。
+任务失败时堆栈与所在阶段落盘到该任务产物目录的 `error-<jobid>.log`;
+`GET /api/doctor` 返回与 `ivb doctor` 相同的环境自检结果。
 
 > 本地工具, 默认只绑 127.0.0.1; 上传成功后 bvid 记录在项目目录 upload.json。
 
 ## .env 说明
 
-环境变量名与字段名大写一致, **可复用 drivecast 的 `.env`**(同一套 OpenAI 兼容配置):
+环境变量名与字段名大写一致, **可复用 drivecast 的 `.env`**(同一套 OpenAI 兼容配置)。
+
+> 注释请单独成行, 不要写在 `KEY=` 后面。空值与 `#` 开头的值会被视为未配置;
+> `LLM_BASE_URL` 必须以 `http(s)://` 开头, 连不上时报错会直接给出所用 base_url。
 
 ```bash
 # LLM(任意 OpenAI 兼容服务, 如 deepseek)

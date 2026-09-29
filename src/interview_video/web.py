@@ -94,6 +94,7 @@ class Job:
         self.error: str | None = None
         self.project: str | None = None  # out_dir 名(系列模式=系列根目录名)
         self.series: dict[str, Any] | None = None  # 系列进度 {episode,episodes,chapter,chapters,phase}
+        self.usage: dict[str, int] | None = None  # LLM token 汇总(llm_calls.jsonl)
         self.task: asyncio.Task | None = None  # 后台任务句柄(取消接口用)
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +106,7 @@ class Job:
             "error": self.error,
             "project": self.project,
             "series": self.series,
+            "usage": self.usage,
             "cancellable": self.status == "running" and self.task is not None,
             "stages": [
                 {"key": k, "label": label, "done": k in self.done_stages,
@@ -139,9 +141,11 @@ async def _execute_pipeline(
     script: Script | None = None,  # 预制脚本(系列模式), 跳过 LLM 生成
 ) -> ProjectManifest:
     """build_graph + astream(updates) 跑流水线, 逐节点回调进度。"""
+    from . import doctor as doctor_mod
     from . import graph as graph_mod
     from .llm_audit import LLMCallAudit
 
+    await asyncio.to_thread(doctor_mod.preflight, settings)
     out_dir.mkdir(parents=True, exist_ok=True)
     graph = graph_mod.build_graph(settings)
     initial: dict[str, Any] = {
@@ -160,6 +164,18 @@ async def _execute_pipeline(
     return ProjectManifest.model_validate_json(
         (out_dir / "project.json").read_text(encoding="utf-8")
     )
+
+
+def _sum_usage(root: Path) -> dict[str, int]:
+    """系列根目录(策划/编剧) + 各分集目录(元数据)的 llm_calls.jsonl 合计。"""
+    from .llm_audit import summarize_usage
+
+    total = summarize_usage(root)
+    for d in root.iterdir():
+        if d.is_dir():
+            for k, v in summarize_usage(d).items():
+                total[k] += v
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -193,11 +209,22 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
     async def get_settings() -> dict[str, Any]:
         return {
             "brand": settings.brand,
-            "llm_configured": settings.llm_api_key is not None,
+            "llm_configured": settings.llm_ready(),
             "tts_provider": settings.tts_provider,
             "upload_enabled": settings.bili_upload_enabled,
-            "doubao_configured": bool(settings.tts_doubao_api_key),
+            "bili_configured": settings.bili_ready(),
+            "doubao_configured": settings.doubao_ready(),
             "voices": VOICES,
+        }
+
+    @app.get("/api/doctor")
+    async def get_doctor() -> dict[str, Any]:
+        from . import doctor as doctor_mod
+
+        checks = await asyncio.to_thread(doctor_mod.run_doctor, settings)
+        return {
+            "ok": all(c.ok for c in checks if c.required),
+            "checks": [c.__dict__ for c in checks],
         }
 
     # ---------- 选题 ----------
@@ -237,13 +264,18 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         import traceback
 
         from .cli import _default_out_dir  # 复用 CLI 的目录命名
+        from .llm_audit import summarize_usage
 
         logger = logging.getLogger(__name__)
 
+        stage_keys = [k for k, _ in STAGES]
+
         def _on_stage(node: str) -> None:
-            if job.current_stage and job.current_stage not in job.done_stages:
-                job.done_stages.append(job.current_stage)
-            job.current_stage = node
+            """node 为刚完成的节点: 记为 done, active 前移到下一节点。"""
+            if node not in job.done_stages:
+                job.done_stages.append(node)
+            i = stage_keys.index(node) if node in stage_keys else -1
+            job.current_stage = stage_keys[i + 1] if 0 <= i < len(stage_keys) - 1 else None
 
         try:
             job_settings = settings.model_copy()
@@ -261,13 +293,14 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
                         job_settings, script_file,
                         job.params.topic_title, job.params.industry,
                     )
+                    job.project = out_dir.name
+                    job.current_stage = stage_keys[0]
                     await _execute_pipeline(
                         job_settings, out_dir, job.params.industry,
                         job.params.topic_title, script_file, _on_stage,
                     )
-                    job.project = out_dir.name
-                if job.current_stage and job.current_stage not in job.done_stages:
-                    job.done_stages.append(job.current_stage)
+                    job.usage = summarize_usage(out_dir)
+                job.current_stage = None
                 job.status = "done"
             except asyncio.CancelledError:
                 job.status, job.error = "cancelled", "任务被取消"
@@ -300,9 +333,11 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         每章/每集完成即增量落盘(planning/), 失败不丢已花掉的 token;
         已有 project.json 的分集直接跳过(重试幂等)。
         """
+        from . import doctor as doctor_mod
         from . import series as series_mod
         from .cli import _slug
 
+        await asyncio.to_thread(doctor_mod.preflight, job_settings)
         req = job.params
         theme = req.theme or req.topic_title or "面试求职"
         job.series = {
@@ -336,13 +371,14 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         )
         for i, script in enumerate(scripts):
             job.series.update(episode=i + 1, phase="媒体合成")
-            job.done_stages, job.current_stage = [], None  # 每集重置节点进度
+            job.done_stages, job.current_stage = [], STAGES[0][0]  # 每集重置节点进度
             out_dir = root / f"ep{i + 1:02d}-{_slug(script.title)}"
             if (out_dir / "project.json").exists():
                 continue  # 已有成片, 重试幂等跳过
             await _execute_pipeline(
                 job_settings, out_dir, theme, None, None, on_stage, script=script,
             )
+        job.usage = _sum_usage(root)
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str) -> dict[str, Any]:
