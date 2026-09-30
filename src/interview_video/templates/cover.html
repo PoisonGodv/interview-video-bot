@@ -7,11 +7,16 @@
   justify-content: center;
 }
 .cover-title {
-  font-size: 108px;          /* 主标题 ≥80px */
+  font-size: {{ title_px | default(108) }}px;  /* 按标题长度自适应(render.cover_title_px), 最大 108px */
   font-weight: 800;
   line-height: 1.25;
   letter-spacing: 2px;
   margin-bottom: 48px;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
   text-shadow: 0 6px 30px rgba(0, 0, 0, .45);
 }
 .cover-title .hl { color: {{ accent }}; }
@@ -22,6 +27,10 @@
   max-width: 1400px;
   border-left: 8px solid {{ accent }};
   padding-left: 32px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
 }
 .cover-meta {
   margin-top: 72px;
@@ -34,6 +43,13 @@
   font-weight: 700;
   color: #f8fafc;
 }
+{% endblock %}
+{% block portrait_css %}
+.cover { justify-content: center; }
+.cover-title { margin-bottom: 56px; }
+.cover-hook { font-size: 52px; max-width: none; }
+.cover-brand { font-size: 44px; }
+.cover-meta { margin-top: 88px; }
 {% endblock %}
 {% block content %}
 <div class="topbar">

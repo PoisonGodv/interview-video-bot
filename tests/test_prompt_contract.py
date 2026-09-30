@@ -72,7 +72,6 @@ def test_topic_prompt_contract():
 
 def test_metadata_template_variables_not_prefilled():
     """模板本体保留 {brand}/{chapter_lines} 占位(值不得烤进模板字符串)。"""
-    user_template = _meta_prompt().messages[1]  # HumanMessagePromptTemplate
-    template_text = user_template.prompt.template
+    template_text = _meta_prompt().messages[1].template
     assert "{chapter_lines}" in template_text
     assert "{brand}" in template_text

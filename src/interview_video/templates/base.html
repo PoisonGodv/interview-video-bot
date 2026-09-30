@@ -5,11 +5,12 @@
 <style>
 /* ===== 视觉规范(SPECS §4) =====
    深色渐变底 #0f172a → #1e293b, 点缀色 {{ accent }},
-   大字号, 底部 180px 为字幕条留白区(不得放任何内容)。 */
+   大字号, 底部 180px 为字幕条留白区(不得放任何内容)。
+   竖屏(body.portrait, 1080x1920): 内容上移居中, 底部 520px 留给字幕条与平台操作栏。 */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body {
-  width: 1920px;
-  height: 1080px;
+  width: {{ width | default(1920) }}px;
+  height: {{ height | default(1080) }}px;
   overflow: hidden;
   font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   color: #f8fafc;
@@ -65,10 +66,18 @@ body::before {
   color: #94a3b8;
   letter-spacing: 2px;
 }
+/* ---- 竖屏 9:16 ---- */
+body.portrait::before { top: -200px; right: -320px; }
+body.portrait .page { padding: 140px 72px 520px; }
+body.portrait .subtitle-safe { height: 520px; }
+body.portrait .topbar { margin-bottom: 72px; }
+body.portrait .brand { font-size: 38px; }
+body.portrait .chip, body.portrait .progress { font-size: 34px; }
 {% block extra_css %}{% endblock %}
+{% if portrait %}{% block portrait_css %}{% endblock %}{% endif %}
 </style>
 </head>
-<body>
+<body class="{{ 'portrait' if portrait else 'landscape' }}">
 <div class="page">
   {% block content %}{% endblock %}
 </div>

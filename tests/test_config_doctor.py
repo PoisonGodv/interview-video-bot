@@ -21,6 +21,16 @@ def test_env_example_yields_clean_settings(tmp_path: Path) -> None:
     assert s.tts_provider == "edge"
 
 
+def test_env_example_documents_every_setting() -> None:
+    """Settings 的每个字段都应在 .env.example 出现(可注释)。"""
+    import re
+
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    keys = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]*)=", text, re.M))
+    missing = [n.upper() for n in Settings.model_fields if n.upper() not in keys]
+    assert not missing, f".env.example 缺少: {missing}"
+
+
 def test_inline_comment_value_becomes_none(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     env.write_text("LLM_BASE_URL=   # 例 https://api.deepseek.com\nBILI_JCT=  # x\n", encoding="utf-8")
@@ -62,7 +72,7 @@ async def test_connect_error_retries_then_names_base_url(monkeypatch) -> None:
     monkeypatch.setattr(llm_mod.asyncio, "sleep", _no_sleep)
     client = HTTPChatClient(model="m", api_key="k", base_url="https://nowhere.test/v1", max_retries=2)
     with pytest.raises(LLMConnectionError, match="nowhere.test"):
-        await client.ainvoke("hi")
+        await client.chat("hi")
     assert calls == 3  # 瞬时连接错误按 max_retries 重试, 耗尽后才报配置/网络错误
 
 
@@ -82,7 +92,7 @@ async def test_invalid_url_is_fatal_without_retry(monkeypatch) -> None:
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
     client = HTTPChatClient(model="m", api_key="k", base_url="https://bad.test/v1", max_retries=2)
     with pytest.raises(LLMConnectionError, match="bad.test"):
-        await client.ainvoke("hi")
+        await client.chat("hi")
     assert calls == 1  # 配置错误不重试
 
 
@@ -97,3 +107,92 @@ def test_doctor_config_flags_doubao_without_creds() -> None:
     checks = doctor_mod.check_config(Settings(_env_file=None, tts_provider="doubao"))
     bad = [c for c in checks if c.name == "豆包 TTS 凭证"]
     assert bad and not bad[0].ok and bad[0].required
+
+
+# ---------- .env 查找顺序 / OUT_ROOT / 日志轮转 ----------
+
+def _isolate_env(monkeypatch, tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("IVB_ENV_FILE", raising=False)
+    monkeypatch.delenv("OUT_ROOT", raising=False)
+    monkeypatch.delenv("BRAND", raising=False)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    return home
+
+
+def test_env_file_resolution_order(monkeypatch, tmp_path: Path) -> None:
+    from interview_video.config import load_settings, resolve_env_file
+
+    home = _isolate_env(monkeypatch, tmp_path)
+    assert resolve_env_file() is None
+    assert load_settings()._env_path is None
+
+    user_env = home / ".config" / "ivb" / ".env"
+    user_env.parent.mkdir(parents=True)
+    user_env.write_text("BRAND=用户级\n", encoding="utf-8")
+    s = load_settings()
+    assert s.brand == "用户级" and s._env_path == user_env.resolve()
+
+    Path(".env").write_text("BRAND=当前目录\n", encoding="utf-8")
+    assert load_settings().brand == "当前目录"
+
+    explicit = tmp_path / "custom.env"
+    explicit.write_text("BRAND=显式\n", encoding="utf-8")
+    monkeypatch.setenv("IVB_ENV_FILE", str(explicit))
+    s = load_settings()
+    assert s.brand == "显式" and s._env_path == explicit.resolve()
+
+    monkeypatch.setenv("IVB_ENV_FILE", str(tmp_path / "missing.env"))  # 不存在则继续往下找
+    assert load_settings().brand == "当前目录"
+
+
+def test_out_root_absolute_and_tilde(monkeypatch, tmp_path: Path) -> None:
+    from interview_video.config import describe_paths, load_settings
+
+    home = _isolate_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("OUT_ROOT", str(tmp_path / "abs-out"))
+    s = load_settings()
+    assert s.out_root == tmp_path / "abs-out"
+    assert str(tmp_path / "abs-out") in describe_paths(s)
+    monkeypatch.setenv("OUT_ROOT", "~/videos")
+    assert load_settings().out_root == home / "videos"
+
+
+def test_doctor_reports_env_and_out_root(monkeypatch, tmp_path: Path) -> None:
+    from interview_video.config import load_settings
+
+    _isolate_env(monkeypatch, tmp_path)
+    Path(".env").write_text(f"OUT_ROOT={tmp_path / 'o'}\n", encoding="utf-8")
+    checks = {c.name: c for c in doctor_mod.check_config(load_settings())}
+    assert checks[".env"].ok and checks[".env"].detail == str((tmp_path / "cwd" / ".env").resolve())
+    assert checks["输出目录"].ok and checks["输出目录"].detail == str(tmp_path / "o")
+
+    Path(".env").unlink()
+    checks = {c.name: c for c in doctor_mod.check_config(load_settings())}
+    assert not checks[".env"].ok and "IVB_ENV_FILE" in checks[".env"].detail
+
+
+def test_logging_rotates_and_quiets_noise(tmp_path: Path) -> None:
+    import logging
+    import logging.handlers
+
+    from interview_video.logging_setup import LOG_BACKUPS, LOG_MAX_BYTES, setup_logging
+
+    root = logging.getLogger()
+    try:
+        setup_logging(tmp_path)
+        managed = [h for h in root.handlers if getattr(h, "_ivb_managed", False)]
+        files = [h for h in managed if isinstance(h, logging.handlers.RotatingFileHandler)]
+        assert len(files) == 1
+        assert files[0].maxBytes == LOG_MAX_BYTES and files[0].backupCount == LOG_BACKUPS
+        for name in ("httpx", "httpcore", "asyncio", "websockets", "PIL", "playwright"):
+            assert logging.getLogger(name).level == logging.WARNING
+    finally:
+        for h in list(root.handlers):
+            if getattr(h, "_ivb_managed", False):
+                root.removeHandler(h)
+                h.close()

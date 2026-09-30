@@ -1,9 +1,9 @@
 """元数据链: 由脚本与章节生成 B 站投稿元数据(标题/简介/标签)。"""
 from __future__ import annotations
 
-from typing import Any
-
+from ..boundary import BoundaryRules
 from ..config import Settings
+from ..llm import ChatModel
 from ..models import BiliMeta, Chapter, Script
 from ..prompts import ChatPromptTemplate
 from . import parse_json_lenient
@@ -86,7 +86,7 @@ def _finalize_meta(meta: BiliMeta) -> BiliMeta:
 
 
 async def write_metadata(
-    llm: Any,
+    llm: ChatModel,
     script: Script,
     chapters: list[Chapter],
     settings: Settings,
@@ -100,7 +100,7 @@ async def write_metadata(
     }
     meta = await invoke_structured(
         _build_prompt(), llm, payload, BiliMeta, parse_metadata_json,
-        stage="metadata",
+        stage="metadata", boundary_rules=BoundaryRules.non_script(),
     )
     assert isinstance(meta, BiliMeta)
     return _finalize_meta(meta)

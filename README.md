@@ -9,10 +9,10 @@ AI 面试求职短视频流水线: 给一条行业(如「互联网」「护理�
 ```
 industry ──chains/topic.py──▶ Topic ──chains/script.py──▶ Script(scenes[])
 Script ──tts.py(edge-tts / 火山豆包双通道)──▶ 每场景 mp3 + cues(edge=词级时间轴, doubao=估算时间轴)
-Script ──render.py(Jinja2+Playwright)──▶ cover.png + scene_XXX.png (1920x1080)
+Script ──render.py(Jinja2+Playwright)──▶ cover.png + scene_XXX.png (1920x1080; VIDEO_ASPECT=9:16 时 1080x1920)
         ──assemble.py(build_scene_clips)──▶ 每场景 mp4(ffprobe 回填精确时长)
-全局cues(tts.offset_cues)──subtitle_bars.py(Pillow)──▶ 每 cue 一张 1920x1080 透明字幕条 PNG
-clips + bars ──assemble.py(finalize_video)──▶ final.mp4(逐 clip overlay 字幕条 → concat 直拷 → loudnorm)
+全局cues(tts.offset_cues)──subtitle_bars.py(Pillow)──▶ 每 cue 一张与画幅同尺寸的透明字幕条 PNG
+clips + bars ──assemble.py(finalize_video)──▶ final.mp4(逐 clip overlay 字幕条 → concat 直拷 → [可选 BGM 混音] → loudnorm)
 Script + chapters ──chains/metadata.py──▶ BiliMeta(标题/简介/标签)
         ──▶ project.json(manifest); 可选 bilibili.py 上传 B站
 ```
@@ -20,7 +20,9 @@ Script + chapters ──chains/metadata.py──▶ BiliMeta(标题/简介/标�
 编排层 `graph.py` 基于原生异步工作流引擎(`workflow_engine.py`, 零第三方依赖)把以上串成线性 8 节点图:
 `gen_script → tts → render → clips → subs → finalize → metadata → manifest`,
 `run_pipeline()` 是 async 便捷入口; `cli.py` 是 `ivb` 命令行(也是 `python -m interview_video`)。
-LLM 调用完全基于原生 HTTP 客户端(`httpx`, 彻底移除 LangChain/LangGraph 依赖), 并由模型输出边界体系(`boundary.py`)提供强类型、结构与业务红线防护。
+LLM 调用基于原生 HTTP 客户端(`llm.py`, `httpx` 直连任意 OpenAI 兼容接口, 不依赖 LLM 编排框架), 并由模型输出边界体系(`boundary/` 包: errors / rules / redlines / parsing / structure / repair)提供强类型、结构与业务红线防护。
+媒体步骤(ffmpeg/ffprobe/Playwright/Pillow)在可取消工作线程(`procs.py`)中执行, 任务取消时子进程会被终止。
+模块契约与各层接口见 `SPECS.md`。
 
 本机 ffmpeg **无 libass**(没有 subtitles 滤镜), 因此字幕不走 `subtitles` 滤镜,
 而是 Pillow 生成「底部字幕条透明 PNG + overlay」方案, 兼容性更好。
@@ -51,11 +53,29 @@ cp .env.example .env
 缺依赖直接报错, 不会先花掉 LLM/TTS 费用。Linux 需安装中文字体(如 `apt install fonts-noto-cjk`)
 或设 `SUBTITLE_FONT_PATH`。
 
-## 三条命令
+## 常用命令
+
+| 命令 | 作用 |
+|---|---|
+| `ivb topics` | 生成选题 / 查看选题库(`--list [--all]`、`--next`) |
+| `ivb generate` | 单集完整流水线(`--topic`/`--script-file`/`--resume`/`--stop-after script`/`--tts`/`--voice`/`--aspect`/`--bgm`/`--publish-at`/`-y`) |
+| `ivb batch` | 按选题库顺序批量生成 N 条 |
+| `ivb series` | 多 agent 系列长视频(`--episodes`/`--duration`/`--resume`/`--dry-run`/`-y`) |
+| `ivb upload` | 上传 B站(`-y`/`--force`/`--publish-at`) |
+| `ivb eval` | 生成质量评测 |
+| `ivb doctor` | 环境自检(`--ping`) |
+| `ivb web` | Web 操作台(`--host`/`--port`) |
+| `ivb --version` | 显示版本 |
+
+各命令完整参数见 `ivb <命令> --help`。
 
 ```bash
-# ① 生成选题清单(需 LLM), 存 output/topics-*.json
+# ① 生成选题清单(需 LLM), 存 output/topics-*.json, 并去重入选题库 output/topics_backlog.json
+#    选题库已有/用过的标题会作为 avoid 传给 LLM, 避免反复出同一题
 ivb topics --industry 护理 -n 8
+ivb topics --list [--industry 护理] [--all]   # 查看选题库(默认只列未用; --all 含已用)
+ivb topics --next --industry 护理             # 取下一条未用选题并打印对应 generate 命令
+# 视频生成完成后, 对应选题自动在选题库标记为已用
 
 # ② 跑完整流水线生成视频
 #    未给 --out 时自动生成 output/<slug>-<YYYYmmdd-HHMM>/
@@ -65,6 +85,8 @@ ivb generate --industry 互联网 \
              --topic "应届生自我介绍" \
              --voice zh-CN-XiaoxiaoNeural \
              --out output/self-intro
+# 临时切豆包: --voice 作用于当前通道(豆包音色写入 TTS_DOUBAO_VOICE), series 同样支持
+ivb generate --topic "应届生自我介绍" --tts doubao --voice zh_female_vv_uranus_bigtts
 # 或直接复用现成脚本:
 ivb generate --script-file examples/sample_script.json --out output/demo
 # 中途失败(ffmpeg/渲染/TTS)后断点续跑: 复用该目录的 script.json 与 TTS 缓存, 不再付 LLM 费用
@@ -74,8 +96,26 @@ ivb generate --topic "应届生自我介绍" --stop-after script --out output/se
 ivb generate --resume output/self-intro
 
 # ③ 读 project.json 上传 B站(需开启 BILI_UPLOAD_ENABLED 并配置 cookie)
+#    成功后 bvid 写入 upload.json; 已上传过的项目默认拒绝重复投稿, 确需重投加 --force
 ivb upload output/demo --yes
+# 定时发布: 本地时间, 需在 2 小时后 ~ 15 天内(B站 dtime 限制), 不合法直接报错不上传
+ivb upload output/demo --yes --publish-at "2026-10-02 20:00"
 ```
+
+### 竖屏 / BGM / 批量
+
+```bash
+# 9:16 竖屏(1080x1920): 版式、字幕位置(避开底部操作栏)、封面随之调整; 默认仍是 16:9
+ivb generate --topic "应届生自我介绍" --aspect 9:16
+# 背景音乐: 循环铺满、低音量(BGM_VOLUME_DB)、口播时自动压低(BGM_DUCKING)、结尾淡出; 不设则不加
+ivb generate --topic "应届生自我介绍" --bgm ~/music/lofi.mp3
+# 批量: 从选题库按顺序取 N 条未用选题逐个生成, 单条失败不影响后续, 最后打印汇总表
+ivb batch --industry 护理 -n 3 [--aspect 9:16] [--bgm bgm.mp3]
+```
+
+封面标题按长度自动缩放字号(108px → 最小 56px, 最多 3 行), 长标题不再溢出;
+字幕每条最多 `SUBTITLE_MAX_CHARS`(默认 16)字, 超长句优先在逗号/顿号处断开, 时间按字数比例分配。
+Web 操作台同样支持画幅选择、选题库浏览与定时发布。
 
 ## 系列长视频(多 agent)
 
@@ -91,7 +131,7 @@ ivb series "程序员面试通关" --episodes 3 --duration 15 --dry-run
 
 # 中途失败(断网/限流/解析失败)后断点续跑: 已完成的集与章节不重跑、
 # 已有成片的分集跳过媒体合成, 不再重复付 LLM/TTS 费用
-ivb series "程序员面试通关" --resume output/程序员面试通关-series-20260923-1600
+ivb series --resume output/程序员面试通关-series-20260923-1600   # 主题从 series.json 读取, 可省略
 ```
 
 多 agent 角色与协作(`chains/series.py` + `series.py` 双循环图):
@@ -126,7 +166,8 @@ ivb series "程序员面试通关" --resume output/程序员面试通关-series-
 
 - **LLM 审计**: 每次调用的 token/耗时/输入输出规模追加到产物目录 `llm_calls.jsonl`
   (单集写在产物目录, 系列策划/编剧写在系列根目录); CLI 完成面板与 Web 完成提示直接显示调用次数与 token 合计;
-- **日志**: 统一 INFO 控制台 + `output/ivb.log` 文件双通道, 回退/降级/重试全部留痕;
+- **日志**: 统一 INFO 控制台 + `<OUT_ROOT>/ivb.log` 文件双通道(5MB 轮转保留 3 份), 回退/降级/重试全部留痕,
+  httpx/httpcore/asyncio/websockets/PIL/playwright 的 DEBUG 噪声已压到 WARNING;
   命令失败只打印一行原因, 完整堆栈写入日志(设 `IVB_DEBUG=1` 直接打印);
 - **Web 失败诊断**: 任务失败时堆栈与所在阶段落盘 `error-<jobid>.log`;
 - **生成溯源**: `project.json` 的 `generation` 块记录模型/温度/TTS 通道/prompt 版本;
@@ -156,6 +197,11 @@ ivb eval -o eval-report.json  # 报告落盘, 改 prompt 后对比基线
 ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
 ```
 
+安全: 所有请求校验 Host 头(回环名 / `--host` / `WEB_ALLOWED_HOSTS`, 防 DNS 重绑定);
+POST/PUT/DELETE/PATCH 的 Origin(无则 Referer)必须与 Host 同源, 跨站表单/脚本提交返回 403。
+`--host` 为非回环地址(如 `0.0.0.0`)时写操作还需令牌 `X-IVB-Token`: 未设置 `WEB_TOKEN` 则启动时生成,
+终端打印带 `#token=` 的链接, 页面读取后存入 sessionStorage 并自动附带。
+
 单页操作台(FastAPI + 原生 JS, 无构建步骤), 三段式:
 
 1. **选题**: 输入行业 → 生成选题清单(LLM), 点击选题自动填入生成框;
@@ -169,6 +215,8 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
    勾选「只生成脚本」则停在配音前(同 `--stop-after script`), 作品库出现「仅脚本」草稿;
 3. **作品库**: 封面墙(系列分集自动展开为独立条目) → 详情里可播放成片、
    编辑 B站标题/简介/标签(写回 project.json)、一键上传(未配 cookie 三件套会返回指引);
+   按创建时间倒序(系列分集成组); 失败的任务(即使脚本前就失败)标「生成失败」并带错误日志链接,
+   project.json/script.json 损坏的目录标「文件损坏」而不拖垮整个作品库;
    详情里还有**脚本编辑器**(script.json 格式化 JSON): 「保存脚本」/「保存并重新生成」,
    重新生成复用原目录与改后的脚本(同 `--resume`, 未改动场景复用配音缓存), 占用同一把单飞锁。
    未全部出片的系列列在作品库顶部「未完成系列」, 点**续跑**同 `ivb series --resume <root>`
@@ -186,11 +234,17 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
 任务失败时堆栈与所在阶段落盘到该任务产物目录的 `error-<jobid>.log`;
 `GET /api/doctor` 返回与 `ivb doctor` 相同的环境自检结果。
 
-> 本地工具, 默认只绑 127.0.0.1; 上传成功后 bvid 记录在项目目录 upload.json。
+> 本地工具, 默认只绑 127.0.0.1; 上传成功后 bvid 记录在项目目录 upload.json(CLI 与 Web 共用),
+> 已有 bvid 时 `POST /api/projects/{name}/upload` 返回 409(`already_uploaded`), 页面确认后带 `{"force": true}` 重投。
 
 ## .env 说明
 
 环境变量名与字段名大写一致, **可复用 drivecast 的 `.env`**(同一套 OpenAI 兼容配置)。
+完整清单(含全部可选项与说明)以 `.env.example` 为准, 下面是常用项速览(注释行仅作说明, 实际 `.env` 里注释须单独成行)。
+
+`.env` 按以下顺序查找, 首个存在者生效: `$IVB_ENV_FILE` → 当前目录 `./.env` → `~/.config/ivb/.env`
+(不在项目目录运行时放用户级配置即可)。`OUT_ROOT` 默认 `output`(相对当前目录), 可写绝对路径或 `~/...`。
+实际读取的 `.env` 与输出目录会在 `ivb doctor` 以及 generate/series/web 启动时打印。
 
 > 注释请单独成行, 不要写在 `KEY=` 后面。空值与 `#` 开头的值会被视为未配置;
 > `LLM_BASE_URL` 必须以 `http(s)://` 开头, 连不上时报错会直接给出所用 base_url。
@@ -200,25 +254,46 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
 LLM_API_KEY=sk-...
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
+# LLM_TEMPERATURE=0.7
 # LLM_TIMEOUT=300            # 读超时(秒)
 # LLM_CONNECT_TIMEOUT=10     # 建连超时(秒)
 # LLM_MAX_TOKENS=8192        # 输出被截断(finish_reason=length)时调大
+# LLM_MAX_RETRIES=2          # 客户端层网络/限流重试次数
+# LLM_FALLBACK_MODEL=        # 备用模型(可选), BASE_URL/API_KEY 不填则沿用主模型
+# LLM_FALLBACK_BASE_URL=
+# LLM_FALLBACK_API_KEY=
 # LLM_MAX_CALLS_PER_RUN=     # 单次运行 LLM 调用硬上限(默认不限), 超限停下可续跑
 # LLM_MAX_TOKENS_PER_RUN=    # 单次运行 token 硬上限(默认不限)
 # LLM_PRICE_INPUT_PER_1K=    # 费用预估单价(可选): 输入/输出每千 token、TTS 每万字
 # LLM_PRICE_OUTPUT_PER_1K=
 # TTS_PRICE_PER_10K_CHARS=
 
-# TTS / 内容 / 视频(均有默认值, 可省略)
-TTS_PROVIDER=edge          # edge(免费) | doubao(火山引擎豆包 seed-tts-2.0)
+# TTS(均有默认值, 可省略)
+TTS_PROVIDER=edge          # edge(免费) | doubao(火山引擎豆包 seed-tts-2.0); 命令行 --tts 临时覆盖
 TTS_VOICE=zh-CN-YunxiNeural
 TTS_RATE=+6%
 # TTS_FALLBACK_PROVIDER=edge  # 主通道重试耗尽/鉴权失败时该场景改用备用通道(默认不回退)
 # doubao 通道凭证(TTS_PROVIDER=doubao 时必填, 火山引擎控制台→豆包语音→API Key):
 # TTS_DOUBAO_API_KEY=
+# TTS_DOUBAO_APP_KEY=        # 旧版控制台: App ID + Access Key 一对, 替代 API Key
+# TTS_DOUBAO_ACCESS_KEY=
 # TTS_DOUBAO_VOICE=zh_male_m191_uranus_bigtts   # 女声: zh_female_vv_uranus_bigtts
+# TTS_DOUBAO_RATE=0          # speech_rate [-50,100]
+# TTS_DOUBAO_RESOURCE_ID=seed-tts-2.0           # 1.0 音色改 seed-tts-1.0
+# 高级项(一般不改): TTS_DOUBAO_HTTP_URL / TTS_DOUBAO_UID / TTS_DOUBAO_FORMAT / TTS_DOUBAO_SAMPLE_RATE / TTS_DOUBAO_RECV_TIMEOUT
+
+# 内容 / 画面 / 音频(均有默认值, 可省略)
 BRAND=面试充电站
 TARGET_DURATION_SEC=100
+VIDEO_ASPECT=16:9          # 16:9 | 9:16(竖屏); 命令行 --aspect 临时覆盖
+# VIDEO_WIDTH=1920 / VIDEO_HEIGHT=1080 / FPS=30   # 横屏基准分辨率(竖屏自动对调)与帧率
+# BGM_FILE=~/music/bgm.mp3 # 背景音乐(可选), 命令行 --bgm 临时覆盖
+# BGM_VOLUME_DB=-18        # BGM 音量(dB)
+# BGM_DUCKING=true         # 口播时压低 BGM
+# SUBTITLE_MAX_CHARS=16    # 每条字幕最多字数(6-16)
+# SUBTITLE_FONTSIZE=52 / SUBTITLE_BOTTOM=96 / SUBTITLE_BOX=true   # 字幕条字号/距底像素/半透明底条
+# SUBTITLE_FONT_PATH=      # 自动探测不到中文字体时指定
+# LOUDNESS_I=-16 / LOUDNESS_TP=-1.5 / LOUDNESS_LRA=11             # 成片 loudnorm 参数
 
 # 系列长视频(均有默认值, 可省略)
 SERIES_REVIEW=true        # 章节审稿 agent 开关
@@ -230,6 +305,11 @@ BILI_SESSDATA=
 BILI_JCT=
 BILI_BUVID3=
 BILI_TID=36
+
+# 输出目录 / Web 操作台(可选)
+# OUT_ROOT=output          # 可写绝对路径或 ~/...
+# WEB_TOKEN=               # 非回环 --host 时写操作令牌(不设则启动时生成)
+# WEB_ALLOWED_HOSTS=       # 额外允许的 Host 头(逗号分隔)
 ```
 
 ## B站 cookie 获取步骤
@@ -276,7 +356,7 @@ output/<主题>-series-<时间戳>/
 ## 测试与 CI
 
 ```bash
-.venv/bin/pytest                  # 单元测试(不联网/不调真实 LLM/不起 chromium), 147 个
+.venv/bin/pytest -q               # 单元测试(不联网/不调真实 LLM/TTS/不起 chromium)
 .venv/bin/pytest --run-integration  # 额外跑需要 ffmpeg/网络/chromium 的集成测试
 make test                         # 等价入口(make lint / make integration / make eval)
 .venv/bin/ruff check src tests    # 静态检查(CI 同款)
@@ -285,14 +365,15 @@ make test                         # 等价入口(make lint / make integration / 
 单元测试将 tts/render/assemble/subtitle_bars monkeypatch 成本地假实现;
 依赖 ffmpeg 的素材合成测试打 `@pytest.mark.integration`, 缺二进制时自动 skip。
 CI(GitHub Actions / Gitea 镜像, `.github/workflows/ci.yml`)在每次 push 跑
-ruff + 全量离线单测; 依赖由 `uv.lock` 锁定(`uv sync --extra dev` 复现环境)。
-变更记录见 `CHANGELOG.md`。
+ruff + Python 3.10/3.11/3.12 全量离线单测, 另有安装 ffmpeg 的集成测试任务; 依赖由 `uv.lock` 锁定(`uv sync --extra dev` 复现环境)。
+变更记录见 `CHANGELOG.md`, 模块契约见 `SPECS.md`。
 
 ## 路线图
 
 - ~~Web 操作台~~(已落地: `ivb web`)
 - ~~系列断点续跑 / LLM 调用健壮化 / 可观测性 / evals~~(0.2.0 已落地)
+- ~~定时发布 / 竖屏 / BGM / 选题库与批量生产~~(0.3.0 已落地: `--publish-at` / `--aspect` / `--bgm` / `ivb batch`)
 - 双音色对话(面试官/求职者交替配音, 更强代入感)
 - 真人数字人形象(替代 HTML 画面帧)
-- 自动定时发布(接 B站 delay_time / cron 定点投递)
-- LangGraph interrupt() 人工审稿介入(策划确认后再跑全集)
+- 无人值守定时投递(cron 定点跑 `ivb batch` + 自动上传)
+- 系列策划人工审稿介入(策划确认后再跑全集)

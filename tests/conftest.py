@@ -41,6 +41,12 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_out_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """默认 OUT_ROOT 指向本测试的 tmp_path/output: 选题库/日志等旁路写入不落到仓库或用户目录。"""
+    monkeypatch.setenv("OUT_ROOT", str(tmp_path / "output"))
+
+
 def _png_bytes() -> bytes:
     """最小的合法 PNG(16x16 RGBA), 供假媒体实现落盘。"""
     import io

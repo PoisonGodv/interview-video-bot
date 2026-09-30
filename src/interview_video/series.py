@@ -1,4 +1,4 @@
-"""系列长视频编排: LangGraph 多 agent 双循环(集循环 × 章节循环)。
+"""系列长视频编排: 原生工作流引擎多 agent 双循环(集循环 × 章节循环)。
 
 图结构:
     plan → episode_setup ──(还有集)──▶ outline → chapter ──(还有章)──▶ chapter
@@ -28,7 +28,7 @@ from typing import Any, TypedDict
 from .chains import series as series_chains
 from .config import Settings
 from .models import ChapterDraft, EpisodeOutline, Scene, Script, SeriesPlan
-from .workflow_engine import END, START, CompiledStateGraph, StateGraph
+from .workflow_engine import END, START, CompiledWorkflow, RunContext, WorkflowEngine
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ def _clamp_outline(outline: EpisodeOutline, ep_target_sec: int, chapter_sec: int
 
 def build_series_graph(
     settings: Settings, on_event: EventFn | None = None, run_dir: Path | None = None
-) -> CompiledStateGraph:
+) -> CompiledWorkflow:
     """构建系列生成图。settings/on_event/run_dir 由闭包捕获, 不入状态。"""
 
     def emit(name: str, **payload: Any) -> None:
@@ -177,7 +177,7 @@ def build_series_graph(
     def _has_chapter(state: SeriesState) -> str:
         return "chapter" if state["ch_idx"] < len(state["outline"].chapters) else "build_script"
 
-    graph = StateGraph(SeriesState)
+    graph = WorkflowEngine(SeriesState)
     graph.add_node("plan", plan_node)
     graph.add_node("episode_setup", episode_setup_node)
     graph.add_node("outline", outline_node)
@@ -279,7 +279,7 @@ async def generate_series(
     graph = build_series_graph(settings, on_event, run_dir=run_dir)
     from .llm_audit import LLMCallAudit, run_budget
 
-    config = {"callbacks": [LLMCallAudit(run_dir)]} if run_dir is not None else None
+    context = RunContext(audit=LLMCallAudit(run_dir) if run_dir is not None else None)
     with run_budget(settings):  # 超限抛 LLMBudgetExceededError; 已完成章节已落盘, 可 resume
-        final = await graph.ainvoke(initial, config=config)
+        final = await graph.run(initial, context=context)
     return final["plan"], final["scripts"]

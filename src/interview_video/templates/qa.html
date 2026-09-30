@@ -41,6 +41,14 @@
 }
 .a-card .tag { color: #fbbf24; }
 {% endblock %}
+{% block portrait_css %}
+.qa-header { font-size: 76px; line-height: 1.25; margin: auto 0 72px; }
+.qa-header .idx { display: block; margin-bottom: 16px; }
+.qa-cards { gap: 52px; margin-bottom: auto; }
+.qa-card { flex-direction: column; padding: 44px 48px; }
+.qa-card .tag { margin: 0 0 20px 0; font-size: 56px; }
+.qa-card .body { font-size: 50px; }
+{% endblock %}
 {% block content %}
 <div class="topbar">
   <div class="brand">{{ brand }}</div>

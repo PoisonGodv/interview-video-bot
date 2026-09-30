@@ -6,9 +6,11 @@
 - 子进程经 procs.run 启动: 所在任务被取消时 terminate/kill, 不留孤儿 ffmpeg
 - 单次调用超时随媒体时长伸缩(下限 300s); 非零退出抛 RuntimeError 附 stderr 末尾 500 字
 - 字幕条按场景 clip 逐段烧录(cue 平移到场景本地时间), 再 concat(-c copy), 避免长视频单条巨型 filter
+- 可选 BGM(BGM_FILE): 在最后一遍音频处理里循环铺满、压低音量、口播时 sidechain 闪避、结尾淡出
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -16,6 +18,8 @@ from pathlib import Path
 from . import procs
 from .config import Settings
 from .models import Chapter, SceneMedia, Script, SubtitleBar
+
+logger = logging.getLogger(__name__)
 
 # 单次 ffmpeg 调用超时(秒): max(下限, 固定开销 + 媒体时长 × 系数), SPECS 要求 >= 300
 _FFMPEG_TIMEOUT_FLOOR = 300.0
@@ -29,6 +33,9 @@ _X264_ARGS = [
 ]
 # 跨场景边界的字幕条切片后, 短于此值(秒)的碎片丢弃
 _MIN_SLICE = 1e-3
+# BGM 结尾淡出时长(秒), 短片按总长 1/4 封顶
+_BGM_FADE_SEC = 3.0
+_AUDIO_FMT = "aformat=sample_rates=44100:channel_layouts=stereo"
 
 
 def _timeout_for(duration: float) -> float:
@@ -87,7 +94,7 @@ def build_scene_clips(
     clips_dir = Path(clips_dir)
     clips_dir.mkdir(parents=True, exist_ok=True)
     anchor = clips_dir.parent.resolve()  # 视为 out_dir, 输入输出均相对它传参
-    w, h, fps = settings.video_width, settings.video_height, settings.fps
+    (w, h), fps = settings.frame_size(), settings.fps
     vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
@@ -224,15 +231,54 @@ def finalize_video(
         f"loudnorm=I={settings.loudness_i}:TP={settings.loudness_tp}"
         f":LRA={settings.loudness_lra}"
     )
-    # 视频直拷, 仅音频响度归一(loudnorm 内部上采样到 192k, 输出钉回 44.1k)
+    bgm = settings.bgm_file
+    if bgm is not None and not Path(bgm).is_file():
+        logger.warning("BGM_FILE 不存在, 跳过背景音乐: %s", bgm)
+        bgm = None
+    if bgm is None:
+        # 视频直拷, 仅音频响度归一(loudnorm 内部上采样到 192k, 输出钉回 44.1k)
+        audio_args = ["-i", base.name, "-c:v", "copy", "-af", loudnorm]
+    else:
+        audio_args = [
+            "-i", base.name, "-stream_loop", "-1", "-i", str(Path(bgm).resolve()),
+            "-filter_complex", bgm_filter(total, settings, loudnorm),
+            "-map", "0:v", "-map", "[aout]", "-c:v", "copy",
+        ]
     _run(
-        ["ffmpeg", "-y", "-i", base.name,
-         "-c:v", "copy", "-af", loudnorm,
+        ["ffmpeg", "-y", *audio_args,
          "-c:a", "aac", "-b:a", "160k", "-ar", "44100", out_path.name],
         out_dir,
         _timeout_for(total),
     )
     return out_path
+
+
+def bgm_filter(total: float, settings: Settings, loudnorm: str) -> str:
+    """口播 [0:a] + 循环 BGM [1:a] → [aout]。
+
+    BGM 截到成片时长、按 BGM_VOLUME_DB 压低、(可选)口播时 sidechain 闪避、结尾淡出;
+    与口播混合后整体 loudnorm。
+    """
+    fade = min(_BGM_FADE_SEC, max(total, 0.0) / 4)
+    fade_start = max(total - fade, 0.0)
+    bg = (
+        f"[1:a]{_AUDIO_FMT},atrim=0:{_fmt_t(total)},asetpts=PTS-STARTPTS,"
+        f"volume={settings.bgm_volume_db}dB"
+    )
+    if settings.bgm_ducking:
+        parts = [
+            f"[0:a]{_AUDIO_FMT},asplit=2[voice][sc]",
+            f"{bg}[bgraw]",
+            "[bgraw][sc]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=400[bgduck]",
+            f"[bgduck]afade=t=out:st={_fmt_t(fade_start)}:d={_fmt_t(fade)}[bg]",
+        ]
+    else:
+        parts = [
+            f"[0:a]{_AUDIO_FMT}[voice]",
+            f"{bg},afade=t=out:st={_fmt_t(fade_start)}:d={_fmt_t(fade)}[bg]",
+        ]
+    parts.append(f"[voice][bg]amix=inputs=2:duration=first:normalize=0,{loudnorm}[aout]")
+    return ";".join(parts)
 
 
 def build_chapters(script: Script, scene_media: list[SceneMedia]) -> list[Chapter]:

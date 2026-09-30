@@ -1,9 +1,10 @@
 """LLM 调用统一入口: 模型输出边界防护 + 结构化自修复 + 异常分类与回退留痕。
 
-彻底移除 LangChain 依赖，原生对接 boundary.enforce_boundary 与 prompts.ChatPromptTemplate。
-契约与策略:
+模型只需实现 ``await llm.chat(messages)``(见 llm.ChatModel); prompt 为 prompts.ChatPromptTemplate、
+str 或 OpenAI 格式消息列表。契约与策略:
 1. 边界与结构化防护 (invoke_structured):
    - 首选 enforce_boundary: 执行 Schema、长度与结构、业务红线三重边界校验;
+     长度/结构规则由调用方显式传入 boundary_rules(默认为完整脚本规则);
    - 初次违规时自动下调温度发起带第一现场与违规反馈的自修复重问;
    - 容错本地回退解析: 若触发边界违规但本地 fallback_parser 可补救，留痕日志后采用;
    - 红线闸门: 任何回退解析结果都会重扫业务红线, 命中即抛 RedlineGateError(ValueError);
@@ -28,7 +29,15 @@ from ..boundary import (
     enforce_boundary,
     scan_object_redlines,
 )
-from ..llm import LLMBudgetExceededError, LLMError, LLMTruncatedError, is_fatal_error
+from ..llm import (
+    ChatModel,
+    LLMBudgetExceededError,
+    LLMError,
+    LLMTruncatedError,
+    is_fatal_error,
+    normalize_messages,
+)
+from ..prompts import ChatPromptTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -42,23 +51,6 @@ _REPAIR_INSTRUCTION = (
 )
 
 _MAX_REPAIR_OUTPUT_CHARS = 4000
-
-
-def _fatal_llm_error(exc: BaseException) -> bool:
-    """鉴权/权限/模型不存在类错误: 重试与回退都无意义, 应当立即失败。"""
-    if is_fatal_error(exc):
-        return True
-    try:
-        import openai
-
-        fatal = tuple(
-            getattr(openai, attr)
-            for attr in ("AuthenticationError", "PermissionDeniedError", "NotFoundError")
-            if hasattr(openai, attr)
-        )
-        return isinstance(exc, fatal) if fatal else False
-    except ImportError:
-        return False
 
 
 def _transport_exhausted(exc: BaseException) -> bool:
@@ -82,46 +74,15 @@ def _redline_gate(value: Any, stage: str, raw: str = "") -> Any:
     raise RedlineGateError(f"[{stage}] LLM 输出命中业务红线: {detail}") from err
 
 
-def _msg_text(message: Any) -> str:
-    """自各类返回形态提取纯文本。"""
-    if message is None:
-        return ""
-    if isinstance(message, str):
-        return message
-    content = getattr(message, "content", message)
-    if isinstance(content, str):
-        return content
-    try:
-        return "".join(
-            part if isinstance(part, str) else str(part.get("text", ""))
-            for part in content
-        )
-    except Exception:  # noqa: BLE001
-        return str(content)
-
-
 def _format_messages(prompt: Any, payload: dict[str, Any]) -> list[dict[str, str]]:
-    """将 PromptTemplate 格式化为 list[dict[str, str]]。"""
-    if hasattr(prompt, "format_messages"):
-        raw_msgs = prompt.format_messages(**payload)
-        return [
-            {"role": m.role if hasattr(m, "role") else m.get("role", "user"),
-             "content": str(m.content if hasattr(m, "content") else m.get("content", ""))}
-            for m in raw_msgs
-        ]
-    if isinstance(prompt, str):
-        return [{"role": "user", "content": prompt}]
-    if isinstance(prompt, list):
-        return [
-            {"role": m.get("role", "user") if isinstance(m, dict) else getattr(m, "role", "user"),
-             "content": str(m.get("content", "")) if isinstance(m, dict) else str(getattr(m, "content", ""))}
-            for m in prompt
-        ]
-    return [{"role": "user", "content": str(prompt)}]
+    """ChatPromptTemplate / str / 消息列表 → OpenAI 格式 list[dict[str, str]]。"""
+    if isinstance(prompt, ChatPromptTemplate):
+        return [dict(m) for m in prompt.format_messages(**payload)]
+    return normalize_messages(prompt)
 
 
 async def _repair_reask(
-    llm: Any,
+    llm: ChatModel,
     messages: list[dict[str, str]],
     bad_text: str,
     error: BaseException,
@@ -139,18 +100,12 @@ async def _repair_reask(
             ),
         }
     )
-    if hasattr(llm, "ainvoke"):
-        response = await llm.ainvoke(repair_msgs)
-    elif callable(llm):
-        response = await llm(repair_msgs)
-    else:
-        raise TypeError(f"llm 必须支持 ainvoke 或 callable: {type(llm)}")
-    return _msg_text(response)
+    return (await llm.chat(repair_msgs)).content
 
 
 async def invoke_text(
     prompt: Any,
-    llm: Any,
+    llm: ChatModel,
     payload: dict[str, Any],
     fallback_parser: Callable[[str], Any],
     *,
@@ -159,17 +114,11 @@ async def invoke_text(
     """纯文本调用 + 容错解析 + 一次修复重问; 全失败抛 ValueError(保留第一现场)。"""
     messages = _format_messages(prompt, payload)
     try:
-        if hasattr(llm, "ainvoke"):
-            raw_res = await llm.ainvoke(messages)
-        elif callable(llm):
-            raw_res = await llm(messages)
-        else:
-            raise TypeError(f"llm 不支持调用: {type(llm)}")
-        text = _msg_text(raw_res)
+        text = (await llm.chat(messages)).content
     except (LLMTruncatedError, LLMBudgetExceededError):
         raise
     except Exception as exc:
-        if _fatal_llm_error(exc):
+        if is_fatal_error(exc):
             raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误, 不重试: {exc}") from exc
         raise
 
@@ -189,7 +138,7 @@ async def invoke_text(
         except (LLMTruncatedError, LLMBudgetExceededError):
             raise
         except Exception as exc2:
-            if _fatal_llm_error(exc2):
+            if is_fatal_error(exc2):
                 raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误: {exc2}") from exc2
             raise ValueError(f"[{stage}] LLM 输出解析失败(文本+修复重试均失败)") from exc
     return _redline_gate(parsed, stage, text)
@@ -197,7 +146,7 @@ async def invoke_text(
 
 async def invoke_structured(
     prompt: Any,
-    llm: Any,
+    llm: ChatModel,
     payload: dict[str, Any],
     schema: type[BaseModel],
     fallback_parser: Callable[[str], Any],
@@ -207,61 +156,14 @@ async def invoke_structured(
 ) -> Any:
     """结构化调用边界防护统一入口。
 
-    1. 若提供了 with_structured_output (如遗留测试桩)，优先走结构化适配;
-    2. 主路径走 boundary.enforce_boundary，具备 Schema/字数结构/红线自修复机制;
-    3. 解析失败但有原始输出时执行 fallback_parser 本地重解析;
+    1. 主路径走 boundary.enforce_boundary(规则取 boundary_rules, 缺省为完整脚本规则),
+       具备 Schema/字数结构/红线自修复机制;
+    2. 边界失败但有原始输出时执行 fallback_parser 本地重解析(结果仍过红线闸门);
+    3. 其他非传输层异常退到 invoke_text(文本解析 + 一次修复重问);
     4. 全流程对 401/403/404 等致命鉴权错误快速失败。
     """
     messages = _format_messages(prompt, payload)
-
-    # 1. 兼容具备 with_structured_output 的测试桩或三方适配器
-    if hasattr(llm, "with_structured_output") and callable(llm.with_structured_output):
-        try:
-            runner = llm.with_structured_output(schema, include_raw=True)
-            if hasattr(runner, "ainvoke"):
-                res = await runner.ainvoke(payload if hasattr(prompt, "|") else messages)
-            else:
-                res = runner(messages)
-            if isinstance(res, dict):
-                raw_text = _msg_text(res.get("raw"))
-                if res.get("parsed") is not None:
-                    return _redline_gate(res["parsed"], stage, raw_text)
-                first_exc = res.get("parsing_error") or ValueError("结构化输出 parsed 为空")
-                if raw_text:
-                    try:
-                        parsed = fallback_parser(raw_text)
-                    except Exception as err:
-                        first_exc = err
-                    else:
-                        return _redline_gate(parsed, stage, raw_text)
-                # 修复重问
-                repaired = await _repair_reask(llm, messages, raw_text, first_exc)
-                return _redline_gate(fallback_parser(repaired), stage, repaired)
-            return _redline_gate(res, stage)
-        except (RedlineGateError, LLMTruncatedError, LLMBudgetExceededError):
-            raise
-        except Exception as exc:
-            if _fatal_llm_error(exc):
-                raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误, 不重试: {exc}") from exc
-            if _transport_exhausted(exc):
-                raise
-            logger.warning(
-                "[%s] with_structured_output 失败(%s: %.200s), 回退到边界检查主路径",
-                stage,
-                type(exc).__name__,
-                exc,
-            )
-
-    # 2. 原生输出边界主路径: enforce_boundary
     rules = boundary_rules or BoundaryRules()
-    # 根据目标 Schema 适配边界规则
-    schema_name = getattr(schema, "__name__", "")
-    if schema_name in ("_TopicList", "BiliMeta", "SeriesPlan", "EpisodeOutline"):
-        rules.enforce_scene_count = False
-        rules.require_ending_scene = False
-    elif schema_name == "ChapterDraft":
-        rules.enforce_scene_count = False
-        rules.require_ending_scene = False
 
     try:
         result = await enforce_boundary(
@@ -291,7 +193,7 @@ async def invoke_structured(
     except (LLMTruncatedError, LLMBudgetExceededError):
         raise
     except Exception as exc:
-        if _fatal_llm_error(exc):
+        if is_fatal_error(exc):
             raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误, 不重试: {exc}") from exc
         if _transport_exhausted(exc):
             raise  # 客户端已按 Retry-After/退避重试并尝试过备用模型, 不再整轮重来
@@ -301,7 +203,7 @@ async def invoke_structured(
         except (RedlineGateError, LLMBudgetExceededError):
             raise
         except Exception as exc2:
-            if _fatal_llm_error(exc2):
+            if is_fatal_error(exc2):
                 raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误: {exc2}") from exc2
             raise ValueError(
                 f"[{stage}] LLM 输出解析失败(structured/本地重解析/修复重试均失败)"
@@ -312,5 +214,4 @@ __all__ = [
     "RedlineGateError",
     "invoke_structured",
     "invoke_text",
-    "_fatal_llm_error",
 ]

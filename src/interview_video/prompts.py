@@ -1,13 +1,13 @@
-"""轻量级原生 Prompt 模板系统 (替换 LangChain ChatPromptTemplate)。
+"""轻量级原生 Prompt 模板系统。
 
 设计特性:
 1. 零第三方依赖，纯标准库实现;
-2. 接口对齐 ChatPromptTemplate: from_messages、format_messages;
+2. 接口: ChatPromptTemplate.from_messages / format_messages;
 3. 变量安全替换:
    - 支持 {{ 和 }} 转义还原为 { 和 };
    - 仅对匹配到的 kwargs 变量进行安全单次替换，不进行二次求值;
    - 彻底免疫用户内容中的花括号(如 HashMap{K,V});
-4. 消息对象 ChatMessage 兼容字典访问、属性访问及 str() 输出。
+4. 消息对象 ChatMessage 即 OpenAI 格式 {role, content} 字典, 另支持属性访问。
 """
 from __future__ import annotations
 
@@ -43,8 +43,6 @@ class MessagePrompt:
     def __init__(self, role: str, template: str) -> None:
         self.role = role
         self.template = template
-        # 兼容部分测试检查 .prompt.template 的契约
-        self.prompt = self
 
     def format(self, **kwargs: Any) -> ChatMessage:
         content = safe_format_prompt(self.template, kwargs)

@@ -20,6 +20,7 @@ from .chains.script import (
     write_script,
 )
 from .config import Settings
+from .llm import ChatModel
 from .models import Script, Topic
 from .prompts import ChatPromptTemplate
 
@@ -75,16 +76,10 @@ def check_script_contract(script: Script) -> list[str]:
     return issues
 
 
-async def judge_script(llm: Any, script: Script) -> dict[str, int]:
+async def judge_script(llm: ChatModel, script: Script) -> dict[str, int]:
     """LLM-as-judge 打分(hook/colloquial/coherence, 各 1~5)。解析失败抛 ValueError。"""
     messages = _JUDGE_PROMPT.format_messages(script_json=script.model_dump_json())
-    if hasattr(llm, "ainvoke"):
-        resp = await llm.ainvoke(messages)
-    elif callable(llm):
-        resp = await llm(messages)
-    else:
-        raise TypeError(f"llm 不支持调用: {type(llm)}")
-    text = str(getattr(resp, "content", resp))
+    text = (await llm.chat(messages)).content
     from .chains import parse_json_lenient
 
     data = parse_json_lenient(text)

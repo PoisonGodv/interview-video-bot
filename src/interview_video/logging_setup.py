@@ -2,15 +2,20 @@
 
 落点:
 - 控制台(stderr): INFO 起, 不干扰 rich 面板输出;
-- 文件 <out_root>/ivb.log: DEBUG 起, 保留完整回退/降级/重试痕迹。
+- 文件 <out_root>/ivb.log: DEBUG 起, 保留完整回退/降级/重试痕迹; 按 5MB 轮转, 保留 3 份。
 """
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 from pathlib import Path
 
 _FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUPS = 3
+# 三方库 DEBUG/INFO 噪声(请求行/连接池/事件循环/websocket 帧/图片插件/浏览器驱动)
+NOISY_LOGGERS = ("httpx", "httpcore", "asyncio", "websockets", "PIL", "playwright")
 
 
 class _ConsoleFormatter(logging.Formatter):
@@ -40,7 +45,10 @@ def setup_logging(out_root: Path | None = None, level: int = logging.INFO) -> No
     if out_root is not None:
         try:
             out_root.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(out_root / "ivb.log", encoding="utf-8")
+            file_handler = logging.handlers.RotatingFileHandler(
+                out_root / "ivb.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS,
+                encoding="utf-8",
+            )
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(logging.Formatter(_FMT))
             file_handler._ivb_managed = True
@@ -57,5 +65,5 @@ def setup_logging(out_root: Path | None = None, level: int = logging.INFO) -> No
     root.setLevel(logging.DEBUG)
     for h in handlers:
         root.addHandler(h)
-    # 三方库降噪(uvicorn access log / httpx 请求行)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)

@@ -4,6 +4,7 @@ preflight 只查媒体硬依赖(ffmpeg/ffprobe/chromium/中文字体), 在花 LL
 """
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,11 +55,32 @@ def check_font(settings: Settings) -> Check:
     return Check("中文字体", True, str(getattr(font, "path", "") or "已加载"))
 
 
-def check_config(settings: Settings, env_file: Path = Path(".env")) -> list[Check]:
+def check_paths(settings: Settings) -> list[Check]:
+    from .config import env_file_candidates
+
+    env = settings._env_path
+    tried = " / ".join(str(p) for p in env_file_candidates())
+    out_root = settings.out_root.resolve()
+    writable = os.access(out_root if out_root.exists() else _nearest_existing(out_root), os.W_OK)
+    return [
+        Check(".env", env is not None,
+              str(env) if env is not None
+              else f"未找到(依次查找 {tried}); cp .env.example .env 或设 IVB_ENV_FILE",
+              required=False),
+        Check("输出目录", writable,
+              str(out_root) if writable else f"{out_root} 不可写; 改 OUT_ROOT(可用绝对路径)"),
+    ]
+
+
+def _nearest_existing(p: Path) -> Path:
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return p
+
+
+def check_config(settings: Settings) -> list[Check]:
     out = [
-        Check(".env", env_file.exists(),
-              str(env_file.resolve()) if env_file.exists()
-              else f"当前目录无 .env({Path.cwd()}); cp .env.example .env", required=False),
+        *check_paths(settings),
         Check("LLM_API_KEY", settings.llm_ready(),
               f"模型 {settings.llm_model}" if settings.llm_ready()
               else "未配置(仅 --script-file 模式可用)", required=False),
@@ -71,6 +93,17 @@ def check_config(settings: Settings, env_file: Path = Path(".env")) -> list[Chec
             "已配置" if settings.doubao_ready()
             else "TTS_PROVIDER=doubao 但缺 TTS_DOUBAO_API_KEY(或 APP_KEY+ACCESS_KEY)",
         ))
+    if settings.bgm_file is not None:
+        bgm_ok = settings.bgm_file.is_file()
+        out.append(Check(
+            "BGM", bgm_ok,
+            str(settings.bgm_file) if bgm_ok
+            else f"BGM_FILE 不存在: {settings.bgm_file}(生成时将跳过背景音乐)",
+            required=False,
+        ))
+    if settings.video_aspect == "9:16":
+        w, h = settings.frame_size()
+        out.append(Check("画幅", True, f"竖屏 9:16({w}x{h})", required=False))
     if settings.bili_upload_enabled:
         out.append(Check(
             "B站 cookie", settings.bili_ready(),
@@ -86,7 +119,7 @@ async def ping_llm(settings: Settings) -> Check:
 
     try:
         llm = get_chat_model(settings)
-        await llm.ainvoke("ping, 只回复 ok", max_tokens=5)
+        await llm.chat("ping, 只回复 ok", max_tokens=5)
     except Exception as exc:  # noqa: BLE001
         return Check("LLM 连通", False, f"{type(exc).__name__}: {exc}", required=False)
     return Check("LLM 连通", True, "ok", required=False)

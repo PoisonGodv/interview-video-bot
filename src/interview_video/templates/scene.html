@@ -35,6 +35,12 @@
   box-shadow: 0 0 18px {{ accent }};
 }
 {% endblock %}
+{% block portrait_css %}
+.scene-header { font-size: 88px; line-height: 1.25; margin: auto 0 80px; }
+.scene-header .idx { display: block; margin-bottom: 16px; }
+.bullets { gap: 44px; margin-bottom: auto; }
+.bullet { font-size: 52px; padding: 40px 44px; line-height: 1.4; }
+{% endblock %}
 {% block content %}
 <div class="topbar">
   <div class="brand">{{ brand }}</div>

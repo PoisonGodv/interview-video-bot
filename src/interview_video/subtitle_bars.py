@@ -1,6 +1,6 @@
 """字幕条渲染: 纯 Pillow, 不依赖浏览器。
 
-按 SPECS §4: 每 cue 一张 1920x1080 透明 PNG, 底部居中白字黑描边,
+按 SPECS §4: 每 cue 一张与画布同尺寸(横屏 1920x1080 / 竖屏 1080x1920)的透明 PNG, 底部居中白字黑描边,
 可选半透明黑圆角底条; 字体按探测链找中文字体, 找不到抛带指引的 RuntimeError。
 """
 from __future__ import annotations
@@ -36,6 +36,10 @@ _BOX_PADDING_Y = 16
 _BOX_RADIUS = 18
 # 底条颜色: 半透明黑(RGBA 0,0,0,~120, SPECS 约定)
 _BOX_COLOR = (0, 0, 0, 120)
+# 竖屏时字幕条额外上移(像素): 避开抖音/B站竖屏底部的标题/操作栏, 落在模板 520px 留白区内
+PORTRAIT_EXTRA_BOTTOM = 340
+# 文字(含底条)最多占画布宽度的比例, 超出按比例缩小字号
+_MAX_TEXT_WIDTH_RATIO = 0.9
 
 _FONT_LOAD_ERR_GUIDE = (
     "未找到可用的中文字体。请设置环境变量 SUBTITLE_FONT_PATH 指向一个 .ttf/.ttc 中文字体, "
@@ -113,16 +117,34 @@ def _draw_bar(
     )
 
 
+def subtitle_bottom(settings: Settings) -> int:
+    """字幕条距底边像素: 竖屏在 SUBTITLE_BOTTOM 基础上再上移 PORTRAIT_EXTRA_BOTTOM。"""
+    return settings.subtitle_bottom + (PORTRAIT_EXTRA_BOTTOM if settings.portrait else 0)
+
+
+def _fit_font(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
+    settings: Settings, max_width: float,
+) -> ImageFont.FreeTypeFont:
+    """文字加底条内边距超出 max_width 时按比例缩小字号(竖屏窄画布兜底)。"""
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=_STROKE_WIDTH)
+    need = bbox[2] - bbox[0] + 2 * _BOX_PADDING_X
+    if need <= max_width:
+        return font
+    size = max(int(font.size * max_width / need), 20)
+    return load_subtitle_font(settings, size)
+
+
 def render_subtitle_bars(
     cues: list[Cue], subs_dir: Path, settings: Settings
 ) -> list[SubtitleBar]:
-    """每 cue 渲染一张 1920x1080 透明 PNG 字幕条, 返回 SubtitleBar 列表。"""
+    """每 cue 渲染一张画布尺寸的透明 PNG 字幕条, 返回 SubtitleBar 列表。"""
     subs_dir = Path(subs_dir)
     subs_dir.mkdir(parents=True, exist_ok=True)
 
-    width = settings.video_width
-    height = settings.video_height
+    width, height = settings.frame_size()
     font = load_subtitle_font(settings, settings.subtitle_fontsize)
+    bottom = subtitle_bottom(settings)
 
     bars: list[SubtitleBar] = []
     for index, cue in enumerate(cues):
@@ -135,8 +157,8 @@ def render_subtitle_bars(
             cue.text,
             width=width,
             height=height,
-            font=font,
-            bottom=settings.subtitle_bottom,
+            font=_fit_font(draw, cue.text, font, settings, width * _MAX_TEXT_WIDTH_RATIO),
+            bottom=bottom,
             with_box=settings.subtitle_box,
         )
         png_path = subs_dir / f"bar_{index:03d}.png"

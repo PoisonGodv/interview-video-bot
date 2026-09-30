@@ -314,3 +314,196 @@ def test_generate_stop_after_invalid_choice(tmp_path: Path) -> None:
         app, ["generate", "--stop-after", "script", "--resume", str(tmp_path)]
     )
     assert result.exit_code == 2
+
+
+# ---------- --tts / --voice 路由 ----------
+
+
+@pytest.mark.parametrize(
+    ("args", "provider", "edge_voice", "doubao_voice"),
+    [
+        (["--voice", "zh-CN-XiaoxiaoNeural"], "edge", "zh-CN-XiaoxiaoNeural", None),
+        (["--tts", "doubao", "--voice", "zh_female_vv_uranus_bigtts"], "doubao", None,
+         "zh_female_vv_uranus_bigtts"),
+        (["--tts", "doubao"], "doubao", None, None),
+    ],
+)
+def test_generate_tts_and_voice_routing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args, provider, edge_voice, doubao_voice,
+) -> None:
+    from interview_video import cli as cli_mod
+
+    base = Settings(_env_file=None, out_root=tmp_path)
+    monkeypatch.setattr(cli_mod, "load_settings", lambda: base)
+    seen: dict = {}
+
+    async def fake_run_pipeline(settings, out_dir, **kw):
+        seen["s"] = settings.model_copy()
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(cli_mod, "run_pipeline", fake_run_pipeline)
+    result = runner.invoke(app, ["generate", *args, "--out", str(tmp_path / "o")])
+    assert isinstance(result.exception, RuntimeError), result.output
+    s = seen["s"]
+    defaults = Settings(_env_file=None)
+    assert s.tts_provider == provider
+    assert s.tts_voice == (edge_voice or defaults.tts_voice)
+    assert s.tts_doubao_voice == (doubao_voice or defaults.tts_doubao_voice)
+    assert "输出" in result.output
+
+
+def test_tts_invalid_choice(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["generate", "--tts", "azure", "--out", str(tmp_path / "x")])
+    assert result.exit_code == 2 and "edge, doubao" in result.output
+
+
+def test_series_voice_routes_to_doubao(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from interview_video import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_settings", lambda: Settings(_env_file=None, out_root=tmp_path))
+    seen: dict = {}
+
+    def fake_estimate(settings, episodes, duration):
+        seen["s"] = settings
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr("interview_video.estimate.estimate_series", fake_estimate)
+    runner.invoke(app, ["series", "主题", "--tts", "doubao", "--voice", "v-doubao", "--dry-run"])
+    assert seen["s"].tts_provider == "doubao" and seen["s"].tts_doubao_voice == "v-doubao"
+
+
+def _stub_series(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict:
+    from interview_video import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_settings", lambda: Settings(_env_file=None, out_root=tmp_path))
+    monkeypatch.setattr("interview_video.doctor.preflight", lambda settings: None)
+    seen: dict = {}
+
+    async def fake_main(settings, theme, episodes, duration, resume_dir=None):
+        seen.update(theme=theme, resume_dir=resume_dir)
+        return tmp_path
+
+    monkeypatch.setattr(cli_mod, "_series_main", fake_main)
+    return seen
+
+
+def test_series_resume_reads_theme_from_series_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen = _stub_series(monkeypatch, tmp_path)
+    root = tmp_path / "s1"
+    root.mkdir()
+    (root / "series.json").write_text(json.dumps({"theme": "程序员面试通关"}), encoding="utf-8")
+    result = runner.invoke(app, ["series", "--resume", str(root)])
+    assert result.exit_code == 0, result.output
+    assert seen == {"theme": "程序员面试通关", "resume_dir": root}
+
+
+def test_series_resume_explicit_theme_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen = _stub_series(monkeypatch, tmp_path)
+    root = tmp_path / "s1"
+    root.mkdir()
+    (root / "series.json").write_text(json.dumps({"theme": "旧"}), encoding="utf-8")
+    result = runner.invoke(app, ["series", "新主题", "--resume", str(root)])
+    assert result.exit_code == 0, result.output
+    assert seen["theme"] == "新主题"
+
+
+def test_series_resume_series_json_without_theme(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen = _stub_series(monkeypatch, tmp_path)
+    root = tmp_path / "s1"
+    root.mkdir()
+    (root / "series.json").write_text("{}", encoding="utf-8")
+    result = runner.invoke(app, ["series", "--resume", str(root)])
+    assert result.exit_code == 1 and "缺少 theme" in result.output and not seen
+
+
+def test_series_resume_missing_series_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen = _stub_series(monkeypatch, tmp_path)
+    result = runner.invoke(app, ["series", "--resume", str(tmp_path)])
+    assert result.exit_code == 1 and "缺 series.json" in result.output and not seen
+
+
+def test_series_requires_theme_without_resume(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen = _stub_series(monkeypatch, tmp_path)
+    result = runner.invoke(app, ["series", "--dry-run"])
+    assert result.exit_code == 2 and "缺少系列主题" in result.output and not seen
+
+
+# ---------- 上传幂等: upload.json 由 upload_project 写入 ----------
+
+
+def _bili_settings() -> Settings:
+    return Settings(
+        _env_file=None, bili_upload_enabled=True,
+        bili_sessdata="s", bili_jct="j", bili_buvid3="b",
+    )
+
+
+def _fake_project(tmp_path: Path) -> Path:
+    from datetime import datetime
+
+    from interview_video.models import ProjectManifest, Script
+
+    d = tmp_path / "proj"
+    d.mkdir()
+    (d / "cover.png").write_bytes(_png_bytes())
+    (d / "final.mp4").write_bytes(b"x")
+    m = ProjectManifest(
+        created_at=datetime.now(), industry="互联网", script=Script(title="标题", scenes=[]),
+        video=d / "final.mp4", cover=d / "cover.png", voice="v", duration_total=1.0,
+    )
+    (d / "project.json").write_text(m.model_dump_json(), encoding="utf-8")
+    return d
+
+
+@pytest.fixture
+def fake_uploader(monkeypatch: pytest.MonkeyPatch) -> list:
+    from interview_video import bilibili as bili_mod
+
+    starts: list = []
+
+    class FakeUploader:
+        def __init__(self, pages, meta, credential):
+            pass
+
+        async def start(self):
+            starts.append(1)
+            return {"bvid": f"BV{len(starts)}", "aid": 1}
+
+    async def fake_cover(pic, credential):
+        return "https://cover"
+
+    vu = bili_mod.video_uploader
+    monkeypatch.setattr(vu, "upload_cover", fake_cover)
+    monkeypatch.setattr(vu, "VideoUploader", FakeUploader)
+    monkeypatch.setattr(vu, "VideoUploaderPage", lambda *a, **k: None)
+    monkeypatch.setattr(vu, "VideoMeta", lambda **k: None)
+    monkeypatch.setattr(bili_mod.Picture, "from_file", staticmethod(lambda p: None))
+    return starts
+
+
+def test_upload_project_writes_sidecar_and_refuses_reupload(tmp_path: Path, fake_uploader: list) -> None:
+    from interview_video.bilibili import AlreadyUploadedError, read_upload_record, upload_project
+
+    d = _fake_project(tmp_path)
+    assert asyncio_run(upload_project(d, _bili_settings())) == "BV1"
+    assert read_upload_record(d)["bvid"] == "BV1"
+    with pytest.raises(AlreadyUploadedError, match="BV1"):
+        asyncio_run(upload_project(d, _bili_settings()))
+    assert len(fake_uploader) == 1
+    assert asyncio_run(upload_project(d, _bili_settings(), force=True)) == "BV2"
+    assert read_upload_record(d)["bvid"] == "BV2"
+
+
+def test_cli_upload_refuses_without_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_uploader: list,
+) -> None:
+    from interview_video import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_settings", _bili_settings)
+    d = _fake_project(tmp_path)
+    r = runner.invoke(app, ["upload", str(d), "-y"])
+    assert r.exit_code == 0 and "BV1" in r.output
+    r = runner.invoke(app, ["upload", str(d), "-y"])
+    assert r.exit_code == 1 and "--force" in r.output and len(fake_uploader) == 1
+    r = runner.invoke(app, ["upload", str(d), "-y", "--force"])
+    assert r.exit_code == 0 and "BV2" in r.output

@@ -1,10 +1,10 @@
 """选题链: 按行业生成求职面试短视频选题清单。"""
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel
 
+from ..boundary import BoundaryRules
+from ..llm import ChatModel
 from ..models import Topic
 from ..prompts import ChatPromptTemplate
 from . import parse_json_lenient
@@ -45,7 +45,7 @@ def _parse_topic_list(text: str) -> _TopicList:
 
 
 async def generate_topics(
-    llm: Any,
+    llm: ChatModel,
     industry: str,
     n: int = 5,
     avoid: list[str] | None = None,
@@ -58,7 +58,7 @@ async def generate_topics(
     }
     result = await invoke_structured(
         _build_prompt(), llm, payload, _TopicList, _parse_topic_list,
-        stage="topics",
+        stage="topics", boundary_rules=BoundaryRules.non_script(),
     )
     assert isinstance(result, _TopicList)  # 两条路径都保证同型
     return result.topics[:n]

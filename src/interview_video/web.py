@@ -1,19 +1,21 @@
 """Web 操作台: FastAPI 单页应用, 本地使用(默认绑 127.0.0.1)。
 
 功能: 选题生成 → 一键跑流水线(节点级进度) → 作品库(播放/元数据编辑/上传 B站)。
-复用 graph.build_graph 的 astream 拿节点进度; 生成任务单飞(一把锁), 避免 TTS 限流。
+复用 graph.build_graph 的 stream 拿节点进度; 生成任务单飞(一把锁), 避免 TTS 限流。
 """
 from __future__ import annotations
 
 import asyncio
-import json
+import ipaddress
 import re
+import secrets
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
@@ -56,6 +58,36 @@ VOICES: dict[str, list[dict[str, str]]] = {
 _NAME_RE = re.compile(r"^[\w\-一-鿿]+$")  # 项目目录名白名单(防路径穿越)
 
 _STATIC_DIR = Path(__file__).parent / "static"
+# 免 LLM 冒烟脚本: 随包分发(package data), 源码仓库里退回 examples/ 原件
+_SAMPLE_SCRIPT_CANDIDATES = (
+    Path(__file__).parent / "data" / "sample_script.json",
+    Path(__file__).resolve().parents[2] / "examples" / "sample_script.json",
+)
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+TOKEN_HEADER = "X-IVB-Token"
+
+
+def sample_script_path() -> Path | None:
+    return next((p for p in _SAMPLE_SCRIPT_CANDIDATES if p.is_file()), None)
+
+
+def is_loopback(host: str) -> bool:
+    h = host.strip("[]").lower()
+    if h in _LOOPBACK_NAMES or h.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _hostname(netloc: str) -> str | None:
+    try:
+        return urlsplit(f"//{netloc}").hostname
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +113,7 @@ class JobRequest(BaseModel):
         default=15.0, ge=SERIES_MIN_EPISODE_MIN, le=SERIES_MAX_EPISODE_MIN
     )
     stop_after: Literal["script"] | None = None  # 只生成脚本(审改后再 regenerate)
+    aspect: Literal["16:9", "9:16"] | None = None  # 画幅, 不传用 VIDEO_ASPECT
 
 
 class EstimateRequest(BaseModel):
@@ -94,6 +127,11 @@ class EstimateRequest(BaseModel):
 class RegenerateRequest(BaseModel):
     provider: str | None = None
     voice: str | None = None
+
+
+class UploadRequest(BaseModel):
+    force: bool = False  # 已有 bvid 时仍重新投稿(前端二次确认后才传)
+    publish_at: str | None = None  # 定时发布 "YYYY-mm-dd HH:MM"(本地时间, 2 小时后~15 天内)
 
 
 class MetaRequest(BaseModel):
@@ -122,6 +160,7 @@ class Job:
         self.usage: dict[str, int] | None = None  # LLM token 汇总(llm_calls.jsonl)
         self.task: asyncio.Task | None = None  # 后台任务句柄(取消接口用)
         self.cancel_requested = False  # 已请求取消, 正在等子进程(ffmpeg/chromium)退出
+        self.error_log_url: str | None = None  # 失败现场日志(/files/...), 失败后才有
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +169,7 @@ class Job:
             "current_stage": self.current_stage,
             "done_stages": self.done_stages,
             "error": self.error,
+            "error_log_url": self.error_log_url,
             "project": self.project,
             "series": self.series,
             "usage": self.usage,
@@ -181,10 +221,11 @@ async def _execute_pipeline(
     on_stage,  # Callable[[str], None], 节点完成回调
     script: Script | None = None,  # 预制脚本(系列模式), 跳过 LLM 生成
 ) -> ProjectManifest:
-    """build_graph + astream(updates) 跑流水线, 逐节点回调进度。"""
+    """build_graph + stream(updates) 跑流水线, 逐节点回调进度。"""
     from . import doctor as doctor_mod
     from . import graph as graph_mod
     from .llm_audit import LLMCallAudit, run_budget
+    from .workflow_engine import RunContext
 
     await asyncio.to_thread(doctor_mod.preflight, settings)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -198,8 +239,8 @@ async def _execute_pipeline(
     if script is not None:
         initial["script"] = script
     with run_budget(settings):
-        async for chunk in graph.astream(
-            initial, stream_mode="updates", config={"callbacks": [LLMCallAudit(out_dir)]}
+        async for chunk in graph.stream(
+            initial, stream_mode="updates", context=RunContext(audit=LLMCallAudit(out_dir))
         ):
             for node_name in chunk:
                 on_stage(node_name)
@@ -260,15 +301,78 @@ def _sum_usage(root: Path) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# 跨站/DNS 重绑定防护
+# ---------------------------------------------------------------------------
+
+def _install_guard(app: FastAPI, settings: Settings, bind_host: str) -> None:
+    """Host 白名单(防 DNS 重绑定) + 写请求同源校验(防 CSRF) + 非回环绑定时写请求令牌。
+
+    - Host 头: 回环名 / --host 本身 / WEB_ALLOWED_HOSTS; 绑通配地址(0.0.0.0/::)时另放行 IP 字面量
+      (重绑定攻击必须用域名);
+    - POST/PUT/DELETE/PATCH: 有 Origin(无则 Referer)时其 host:port 必须等于 Host 头; 都没有视为非浏览器客户端;
+    - 令牌: 配了 WEB_TOKEN 或绑非回环地址时, 写请求须带 X-IVB-Token(未配置则生成, 见 app.state.web_token)。
+    """
+    wildcard = bind_host in ("0.0.0.0", "::", "")
+    allowed = set(_LOOPBACK_NAMES)
+    if not wildcard:
+        allowed.add(bind_host.strip("[]").lower())
+    allowed |= {
+        h.strip().lower() for h in (settings.web_allowed_hosts or "").split(",") if h.strip()
+    }
+    token = settings.web_token.get_secret_value() if settings.web_token else None
+    if token is None and not is_loopback(bind_host):
+        token = secrets.token_urlsafe(24)
+    app.state.web_token = token
+
+    def _host_ok(host_header: str) -> bool:
+        name = _hostname(host_header)
+        if not name:
+            return False
+        if name in allowed or is_loopback(name):
+            return True
+        if wildcard:
+            try:
+                ipaddress.ip_address(name)
+                return True
+            except ValueError:
+                return False
+        return False
+
+    @app.middleware("http")
+    async def _guard(request: Request, call_next):
+        host_header = request.headers.get("host", "")
+        if not _host_ok(host_header):
+            return JSONResponse({"detail": f"拒绝的 Host: {host_header}"}, status_code=403)
+        if request.method in _UNSAFE_METHODS:
+            source = request.headers.get("origin") or request.headers.get("referer")
+            if source is not None:
+                parts = urlsplit(source)
+                if not parts.netloc or parts.netloc.lower() != host_header.lower():
+                    return JSONResponse({"detail": "跨站请求被拒绝(Origin 不匹配)"}, status_code=403)
+            if token is not None and not secrets.compare_digest(
+                request.headers.get(TOKEN_HEADER, "").encode(), token.encode()
+            ):
+                return JSONResponse(
+                    {"detail": f"缺少或错误的操作令牌({TOKEN_HEADER}), 请用启动时打印的带 #token= 的链接打开"},
+                    status_code=401,
+                )
+        return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
 # App 工厂
 # ---------------------------------------------------------------------------
 
-def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, *, scheduler=None, host: str = "127.0.0.1"
+) -> FastAPI:
     """创建操作台 app。
 
     scheduler: 任务调度器 fn(coro_func, *args), 默认 asyncio.create_task
     (uvicorn 下任务跨请求存活); 测试可注入收集器, 用 TestClient portal 手动驱动,
     规避 TestClient 请求结束即取消 request 内 create_task 的行为。
+    host: 监听地址。绑非回环地址时写操作必须带令牌(WEB_TOKEN, 未配置则生成),
+    令牌放在 app.state.web_token 供启动时打印。
     """
     settings = settings or load_settings()
     if scheduler is None:
@@ -278,6 +382,7 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
     manager = JobManager()
 
     app = FastAPI(title="interview-video-bot 操作台")
+    _install_guard(app, settings, host)
 
     @app.exception_handler(_Busy)
     async def _busy_handler(_request, exc: _Busy) -> JSONResponse:
@@ -294,6 +399,9 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         return {"job_id": job.id}
     app.mount("/files", StaticFiles(directory=out_root), name="files")
 
+    def _file_url(p: Path) -> str:
+        return f"/files/{p.resolve().relative_to(out_root).as_posix()}"
+
     # ---------- 页面 ----------
     @app.get("/", response_class=FileResponse)
     async def index() -> FileResponse:
@@ -309,6 +417,8 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
             "upload_enabled": settings.bili_upload_enabled,
             "bili_configured": settings.bili_ready(),
             "doubao_configured": settings.doubao_ready(),
+            "video_aspect": settings.video_aspect,
+            "bgm_configured": settings.bgm_file is not None and settings.bgm_file.is_file(),
             "voices": VOICES,
             "series_limits": {"max_episodes": SERIES_MAX_EPISODES,
                               "min_duration_min": SERIES_MIN_EPISODE_MIN,
@@ -335,8 +445,22 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
             llm = llm_mod.get_chat_model(settings)
         except RuntimeError as exc:
             raise HTTPException(400, str(exc)) from exc
-        topics = await topic_mod.generate_topics(llm, req.industry, req.n)
+        from . import backlog as backlog_mod
+
+        avoid = await asyncio.to_thread(backlog_mod.avoid_titles, settings, req.industry)
+        topics = await topic_mod.generate_topics(llm, req.industry, req.n, avoid=avoid or None)
+        await asyncio.to_thread(backlog_mod.add_topics, settings, topics)
         return {"topics": [t.model_dump() for t in topics]}
+
+    @app.get("/api/topics/backlog")
+    async def get_backlog(industry: str | None = None, include_used: bool = False) -> dict[str, Any]:
+        from . import backlog as backlog_mod
+
+        items = await asyncio.to_thread(backlog_mod.load_backlog, settings)
+        return {"topics": [
+            i.model_dump(mode="json") for i in items
+            if (industry is None or i.industry == industry) and (include_used or i.status == "new")
+        ]}
 
     # ---------- 生成任务 ----------
     @app.post("/api/jobs", status_code=202)
@@ -348,17 +472,27 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         _ensure_idle()
         script_file: Path | None = None
         if req.use_sample_script:
-            script_file = Path("examples/sample_script.json")
-            if not script_file.exists():
-                raise HTTPException(400, "examples/sample_script.json 不存在")
+            script_file = sample_script_path()
+            if script_file is None:
+                raise HTTPException(400, "内置示例脚本 sample_script.json 缺失(安装包不完整)")
 
-        return _start(Job(uuid.uuid4().hex[:8], req), script_file)
+        from .cli import _default_out_dir, _slug
+
+        job = Job(uuid.uuid4().hex[:8], req)
+        # 提交时就定下目录: 任何阶段失败, error.log 都落在该项目目录里, 作品库可见
+        if req.mode == "series":
+            theme = req.theme or req.topic_title or "面试求职"
+            out_dir = out_root / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
+        else:
+            out_dir = _default_out_dir(settings, script_file, req.topic_title, req.industry)
+        job.out_dir = out_dir.resolve()
+        job.project = out_dir.name
+        return _start(job, script_file)
 
     async def _run_job(job: Job, script_file: Path | None) -> None:
         import logging
         import traceback
 
-        from .cli import _default_out_dir  # 复用 CLI 的目录命名
         from .llm_audit import summarize_usage
 
         logger = logging.getLogger(__name__)
@@ -375,6 +509,8 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         try:
             job_settings = settings.model_copy()
             job_settings.tts_provider = job.params.provider
+            if job.params.aspect:
+                job_settings.video_aspect = job.params.aspect
             if job.params.voice:
                 if job.params.provider == "doubao":
                     job_settings.tts_doubao_voice = job.params.voice
@@ -386,22 +522,16 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
                 else:
                     preset: Script | None = None
                     industry = job.params.industry
+                    assert job.out_dir is not None  # 提交时已定目录
+                    out_dir = job.out_dir
+                    job.current_stage = stage_keys[0]
                     if job.resume_dir is not None:
                         from .graph import resume_industry
 
-                        out_dir = job.resume_dir
                         preset = Script.model_validate_json(
                             (out_dir / "script.json").read_text(encoding="utf-8")
                         )
                         industry = resume_industry(out_dir) or industry
-                    else:
-                        out_dir = _default_out_dir(
-                            job_settings, script_file,
-                            job.params.topic_title, industry,
-                        )
-                    job.out_dir = out_dir.resolve()
-                    job.project = out_dir.name
-                    job.current_stage = stage_keys[0]
                     if job.params.stop_after == "script":
                         await _execute_script_stage(
                             job_settings, out_dir, industry,
@@ -435,7 +565,8 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
                         f"{traceback.format_exc()}",
                         encoding="utf-8",
                     )
-                except OSError:
+                    job.error_log_url = _file_url(err_path)
+                except (OSError, ValueError):
                     pass
                 logger.exception("任务 %s 失败(阶段 %s)", job.id, job.current_stage)
         finally:
@@ -467,15 +598,14 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
             if plan.episodes:
                 episode_sec = plan.episodes[0].target_sec
         else:
-            root = out_root / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
+            assert job.out_dir is not None  # 提交时已定根目录
+            root = job.out_dir
         job.series = {
             "episodes": episodes, "episode": 0,
             "chapter": 0, "chapters": 0,
             "phase": "续跑中" if job.resume_dir is not None else "策划中",
         }
         root.mkdir(parents=True, exist_ok=True)
-        job.out_dir = root.resolve()
-        job.project = root.name  # 先定根目录: 失败时 error.log 也能落到系列目录
 
         def on_event(name: str, **p) -> None:
             s = job.series
@@ -591,7 +721,7 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         job = Job(
             uuid.uuid4().hex[:8],
             JobRequest(mode="series", provider=provider, voice=req.voice),
-            resume_dir=d,
+            resume_dir=d.resolve(),
         )
         job.project = d.name
         return _start(job)
@@ -629,22 +759,64 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         except (OSError, ValidationError) as exc:
             raise HTTPException(422, f"{d.name} 的脚本文件损坏: {exc}") from exc
 
+    def _latest_error_log(d: Path) -> Path | None:
+        logs = sorted(d.glob("error-*.log"), key=lambda p: p.stat().st_mtime)
+        return logs[-1] if logs else None
+
+    def _mtime_iso(p: Path) -> str:
+        return datetime.fromtimestamp(p.stat().st_mtime).isoformat()
+
     def _draft_summary(d: Path) -> dict[str, Any]:
         """只有 script.json 的草稿(只生成脚本 / 中途失败): 无视频与封面。"""
         from .graph import resume_industry
 
+        err = _latest_error_log(d)
         return {
             "name": d.name,
             "title": _read_script(d).title,
             "industry": resume_industry(d) or "",
             "duration": 0,
-            "created_at": datetime.fromtimestamp((d / "script.json").stat().st_mtime).isoformat(),
+            "created_at": _mtime_iso(d / "script.json"),
             "has_meta": False,
             "bvid": None,
             "draft": True,
+            "status": "failed" if err is not None else "draft",
+            "has_script": True,
+            "error": None,
+            "error_log_url": _file_url(err) if err is not None else None,
             "cover_url": None,
             "video_url": None,
         }
+
+    def _broken_summary(d: Path, status: str, error: str | None) -> dict[str, Any]:
+        """没有可读脚本的目录: 生成前就失败(只有 error log) / 清单或脚本损坏。"""
+        err = _latest_error_log(d)
+        return {
+            "name": d.name,
+            "title": d.name,
+            "industry": "",
+            "duration": 0,
+            "created_at": _mtime_iso(err or d),
+            "has_meta": False,
+            "bvid": None,
+            "draft": True,
+            "status": status,  # failed | broken
+            "has_script": False,
+            "error": error,
+            "error_log_url": _file_url(err) if err is not None else None,
+            "cover_url": None,
+            "video_url": None,
+        }
+
+    def _safe_summary(d: Path) -> dict[str, Any]:
+        """作品库条目: 单个损坏目录显示为 broken, 不拖垮整个列表。"""
+        try:
+            if (d / "project.json").exists() or (d / "script.json").exists():
+                return _project_summary(d)
+            return _broken_summary(d, "failed", None)
+        except (HTTPException, OSError, ValidationError, ValueError) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
+            return _broken_summary(d, "broken", str(detail)[:300])
 
     def _project_summary(d: Path) -> dict[str, Any]:
         if not (d / "project.json").exists():
@@ -652,10 +824,9 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         m = ProjectManifest.model_validate_json(
             (d / "project.json").read_text(encoding="utf-8")
         )
-        bvid = None
-        sidecar = d / "upload.json"
-        if sidecar.exists():
-            bvid = json.loads(sidecar.read_text("utf-8")).get("bvid")
+        from .bilibili import read_upload_record
+
+        bvid = (read_upload_record(d) or {}).get("bvid")
         rel = d.relative_to(out_root).as_posix()  # 系列分集是嵌套路径(系列根/ep01-xx)
         return {
             "name": d.name,
@@ -666,27 +837,41 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
             "has_meta": m.meta is not None,
             "bvid": bvid,
             "draft": False,
+            "status": "done",
+            "has_script": True,
+            "error": None,
+            "error_log_url": None,
             "cover_url": f"/files/{rel}/cover.png",
             "video_url": f"/files/{rel}/final.mp4",
         }
 
+    def _in_library(d: Path) -> bool:
+        return _is_project(d, allow_draft=True) or (
+            d.is_dir() and any(d.glob("error-*.log"))
+        )
+
+    def _sort_ts(item: dict[str, Any]) -> float:
+        try:
+            return datetime.fromisoformat(item["created_at"]).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
     @app.get("/api/projects")
     async def list_projects() -> dict[str, Any]:
-        items: list[dict[str, Any]] = []
-        for d in sorted(out_root.iterdir(), reverse=True):
+        """作品库: 按创建时间倒序; 系列分集作为一组(组按最新一集排序, 组内 ep01/02 正序)。"""
+        groups: list[tuple[float, list[dict[str, Any]]]] = []
+        for d in out_root.iterdir():
             if not d.is_dir():
                 continue
             if (d / "series.json").exists():
-                # 系列根目录: 展开分集(ep01/02 正序)
-                candidates = [ep for ep in sorted(d.iterdir()) if _is_project(ep, allow_draft=True)]
+                candidates = [ep for ep in sorted(d.iterdir()) if _in_library(ep)]
             else:
-                candidates = [d] if _is_project(d, allow_draft=True) else []
-            for c in candidates:
-                try:
-                    items.append(_project_summary(c))
-                except (HTTPException, OSError, ValidationError, ValueError):
-                    continue  # 单个损坏目录不拖垮整个作品库
-        return {"projects": items}
+                candidates = [d] if _in_library(d) else []
+            group = [_safe_summary(c) for c in candidates]
+            if group:
+                groups.append((max(_sort_ts(i) for i in group), group))
+        groups.sort(key=lambda g: g[0], reverse=True)
+        return {"projects": [i for _, g in groups for i in g]}
 
     @app.get("/api/projects/{name}")
     async def get_project(name: str) -> dict[str, Any]:
@@ -751,14 +936,19 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
         if provider not in VOICES:
             raise HTTPException(400, f"未知 TTS 通道: {provider}")
         _ensure_idle()
-        return _start(Job(
+        job = Job(
             uuid.uuid4().hex[:8],
             JobRequest(provider=provider, voice=req.voice),
-            resume_dir=d,
-        ))
+            resume_dir=d.resolve(),
+        )
+        job.project = d.name
+        return _start(job)
+
+    uploading: set[str] = set()
 
     @app.post("/api/projects/{name}/upload")
-    async def upload_project(name: str) -> dict[str, str]:
+    async def upload_project(name: str, req: UploadRequest | None = None) -> Any:
+        """同步等待上传结果, 但上传跑在工作线程自己的事件循环里, 不阻塞其它请求。"""
         d = _project_dir(name)
         from . import bilibili as bili_mod
 
@@ -768,18 +958,33 @@ def create_app(settings: Settings | None = None, *, scheduler=None) -> FastAPI:
                 "未配置 B站 cookie 三件套(BILI_SESSDATA/BILI_JCT/BILI_BUVID3)"
                 "或未开启 BILI_UPLOAD_ENABLED",
             )
+        force = bool(req and req.force)
+        dtime: int | None = None
+        if req and req.publish_at:
+            try:
+                dtime = bili_mod.parse_publish_at(req.publish_at)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        if not force and (record := bili_mod.read_upload_record(d)):
+            return JSONResponse(
+                {"detail": str(bili_mod.AlreadyUploadedError(record["bvid"])),
+                 "bvid": record["bvid"], "already_uploaded": True},
+                status_code=409,
+            )
+        key = str(d.resolve())
+        if key in uploading:
+            raise HTTPException(409, "该项目正在上传中, 请勿重复提交")
+        uploading.add(key)
         try:
-            bvid = await bili_mod.upload_project(d, settings)
+            bvid = await asyncio.to_thread(
+                asyncio.run, bili_mod.upload_project(
+                    d, settings, force=force, **({"dtime": dtime} if dtime is not None else {}),
+                ),
+            )
         except RuntimeError as exc:
             raise HTTPException(400, str(exc)) from exc
-        sidecar = d / "upload.json"
-        sidecar.write_text(
-            json.dumps(
-                {"bvid": bvid, "uploaded_at": datetime.now().isoformat()},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        return {"bvid": bvid, "url": f"https://www.bilibili.com/video/{bvid}"}
+        finally:
+            uploading.discard(key)
+        return {"bvid": bvid, "url": f"https://www.bilibili.com/video/{bvid}", "dtime": dtime}
 
     return app

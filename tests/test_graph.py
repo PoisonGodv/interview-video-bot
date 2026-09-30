@@ -163,7 +163,7 @@ async def test_pipeline_llm_audit_wired_via_workflow_config(
     )
 
     async def fake_write_metadata(llm, script, chapters, settings):
-        await llm.ainvoke("hi")
+        await llm.chat("hi")
         return BiliMeta(title="t", desc="", tags=["面试"])
 
     monkeypatch.setattr(metadata_mod, "write_metadata", fake_write_metadata)

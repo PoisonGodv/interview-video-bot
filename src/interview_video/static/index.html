@@ -71,6 +71,7 @@
       <input id="industry" value="互联网" placeholder="行业, 如 护理/汽修/教师">
       <input id="topic-n" type="number" value="8" min="1" max="20" style="width:70px">
       <button id="btn-topics">生成选题</button>
+      <button class="ghost" id="btn-backlog">选题库</button>
       <span class="msg" id="topics-msg"></span>
     </div>
     <div id="topics"></div>
@@ -90,6 +91,10 @@
         集数 <input id="episodes" type="number" value="3" min="1" max="12" style="width:64px">
         每集 <input id="duration" type="number" value="15" min="3" max="30" step="1" style="width:64px"> 分钟
       </span>
+      <select id="aspect">
+        <option value="16:9">横屏 16:9</option>
+        <option value="9:16">竖屏 9:16</option>
+      </select>
       <select id="provider"></select>
       <select id="voice"></select>
       <label class="msg" id="sample-wrap"><input type="checkbox" id="use-sample"> 用示例脚本(免 LLM 冒烟)</label>
@@ -117,16 +122,24 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c =>
 // 项目名 → 合法 DOM id 片段(中文/字母数字/-_ 原样, 其余转码)
 const pid = (name) => encodeURIComponent(name).replace(/%/g, "_");
 let voices = {}, pollTimer = null, currentJobId = null;
+// 写操作令牌(绑非回环地址时必需): 启动链接 #token=xxx → sessionStorage, 随后从地址栏抹掉
+const tokenMatch = location.hash.match(/token=([^&]+)/);
+if (tokenMatch) {
+  sessionStorage.setItem("ivb-token", decodeURIComponent(tokenMatch[1]));
+  history.replaceState(null, "", location.pathname + location.search);
+}
+const ivbToken = sessionStorage.getItem("ivb-token") || "";
 
 async function api(path, opts = {}) {
   const r = await fetch(path, opts.method ? {
-    headers: {"Content-Type": "application/json"}, ...opts,
+    headers: {"Content-Type": "application/json", ...(ivbToken ? {"X-IVB-Token": ivbToken} : {})}, ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   } : opts);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     const err = new Error(data.detail || `HTTP ${r.status}`);
     err.jobId = data.job_id || null;  // 409: 正在跑的任务 id
+    err.alreadyUploaded = !!data.already_uploaded;  // 409: 已有 bvid, 需确认后 force
     throw err;
   }
   return data;
@@ -143,6 +156,7 @@ async function init() {
   b("badge-tts", s.tts_provider !== "doubao" || s.doubao_configured,
     "TTS: " + s.tts_provider, "豆包缺凭证");
   b("badge-upload", s.upload_enabled, "B站上传已开启", "上传未开启");
+  if (s.video_aspect) $("aspect").value = s.video_aspect;
   voices = s.voices;
   $("provider").innerHTML = Object.keys(voices).map(p =>
     `<option value="${esc(p)}" ${p === s.tts_provider ? "selected" : ""}>${p === "edge" ? "edge-tts(免费)" : "豆包(火山)"}</option>`).join("");
@@ -168,13 +182,23 @@ $("btn-topics").onclick = async () => {
   try {
     const d = await api("/api/topics", {method: "POST",
       body: {industry: $("industry").value, n: +$("topic-n").value}});
-    $("topics").innerHTML = d.topics.map(t =>
-      `<div class="topic" data-t="${esc(t.title)}"><b>${esc(t.title)}</b><p>${esc(t.hook)}</p></div>`).join("");
-    document.querySelectorAll(".topic").forEach(el =>
-      el.onclick = () => { $("topic-title").value = el.dataset.t; });
-    msg("topics-msg", `${d.topics.length} 条选题, 点击填入生成框`, "ok");
+    showTopics(d.topics);
+    msg("topics-msg", `${d.topics.length} 条选题(已入选题库), 点击填入生成框`, "ok");
   } catch (e) { msg("topics-msg", e.message, "err"); }
   $("btn-topics").disabled = false;
+};
+function showTopics(list) {
+  $("topics").innerHTML = list.map(t =>
+    `<div class="topic" data-t="${esc(t.title)}"><b>${esc(t.title)}</b><p>${esc(t.hook)}</p></div>`).join("");
+  document.querySelectorAll(".topic").forEach(el =>
+    el.onclick = () => { $("topic-title").value = el.dataset.t; });
+}
+$("btn-backlog").onclick = async () => {
+  try {
+    const d = await api("/api/topics/backlog?" + new URLSearchParams({industry: $("industry").value}));
+    showTopics(d.topics);
+    msg("topics-msg", `选题库未用 ${d.topics.length} 条(生成视频后自动标记已用)`, "ok");
+  } catch (e) { msg("topics-msg", e.message, "err"); }
 };
 
 // 系列费用预估: 表单变化时刷新, 开始前再确认一次
@@ -223,11 +247,11 @@ $("btn-gen").onclick = async () => {
       mode: "series", theme: $("topic-title").value || $("industry").value,
       industry: $("industry").value,
       episodes: +$("episodes").value, duration_min: +$("duration").value,
-      provider: $("provider").value, voice: $("voice").value,
+      provider: $("provider").value, voice: $("voice").value, aspect: $("aspect").value,
     } : {
       industry: $("industry").value, topic_title: $("topic-title").value || null,
       provider: $("provider").value, voice: $("voice").value,
-      use_sample_script: $("use-sample").checked,
+      aspect: $("aspect").value, use_sample_script: $("use-sample").checked,
       stop_after: $("script-only").checked ? "script" : null,
     };
     const d = await api("/api/jobs", {method: "POST", body});
@@ -267,6 +291,11 @@ async function pollJob(id) {
         clearInterval(pollTimer);
         msg("gen-msg", (j.status === "cancelled" ? "⛔ " : "❌ ") + (j.error || j.status)
           + (j.series ? " · 可在作品库「未完成系列」点续跑" : ""), "err");
+        if (j.error_log_url) {
+          const a = document.createElement("a");
+          a.href = j.error_log_url; a.target = "_blank"; a.rel = "noopener"; a.textContent = " 查看错误日志";
+          $("gen-msg").appendChild(a);
+        }
         $("btn-gen").disabled = false; loadProjects();
       }
     } catch (e) { /* 轮询失败忽略, 下个周期重试 */ }
@@ -319,13 +348,16 @@ async function loadProjects() {
     if (!d.projects.length) { $("projects").innerHTML = '<p class="msg">暂无作品</p>'; return; }
     $("projects").innerHTML = d.projects.map(p => `
       <div class="proj" data-name="${esc(p.name)}">
-        ${p.cover_url ? `<img src="${esc(p.cover_url)}" loading="lazy">` : '<div class="noimg">仅脚本(未出片)</div>'}
+        ${p.cover_url ? `<img src="${esc(p.cover_url)}" loading="lazy">`
+          : `<div class="noimg">${p.status === "broken" ? "文件损坏" : p.status === "failed" ? "生成失败" : "仅脚本(未出片)"}</div>`}
         <div class="meta">
           <h3>${esc(p.title)}</h3>
           <div class="sub">${esc(p.name)} · ${esc(p.duration)}s · ${esc(p.industry)}
             ${p.bvid ? ` · <a href="https://www.bilibili.com/video/${encodeURIComponent(p.bvid)}" target="_blank" rel="noopener">${esc(p.bvid)}</a>` : ""}</div>
+          ${p.error ? `<div class="msg err">${esc(p.error)}</div>` : ""}
+          ${p.error_log_url ? `<div class="sub"><a href="${esc(p.error_log_url)}" target="_blank" rel="noopener">查看错误日志</a></div>` : ""}
           <div class="row" style="margin-top:8px">
-            <button class="ghost" data-act="detail">详情/编辑</button>
+            ${p.has_script ? '<button class="ghost" data-act="detail">详情/编辑</button>' : ""}
             ${p.draft ? "" : '<button class="ghost" data-act="upload">上传到B站</button>'}
           </div>
           <div class="detail" id="d-${pid(p.name)}"></div>
@@ -418,10 +450,20 @@ async function saveScript(name, btn, regen) {
 
 async function upload(name, btn) {
   if (!confirm(`确认把 ${name} 上传到B站?\n发布后请到创作中心补勾"AI生成"标识。`)) return;
+  const at = prompt("定时发布(可选): 填本地时间 YYYY-mm-dd HH:MM(2 小时后~15 天内), 留空立即发布", "");
+  if (at === null) return;
   btn.disabled = true;
+  const post = force => api(`/api/projects/${encodeURIComponent(name)}/upload`,
+    {method: "POST", body: {force, publish_at: at.trim() || null}});
   try {
-    const d = await api(`/api/projects/${encodeURIComponent(name)}/upload`, {method: "POST"});
-    alert("上传成功: " + d.url);
+    let d;
+    try { d = await post(false); }
+    catch (e) {
+      if (!e.alreadyUploaded) throw e;
+      if (!confirm(`${e.message}\n\n仍要重新投稿一份吗?`)) { btn.disabled = false; return; }
+      d = await post(true);
+    }
+    alert("上传成功: " + d.url + (d.dtime ? "\n定时发布: " + new Date(d.dtime * 1000).toLocaleString() : ""));
     loadProjects();
   } catch (e) { alert("上传失败: " + e.message); }
   btn.disabled = false;

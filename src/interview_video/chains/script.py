@@ -1,9 +1,8 @@
 """脚本链: 由选题生成 5~8 个分镜的完整口播脚本(含 narration 字数校验修正)。"""
 from __future__ import annotations
 
-from typing import Any
-
 from ..config import Settings
+from ..llm import ChatModel
 from ..models import Script, Topic
 from ..prompts import ChatPromptTemplate
 from . import parse_json_lenient
@@ -109,7 +108,7 @@ def _build_prompt() -> ChatPromptTemplate:
     )
 
 
-async def write_script(llm: Any, topic: Topic, settings: Settings) -> Script:
+async def write_script(llm: ChatModel, topic: Topic, settings: Settings) -> Script:
     """由选题写脚本。invoke_structured 三级策略, 结果经 fix_script_narration 修正。"""
     payload = {
         "topic_json": topic.model_dump_json(),

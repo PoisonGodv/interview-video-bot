@@ -21,7 +21,7 @@ def settings(tmp_path) -> Settings:
 
 @pytest.fixture()
 def client(settings) -> TestClient:
-    return TestClient(create_app(settings))
+    return TestClient(create_app(settings), base_url="http://localhost")
 
 
 @pytest.fixture()
@@ -109,7 +109,7 @@ def _wait_job(client, job_id: str, timeout: float = 10.0) -> dict:
 def test_job_lifecycle(portal_app, monkeypatch):
     monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         r = client.post("/api/jobs", json={"industry": "护理", "topic_title": "转行面试"})
         assert r.status_code == 202
         _drive(client, scheduled)
@@ -140,7 +140,7 @@ def test_job_stage_progress_not_lagging(portal_app, monkeypatch):
 
     monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         job_id = client.post("/api/jobs", json={"industry": "护理"}).json()["job_id"]
         _drive(client, scheduled)
         time.sleep(0.1)
@@ -173,7 +173,7 @@ def test_job_single_flight(portal_app, monkeypatch):
 
     monkeypatch.setattr("interview_video.web._execute_pipeline", slow_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         r1 = client.post("/api/jobs", json={"industry": "互联网"})
         assert r1.status_code == 202
         _drive(client, scheduled)
@@ -200,7 +200,7 @@ def test_job_failure_sets_error_and_releases_lock(portal_app, settings, monkeypa
 
     monkeypatch.setattr("interview_video.web._execute_pipeline", boom)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         r1 = client.post("/api/jobs", json={"industry": "互联网"})
         assert r1.status_code == 202
         _drive(client, scheduled)
@@ -232,7 +232,7 @@ def test_job_cancel(settings, monkeypatch):
         return asyncio.get_running_loop().create_task(fn(*a))
 
     app = create_app(settings, scheduler=scheduler)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         job_id = client.post("/api/jobs", json={"industry": "互联网"}).json()["job_id"]
         assert client.get(f"/api/jobs/{job_id}").json()["status"] == "running"
 
@@ -255,7 +255,7 @@ def test_cancel_not_found(client):
 def test_meta_edit_and_upload_guard(portal_app, monkeypatch):
     monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         job_id = client.post("/api/jobs", json={"industry": "汽修"}).json()["job_id"]
         _drive(client, scheduled)
         name = _wait_job(client, job_id)["project"]
@@ -312,7 +312,7 @@ def test_series_job(portal_app, monkeypatch, settings):
     monkeypatch.setattr("interview_video.series.generate_series", fake_generate_series)
     monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         r = client.post("/api/jobs", json={
             "mode": "series", "theme": "程序员面试", "episodes": 2, "duration_min": 10,
         })
@@ -339,7 +339,7 @@ def _sample_script_dict() -> dict:
 def test_script_get_put_and_validation(portal_app, monkeypatch):
     monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         job_id = client.post("/api/jobs", json={"industry": "汽修"}).json()["job_id"]
         _drive(client, scheduled)
         name = _wait_job(client, job_id)["project"]
@@ -382,7 +382,7 @@ def test_stop_after_script_then_regenerate(portal_app, settings, monkeypatch):
     monkeypatch.setattr("interview_video.web._execute_script_stage", fake_script_stage)
     monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         r = client.post("/api/jobs", json={"industry": "护理", "stop_after": "script"})
         _drive(client, scheduled)
         job = _wait_job(client, r.json()["job_id"])
@@ -429,7 +429,7 @@ def test_regenerate_guards(client):
 def test_active_job_and_409_carries_job_id(portal_app, monkeypatch):
     monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         assert client.get("/api/jobs/active").json() is None
         job_id = client.post("/api/jobs", json={"topic_title": "t"}).json()["job_id"]
         active = client.get("/api/jobs/active").json()
@@ -485,7 +485,7 @@ def test_series_list_and_resume(portal_app, monkeypatch, settings):
     monkeypatch.setattr("interview_video.series.generate_series", fake_generate_series)
     monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         series = {s["root"]: s for s in client.get("/api/series").json()["series"]}
         assert series[root.name]["complete"] is False
         assert series[root.name]["done_episodes"] == 1
@@ -520,7 +520,10 @@ def test_corrupt_draft_does_not_break_library(client, settings):
     (bad / "script.json").write_text('{"title": "x", "scenes": [', encoding="utf-8")
     r = client.get("/api/projects")
     assert r.status_code == 200
-    assert [p["name"] for p in r.json()["projects"]] == ["good"]
+    by_name = {p["name"]: p for p in r.json()["projects"]}
+    assert by_name["good"]["status"] == "done"
+    assert by_name["bad"]["status"] == "broken" and by_name["bad"]["error"]
+    assert by_name["bad"]["has_script"] is False
     assert client.get("/api/projects/bad/script").status_code == 422
 
 
@@ -528,7 +531,7 @@ def test_put_script_blocked_for_episode_of_running_series(portal_app, settings):
     root = _write_series_root(settings, "s-series-20260101-0000", 2, 1)
     ep = next(root.glob("ep01-*"))
     app, scheduled = portal_app
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         job_id = client.post(f"/api/series/{root.name}/resume", json={}).json()["job_id"]
         # 系列任务锁的是根目录, 其下分集的脚本同样不可改
         r = client.put(f"/api/projects/{ep.name}/script", json=_sample_script_dict())
@@ -570,7 +573,7 @@ def test_cancel_kills_child_process_and_holds_lock_until_exit(settings, monkeypa
     pid_file = tmp_path / "pid"
     monkeypatch.setattr("interview_video.web._execute_pipeline", _sleeper_execute(pid_file))
     app = create_app(settings, scheduler=_real_task_scheduler)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         job_id = client.post("/api/jobs", json={"industry": "互联网"}).json()["job_id"]
         pid = wait_pid(pid_file)
         assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 200
@@ -609,7 +612,7 @@ def test_cancel_series_stops_between_episodes(settings, monkeypatch, tmp_path):
     monkeypatch.setattr("interview_video.series.generate_series", fake_generate_series)
     monkeypatch.setattr("interview_video.web._execute_pipeline", _sleeper_execute(pid_file, calls))
     app = create_app(settings, scheduler=_real_task_scheduler)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         job_id = client.post("/api/jobs", json={"mode": "series", "theme": "t"}).json()["job_id"]
         pid = wait_pid(pid_file)
         client.post(f"/api/jobs/{job_id}/cancel")
@@ -621,3 +624,179 @@ def test_cancel_series_stops_between_episodes(settings, monkeypatch, tmp_path):
         assert (root / "series.json").exists()
         st = {s["root"]: s for s in client.get("/api/series").json()["series"]}
         assert st[root.name]["complete"] is False
+
+
+# ---------- 作品库: 损坏清单 / 失败可见 / 排序 ----------
+
+def test_corrupt_project_json_does_not_break_library(client, settings):
+    good = settings.out_root.resolve() / "good"
+    _write_manifest(good, settings, "互联网")
+    bad = settings.out_root.resolve() / "bad-manifest"
+    bad.mkdir(parents=True)
+    (bad / "project.json").write_text("{not json", encoding="utf-8")
+    r = client.get("/api/projects")
+    assert r.status_code == 200
+    by_name = {p["name"]: p for p in r.json()["projects"]}
+    assert by_name["good"]["status"] == "done"
+    assert by_name["bad-manifest"]["status"] == "broken"
+
+
+def test_library_sorted_by_created_at_desc(client, settings):
+    import os
+
+    root = settings.out_root.resolve()
+    old = root / "zzz-old"   # slug 倒序会排第一, 按时间应排最后
+    _write_manifest(old, settings, "互联网")
+    m = ProjectManifest.model_validate_json((old / "project.json").read_text("utf-8"))
+    m.created_at = datetime(2020, 1, 1)
+    (old / "project.json").write_text(m.model_dump_json(), encoding="utf-8")
+    new = root / "aaa-new"
+    _write_manifest(new, settings, "互联网")
+    draft = root / "mmm-draft"
+    draft.mkdir()
+    (draft / "script.json").write_text(Script(title="草稿", scenes=[]).model_dump_json(), "utf-8")
+    os.utime(draft / "script.json", (1_600_000_000, 1_600_000_000))  # 2020-09, 晚于 old
+    names = [p["name"] for p in client.get("/api/projects").json()["projects"]]
+    assert names == ["aaa-new", "mmm-draft", "zzz-old"]
+
+
+def test_failed_job_visible_in_library_with_error_log(portal_app, settings, monkeypatch):
+    """脚本生成前就失败: 目录只有 error log, 作品库也要显示(failed + 日志链接)。"""
+    async def boom(settings, out_dir, industry, topic_title, script_file, on_stage):
+        raise RuntimeError("LLM boom")
+
+    monkeypatch.setattr("interview_video.web._execute_pipeline", boom)
+    app, scheduled = portal_app
+    with TestClient(app, base_url="http://localhost") as client:
+        r = client.post("/api/jobs", json={"industry": "互联网", "topic_title": "失败题"})
+        _drive(client, scheduled)
+        job = _wait_job(client, r.json()["job_id"])
+        assert job["status"] == "failed" and job["project"]
+        url = job["error_log_url"]
+        assert url.startswith(f"/files/{job['project']}/error-")
+        assert "LLM boom" in client.get(url).text
+        items = [p for p in client.get("/api/projects").json()["projects"]
+                 if p["name"] == job["project"]]
+        assert items and items[0]["status"] == "failed"
+        assert items[0]["error_log_url"] == url and items[0]["has_script"] is False
+
+
+def test_sample_script_resolved_independent_of_cwd(portal_app, tmp_path, monkeypatch):
+    from interview_video.web import sample_script_path
+
+    p = sample_script_path()
+    assert p is not None and p.is_file()
+    Script.model_validate_json(p.read_text("utf-8"))
+
+    seen: dict = {}
+
+    async def capture(settings, out_dir, industry, topic_title, script_file, on_stage):
+        seen["script_file"] = script_file
+        return _write_manifest(out_dir, settings, industry)
+
+    monkeypatch.setattr("interview_video.web._execute_pipeline", capture)
+    monkeypatch.chdir(tmp_path)  # 不在仓库根目录启动也能找到
+    app, scheduled = portal_app
+    with TestClient(app, base_url="http://localhost") as client:
+        r = client.post("/api/jobs", json={"use_sample_script": True})
+        assert r.status_code == 202
+        _drive(client, scheduled)
+        assert _wait_job(client, r.json()["job_id"])["status"] == "done"
+    assert Path(seen["script_file"]) == p
+
+
+# ---------- 跨站 / DNS 重绑定 / 令牌 ----------
+
+def test_cross_origin_post_rejected(client):
+    r = client.post("/api/projects/x/upload", headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+    r = client.post("/api/projects/x/upload", headers={"Referer": "https://evil.example/a"})
+    assert r.status_code == 403
+    r = client.post("/api/jobs", json={"provider": "xxx"}, headers={"Origin": "null"})
+    assert r.status_code == 403
+    # 同源 / 无 Origin(非浏览器客户端)照常处理
+    r = client.post("/api/jobs", json={"provider": "xxx"}, headers={"Origin": "http://localhost"})
+    assert r.status_code == 400
+    assert client.post("/api/jobs", json={"provider": "xxx"}).status_code == 400
+    # 读请求不校验 Origin
+    assert client.get("/api/settings", headers={"Origin": "https://evil.example"}).status_code == 200
+
+
+def test_foreign_host_header_rejected(settings):
+    """DNS 重绑定: 攻击者域名解析到 127.0.0.1, Host 头是攻击者域名 → 连读请求都拒。"""
+    c = TestClient(create_app(settings), base_url="http://evil.example:8099")
+    assert c.get("/api/settings").status_code == 403
+    assert c.get("/api/settings", headers={"Host": "127.0.0.1:8099"}).status_code == 200
+
+
+def test_allowed_hosts_setting(tmp_path):
+    s = Settings(_env_file=None, out_root=tmp_path / "o", web_allowed_hosts="ivb.lan, other.lan")
+    c = TestClient(create_app(s), base_url="http://ivb.lan")
+    assert c.get("/api/settings").status_code == 200
+
+
+def test_non_loopback_bind_requires_token(settings):
+    app = create_app(settings, host="0.0.0.0")
+    token = app.state.web_token
+    assert token
+    c = TestClient(app, base_url="http://192.168.1.5:8099")
+    assert c.get("/api/settings").status_code == 200  # 读不需要令牌
+    assert c.post("/api/jobs", json={"provider": "xxx"}).status_code == 401
+    assert c.post("/api/jobs", json={"provider": "xxx"},
+                  headers={"X-IVB-Token": "wrong"}).status_code == 401
+    assert c.post("/api/jobs", json={"provider": "xxx"},
+                  headers={"X-IVB-Token": token}).status_code == 400
+    # 绑通配地址时域名 Host 仍拒(防重绑定), IP 字面量放行
+    assert TestClient(app, base_url="http://evil.example").get("/api/settings").status_code == 403
+
+
+def test_configured_token_and_loopback_default(tmp_path):
+    assert create_app(Settings(_env_file=None, out_root=tmp_path / "a")).state.web_token is None
+    s = Settings(_env_file=None, out_root=tmp_path / "b", web_token="s3cret")
+    app = create_app(s)
+    assert app.state.web_token == "s3cret"
+    c = TestClient(app, base_url="http://localhost")
+    assert c.post("/api/jobs", json={"provider": "xxx"}).status_code == 401
+    assert c.post("/api/jobs", json={"provider": "xxx"},
+                  headers={"X-IVB-Token": "s3cret"}).status_code == 400
+
+
+def test_index_sends_token_header():
+    from interview_video.web import _STATIC_DIR
+
+    assert "X-IVB-Token" in (_STATIC_DIR / "index.html").read_text("utf-8")
+
+
+def test_upload_idempotent_with_force(settings, monkeypatch):
+    import json as _json
+    import threading
+
+    from interview_video import bilibili as bili_mod
+
+    s = Settings(_env_file=None, out_root=settings.out_root, bili_upload_enabled=True,
+                 bili_sessdata="s", bili_jct="j", bili_buvid3="b")
+    d = s.out_root / "proj"
+    _write_manifest(d, s, "互联网")
+    main_thread = threading.get_ident()
+    calls: list = []
+
+    async def fake_upload(project_dir, settings_, *, force=False):
+        calls.append((force, threading.get_ident() != main_thread))
+        bvid = f"BV{len(calls)}"
+        bili_mod.write_upload_record(project_dir, bvid)
+        return bvid
+
+    monkeypatch.setattr(bili_mod, "upload_project", fake_upload)
+    with TestClient(create_app(s), base_url="http://localhost") as client:
+        r = client.post("/api/projects/proj/upload")
+        assert r.status_code == 200 and r.json()["bvid"] == "BV1"
+        assert calls[0] == (False, True)  # 在工作线程执行, 不阻塞事件循环
+        assert client.get("/api/projects").json()["projects"][0]["bvid"] == "BV1"
+
+        r = client.post("/api/projects/proj/upload", json={"force": False})
+        assert r.status_code == 409 and r.json()["already_uploaded"] and r.json()["bvid"] == "BV1"
+        assert len(calls) == 1
+
+        r = client.post("/api/projects/proj/upload", json={"force": True})
+        assert r.status_code == 200 and r.json()["bvid"] == "BV2" and calls[1][0] is True
+    assert _json.loads((d / "upload.json").read_text("utf-8"))["bvid"] == "BV2"

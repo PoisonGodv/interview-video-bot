@@ -1,6 +1,6 @@
 """画面渲染: Jinja2 模板 → Playwright(chromium)截图 PNG。
 
-按 SPECS §4: viewport 与 settings.video_width/height 一致(默认 1920x1080),
+按 SPECS §4: viewport 与 settings.frame_size() 一致(默认 1920x1080, VIDEO_ASPECT=9:16 时 1080x1920),
 kind→模板映射 point→scene.html / qa→qa.html / ending→ending.html,
 产出 scenes/scene_%03d.png + cover.png, 返回 RenderResult。
 任务取消时在帧间检查点中止, 并确保关闭 chromium。
@@ -29,6 +29,27 @@ KIND_TEMPLATES = {
 # 视觉规范点缀色(SPECS §4)
 ACCENT = "#38bdf8"
 
+# 封面标题字号候选(大→小)与左右留白: 按标题长度挑能在 _COVER_MAX_LINES 行内放下的最大字号
+_COVER_TITLE_SIZES = (108, 96, 88, 80, 72, 64, 56)
+_COVER_MAX_LINES = 3
+_PAGE_PAD_X = {False: 130, True: 72}
+
+
+def _visual_len(text: str) -> float:
+    """按显示宽度估字数: 全角字符记 1, ASCII 记 0.55。"""
+    return sum(0.55 if ord(ch) < 128 else 1.0 for ch in text)
+
+
+def cover_title_px(title: str, width: int = 1920, portrait: bool = False) -> int:
+    """封面标题自适应字号: 长标题逐级缩小, 保证不超过 3 行(横竖屏通用)。"""
+    content_w = width - 2 * _PAGE_PAD_X[portrait]
+    n = max(_visual_len(title.strip()), 1.0)
+    for px in _COVER_TITLE_SIZES:
+        per_line = content_w / (px * 1.02)  # letter-spacing 2px 近似
+        if n / per_line <= _COVER_MAX_LINES:
+            return px
+    return _COVER_TITLE_SIZES[-1]
+
 
 def _build_env() -> Environment:
     """Jinja2 环境: 从包内 templates/ 加载, HTML 自动转义。"""
@@ -51,9 +72,12 @@ def _render_html(
     index: int,
     total: int,
     industry: str = "",
+    width: int = 1920,
+    height: int = 1080,
 ) -> str:
-    """渲染单个模板为 HTML 字符串(纯函数, 便于单测)。"""
+    """渲染单个模板为 HTML 字符串(纯函数, 便于单测)。竖屏由 width < height 推断。"""
     template = env.get_template(template_name)
+    portrait = width < height
     return template.render(
         brand=brand,
         title=title,
@@ -63,6 +87,10 @@ def _render_html(
         total=total,
         accent=ACCENT,
         industry=industry,
+        width=width,
+        height=height,
+        portrait=portrait,
+        title_px=cover_title_px(title, width, portrait),
     )
 
 
@@ -92,8 +120,7 @@ def render_project(
     scenes_dir.mkdir(parents=True, exist_ok=True)
 
     env = _build_env()
-    width = settings.video_width
-    height = settings.video_height
+    width, height = settings.frame_size()
     total = len(script.scenes)
 
     frames: list[Path] = []
@@ -115,6 +142,8 @@ def render_project(
                     index=index,
                     total=total,
                     industry=industry,
+                    width=width,
+                    height=height,
                 )
                 frame_path = scenes_dir / f"scene_{index:03d}.png"
                 _screenshot_html(page, html, frame_path)
@@ -122,15 +151,18 @@ def render_project(
 
             # 封面帧
             procs.checkpoint()
-            cover_html = env.get_template("cover.html").render(
+            cover_html = _render_html(
+                env,
+                "cover.html",
                 brand=settings.brand,
                 title=script.title,
                 script=script,
                 scene=None,
                 index=0,
                 total=total,
-                accent=ACCENT,
                 industry=industry,
+                width=width,
+                height=height,
             )
             cover_path = out_dir / "cover.png"
             _screenshot_html(page, cover_html, cover_path)

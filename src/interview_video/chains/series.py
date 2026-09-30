@@ -12,10 +12,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
+from ..boundary import BoundaryRules
 from ..config import Settings
-from ..llm import LLMBudgetExceededError
+from ..llm import ChatModel, LLMBudgetExceededError
 from ..models import (
     ChapterDraft,
     ChapterSpec,
@@ -136,7 +136,7 @@ def parse_chapter_json(text: str) -> ChapterDraft:
 # ---------------------------------------------------------------------------
 
 async def plan_series(
-    llm: Any, theme: str, episodes: int, episode_sec: int
+    llm: ChatModel, theme: str, episodes: int, episode_sec: int
 ) -> SeriesPlan:
     """策划 agent: 主题 → 系列规划(N 集 + 系列圣经)。"""
     payload = {
@@ -146,14 +146,14 @@ async def plan_series(
     }
     plan = await invoke_structured(
         _PLAN_PROMPT, llm, payload, SeriesPlan, parse_series_plan_json,
-        stage="series.plan",
+        stage="series.plan", boundary_rules=BoundaryRules.non_script(),
     )
     assert isinstance(plan, SeriesPlan)
     return plan
 
 
 async def write_episode_outline(
-    llm: Any, plan: SeriesPlan, episode: EpisodePlan, chapter_sec: int
+    llm: ChatModel, plan: SeriesPlan, episode: EpisodePlan, chapter_sec: int
 ) -> EpisodeOutline:
     """分集编剧: 一集规划 → 章节大纲。"""
     payload = {
@@ -164,14 +164,14 @@ async def write_episode_outline(
     }
     outline = await invoke_structured(
         _OUTLINE_PROMPT, llm, payload, EpisodeOutline, parse_outline_json,
-        stage="series.outline",
+        stage="series.outline", boundary_rules=BoundaryRules.non_script(),
     )
     assert isinstance(outline, EpisodeOutline)
     return outline
 
 
 async def write_chapter(
-    llm: Any,
+    llm: ChatModel,
     plan: SeriesPlan,
     outline: EpisodeOutline,
     chapter: ChapterSpec,
@@ -195,14 +195,14 @@ async def write_chapter(
     }
     draft = await invoke_structured(
         _CHAPTER_PROMPT, llm, payload, ChapterDraft, parse_chapter_json,
-        stage=f"series.ch{ch_no}",
+        stage=f"series.ch{ch_no}", boundary_rules=BoundaryRules.non_script(),
     )
     assert isinstance(draft, ChapterDraft)
     return _fix_draft(draft)
 
 
 async def review_chapter(
-    llm: Any,
+    llm: ChatModel,
     draft: ChapterDraft,
     chapter: ChapterSpec,
     prev_summary: str,

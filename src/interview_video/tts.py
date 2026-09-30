@@ -28,6 +28,8 @@ _TICKS_PER_SECOND = 10_000_000.0
 
 # 中文标点结尾优先断条(与 SPECS §3 一致)
 _SENTENCE_END_PUNCT = "，。！？；："
+# 超长字幕条细分时可断的位置(次级标点, 含半角; 不含 "." 以免拆开 3.5 之类数字)
+_SOFT_BREAK_PUNCT = _SENTENCE_END_PUNCT + "、,;!?）)》」”"
 
 # 失败重试: 2 次重试(共 3 次尝试), 指数退避基数(秒)
 _MAX_ATTEMPTS = 3
@@ -155,8 +157,58 @@ async def _doubao_audio_bytes(text: str, settings: Settings) -> bytes:
     return bytes(audio)
 
 
+def split_long_text(text: str, max_chars: int = 16) -> list[str]:
+    """超过 max_chars 的一段字幕 → 多段: 优先在次级标点(、,; 等)后断, 找不到再硬切。
+
+    断点取 max_chars 以内最靠后的标点(且切出的前段不短于 1/3, 避免碎片); 标点随前段。
+    """
+    pieces: list[str] = []
+    rest = text
+    while len(rest) > max_chars:
+        cut = 0
+        for i in range(max_chars, max(max_chars // 3, 1) - 1, -1):
+            if rest[i - 1] in _SOFT_BREAK_PUNCT:
+                cut = i
+                break
+        if not cut:
+            cut = max_chars
+            if rest[cut] in _SOFT_BREAK_PUNCT:
+                cut += 1  # 不让下一段以标点开头
+            else:
+                # 不在英文单词/数字中间硬切: 退到该词开头(词过长则照切)
+                j = cut
+                while j > 0 and rest[j - 1].isascii() and rest[j - 1].isalnum():
+                    j -= 1
+                if rest[cut].isascii() and rest[cut].isalnum() and j >= max(max_chars // 3, 1):
+                    cut = j
+        pieces.append(rest[:cut])
+        rest = rest[cut:]
+    if rest.strip():
+        pieces.append(rest)
+    elif pieces and rest:
+        pieces[-1] += rest
+    return pieces
+
+
+def split_long_cues(cues: list[Cue], max_chars: int = 16) -> list[Cue]:
+    """把超过 max_chars 的字幕条按 split_long_text 细分, 时间按字数比例分配。"""
+    out: list[Cue] = []
+    for c in cues:
+        pieces = split_long_text(c.text, max_chars) if len(c.text) > max_chars else [c.text]
+        if len(pieces) <= 1:
+            out.append(c)
+            continue
+        total = sum(len(p) for p in pieces)
+        t = c.start
+        for i, p in enumerate(pieces):
+            end = c.end if i == len(pieces) - 1 else t + (c.end - c.start) * len(p) / total
+            out.append(Cue(start=round(t, 3), end=round(end, 3), text=p))
+            t = end
+    return out
+
+
 def _split_subtitle_units(text: str, max_chars: int = 16) -> list[str]:
-    """文本 → 字幕条文本单元: 句读标点处断(标点随前句), 超长再按 max_chars 硬断。"""
+    """文本 → 字幕条文本单元: 句读标点处断(标点随前句), 超长再按次级标点/硬切细分。"""
     text = text.strip()
     if not text:
         return []
@@ -171,11 +223,7 @@ def _split_subtitle_units(text: str, max_chars: int = 16) -> list[str]:
         sentences.append(buf)
     units: list[str] = []
     for s in sentences:
-        while len(s) > max_chars:
-            units.append(s[:max_chars])
-            s = s[max_chars:]
-        if s:
-            units.append(s)
+        units += split_long_text(s, max_chars)
     return units
 
 
@@ -212,7 +260,7 @@ async def synthesize_text_doubao(
     mp3_path.write_bytes(audio)
     from .assemble import ffprobe_duration  # 延迟导入, 避免模块级耦合
 
-    return estimate_cues(text, ffprobe_duration(mp3_path))
+    return estimate_cues(text, ffprobe_duration(mp3_path), settings.subtitle_max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +479,7 @@ async def synthesize_scenes(
             logger.info("场景 %d TTS 命中缓存, 跳过合成", i)
         else:
             cues, voice_key = await _synthesize_scene(i, scene.narration, mp3_path, settings)
+            cues = split_long_cues(cues, settings.subtitle_max_chars)  # edge 超长单词/条再细分
             duration = cues[-1].end + _TAIL_PAD if cues else _TAIL_PAD
             _save_scene_cache(mp3_path, scene.narration, cues, duration, voice_key)
         media.append(SceneMedia(index=i, mp3=mp3_path, cues=cues, duration=duration))

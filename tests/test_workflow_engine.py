@@ -6,8 +6,8 @@
 3. 环路与双循环 (模拟分集/章节双循环);
 4. 递归步数限制与无限循环保护;
 5. 编译期拓扑检查与死链检测;
-6. astream updates 与 values 两种流模式;
-7. 同步 invoke 与 stream 接口;
+6. stream updates 与 values 两种流模式;
+7. 同步 run_sync 与 stream_sync 接口;
 8. 任务取消与异常透传。
 """
 from __future__ import annotations
@@ -20,19 +20,19 @@ import pytest
 from interview_video.workflow_engine import (
     END,
     START,
-    CompiledStateGraph,
     CompiledWorkflow,
-    StateGraph,
+    RunContext,
     WorkflowEngine,
     WorkflowGraphError,
     WorkflowRecursionError,
+    current_run_context,
 )
 
 
 @pytest.mark.asyncio
-async def test_linear_workflow_ainvoke():
+async def test_linear_workflow_run():
     """测试标准线性流水线及状态更新。"""
-    g = StateGraph(dict)
+    g = WorkflowEngine(dict)
 
     async def step_a(state: dict[str, Any]) -> dict[str, Any]:
         return {"a": 1, "history": state.get("history", []) + ["a"]}
@@ -53,9 +53,8 @@ async def test_linear_workflow_ainvoke():
 
     compiled = g.compile()
     assert isinstance(compiled, CompiledWorkflow)
-    assert isinstance(compiled, CompiledStateGraph)
 
-    final = await compiled.ainvoke({"init": "hello"})
+    final = await compiled.run({"init": "hello"})
     assert final["init"] == "hello"
     assert final["a"] == 1
     assert final["b"] == 3
@@ -64,8 +63,8 @@ async def test_linear_workflow_ainvoke():
 
 
 @pytest.mark.asyncio
-async def test_astream_updates_and_values():
-    """测试 astream 的 updates 模式 (与 web.py 对齐) 和 values 模式。"""
+async def test_stream_updates_and_values():
+    """测试 stream 的 updates 模式 (与 web.py 对齐) 和 values 模式。"""
     g = WorkflowEngine()
 
     async def n1(state: dict[str, Any]) -> dict[str, Any]:
@@ -84,7 +83,7 @@ async def test_astream_updates_and_values():
 
     # 1. updates 模式: 逐节点生成 {node_name: update}
     chunks = []
-    async for chunk in compiled.astream({"x": 0}, stream_mode="updates"):
+    async for chunk in compiled.stream({"x": 0}, stream_mode="updates"):
         chunks.append(chunk)
 
     assert len(chunks) == 2
@@ -93,7 +92,7 @@ async def test_astream_updates_and_values():
 
     # 2. values 模式: 逐节点输出当前累积的 full state
     val_chunks = []
-    async for chunk in compiled.astream({"x": 0}, stream_mode="values"):
+    async for chunk in compiled.stream({"x": 0}, stream_mode="values"):
         val_chunks.append(chunk)
 
     assert len(val_chunks) == 2
@@ -133,10 +132,10 @@ async def test_conditional_edges_routing():
 
     compiled = g.compile()
 
-    res1 = await compiled.ainvoke({"input": 4})
+    res1 = await compiled.run({"input": 4})
     assert res1["result"] == "even"
 
-    res2 = await compiled.ainvoke({"input": 7})
+    res2 = await compiled.run({"input": 7})
     assert res2["result"] == "odd"
 
 
@@ -192,7 +191,7 @@ async def test_double_loop_state_machine():
     g.add_edge("build_script", "setup")
 
     compiled = g.compile()
-    final = await compiled.ainvoke({})
+    final = await compiled.run({})
     # 两集分别为 2 章与 3 章
     assert final["completed"] == ["ep1", "ep2"]
     assert final["ep_idx"] == 2
@@ -200,7 +199,7 @@ async def test_double_loop_state_machine():
 
 @pytest.mark.asyncio
 async def test_recursion_limit_protection():
-    """测试无限循环受到 max_steps / recursion_limit 保护。"""
+    """测试无限循环受到 max_steps / RunContext.recursion_limit 保护。"""
     g = WorkflowEngine()
 
     async def loop_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -213,7 +212,7 @@ async def test_recursion_limit_protection():
     compiled = g.compile()
 
     with pytest.raises(WorkflowRecursionError) as exc_info:
-        await compiled.ainvoke({}, config={"recursion_limit": 15})
+        await compiled.run({}, context=RunContext(recursion_limit=15))
 
     assert "工作流步数达到上限 15" in str(exc_info.value)
 
@@ -261,7 +260,7 @@ def test_compile_validation_errors():
 
 
 def test_sync_invoke_and_stream():
-    """测试同步便捷方法 invoke 和 stream。"""
+    """测试同步便捷方法 run_sync 和 stream_sync。"""
     g = WorkflowEngine()
 
     def add_ten(state: dict[str, Any]) -> dict[str, Any]:
@@ -278,12 +277,10 @@ def test_sync_invoke_and_stream():
 
     compiled = g.compile()
 
-    # invoke
-    final = compiled.invoke({"val": 5})
+    final = compiled.run_sync({"val": 5})
     assert final["val"] == 30
 
-    # stream
-    chunks = list(compiled.stream({"val": 5}, stream_mode="updates"))
+    chunks = list(compiled.stream_sync({"val": 5}, stream_mode="updates"))
     assert len(chunks) == 2
     assert chunks[0] == {"add": {"val": 15}}
     assert chunks[1] == {"mul": {"val": 30}}
@@ -306,25 +303,50 @@ def test_get_graph_compatibility():
 
 
 @pytest.mark.asyncio
-async def test_node_signature_with_config():
-    """测试节点函数根据形参动态接收 (state, config)。"""
+async def test_node_receives_run_context():
+    """节点按签名接收 (state, context); 执行期间 current_run_context() 可取到同一对象, 结束后复位。"""
     g = WorkflowEngine()
-    seen_config = None
+    seen: dict[str, Any] = {}
 
-    async def node_with_config(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-        nonlocal seen_config
-        seen_config = config
+    async def node_with_context(state: dict[str, Any], context: RunContext) -> dict[str, Any]:
+        seen["arg"] = context
+        seen["ambient"] = current_run_context()
         return {"done": True}
 
-    g.add_node("worker", node_with_config)
+    g.add_node("worker", node_with_context)
     g.add_edge(START, "worker")
     g.add_edge("worker", END)
 
-    compiled = g.compile()
-    cfg = {"user_tag": "admin_run"}
-    final = await compiled.ainvoke({}, config=cfg)
+    ctx = RunContext(extra={"user_tag": "admin_run"})
+    final = await g.compile().run({}, context=ctx)
     assert final["done"] is True
-    assert seen_config == cfg
+    assert seen["arg"] is ctx and seen["ambient"] is ctx
+    assert current_run_context() is None
+
+
+@pytest.mark.asyncio
+async def test_run_context_audit_reaches_llm_client(tmp_path):
+    """get_chat_model 未显式传 audit 时取当前 RunContext.audit。"""
+    from interview_video.config import Settings
+    from interview_video.llm import get_chat_model
+    from interview_video.llm_audit import LLMCallAudit
+
+    audit = LLMCallAudit(tmp_path)
+    settings = Settings(_env_file=None, llm_api_key="sk", llm_fallback_model="fb")
+    seen: dict[str, Any] = {}
+
+    def node(state: dict[str, Any]) -> dict[str, Any]:
+        client = get_chat_model(settings)
+        seen["audit"] = client.audit
+        seen["fallback_audit"] = client.fallbacks[0].audit
+        return {}
+
+    g = WorkflowEngine()
+    g.add_node("n", node)
+    g.add_edge(START, "n")
+    await g.compile().run({}, context=RunContext(audit=audit))
+    assert seen["audit"] is audit and seen["fallback_audit"] is audit
+    assert get_chat_model(settings).audit is None
 
 
 @pytest.mark.asyncio
@@ -341,7 +363,7 @@ async def test_workflow_cancellation():
     g.add_edge("slow", END)
 
     compiled = g.compile()
-    task = asyncio.create_task(compiled.ainvoke({}))
+    task = asyncio.create_task(compiled.run({}))
     await asyncio.sleep(0.05)
     task.cancel()
 

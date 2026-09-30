@@ -1,4 +1,4 @@
-"""编排层: LangGraph 线性 8 节点流水线 + run_pipeline 便捷入口。
+"""编排层: 原生工作流引擎线性 8 节点流水线 + run_pipeline 便捷入口。
 
 节点顺序(见 SPECS §6):
     gen_script → tts → render → clips → subs → finalize → metadata → manifest
@@ -30,7 +30,7 @@ from .models import (
     SubtitleBar,
     Topic,
 )
-from .workflow_engine import END, START, CompiledStateGraph, StateGraph
+from .workflow_engine import END, START, CompiledWorkflow, RunContext, WorkflowEngine
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class PipelineState(TypedDict, total=False):
 STOP_AFTER_CHOICES = ("script",)
 
 
-def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledStateGraph:
+def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWorkflow:
     """构建编译后的线性流水线图。节点闭包捕获 settings。
 
     stop_after="script": gen_script 后直接结束(落盘 script.json 供人工审改, 再 --resume 续跑)。
@@ -90,11 +90,20 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledSt
             llm = llm_mod.get_chat_model(settings)
             industry = state.get("industry", "互联网")
             topic_title = (state.get("topic_title") or "").strip()
+            from . import backlog as backlog_mod
+
             if topic_title:
-                # 用户指定的选题原样使用, 不再随机生成再模糊匹配
-                topic = Topic(title=topic_title, industry=industry)
+                # 用户指定的选题原样使用(选题库有同名条目时带上其 hook/要点), 不再随机生成再模糊匹配
+                topic = _backlog_find(settings, topic_title, industry) or Topic(
+                    title=topic_title, industry=industry
+                )
             else:
-                topic = (await topic_mod.generate_topics(llm, industry))[0]
+                # 已入库/用过的标题作为 avoid, 生成结果入库(未选中的留作后续选题)
+                generated = await topic_mod.generate_topics(
+                    llm, industry, avoid=backlog_mod.avoid_titles(settings, industry) or None,
+                )
+                topic = generated[0]
+                _safe_backlog(backlog_mod.add_topics, settings, generated)
             (out_dir / "topic.json").write_text(
                 topic.model_dump_json(indent=2), encoding="utf-8"
             )
@@ -231,6 +240,7 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledSt
                 "llm_model": settings.llm_model,
                 "llm_temperature": str(settings.llm_temperature),
                 "tts_provider": settings.tts_provider,
+                "video_aspect": settings.video_aspect,
                 "prompt_versions": "topic1/script2/metadata2/series2",
             },
         )
@@ -238,9 +248,19 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledSt
         manifest_path.write_text(
             manifest.model_dump_json(indent=2), encoding="utf-8"
         )
+        topic_json = out_dir / "topic.json"
+        if topic_json.exists():  # 选题来自 LLM/--topic/选题库时, 成片后在选题库标记已用
+            from . import backlog as backlog_mod
+
+            try:
+                used = Topic.model_validate_json(topic_json.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                used = None
+            if used is not None:
+                _safe_backlog(backlog_mod.mark_used, settings, used.title, used.industry, out_dir)
         return {"manifest_path": manifest_path}
 
-    graph = StateGraph(PipelineState)
+    graph = WorkflowEngine(PipelineState)
     graph.add_node("gen_script", gen_script)
     graph.add_node("tts", tts_node)
     graph.add_node("render", render_node)
@@ -266,6 +286,23 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledSt
         graph.add_edge(prev, nxt)
     graph.add_edge("manifest", END)
     return graph.compile()
+
+
+def _backlog_find(settings: Settings, title: str, industry: str) -> Topic | None:
+    from . import backlog as backlog_mod
+
+    try:
+        return backlog_mod.find(settings, title, industry)
+    except OSError:
+        return None
+
+
+def _safe_backlog(fn, *args) -> None:
+    """选题库读写失败只告警, 不影响成片。"""
+    try:
+        fn(*args)
+    except OSError as exc:
+        logger.warning("选题库更新失败(不影响本次生成): %s", exc)
 
 
 def resume_industry(out_dir: Path) -> str | None:
@@ -304,9 +341,7 @@ async def run_script_stage(
     from .llm_audit import run_budget
 
     with run_budget(settings):
-        final = await graph.ainvoke(
-            initial, config={"callbacks": [LLMCallAudit(out_dir)]}
-        )
+        final = await graph.run(initial, context=RunContext(audit=LLMCallAudit(out_dir)))
     return final["script"]
 
 
@@ -340,9 +375,7 @@ async def run_pipeline(
     from .llm_audit import LLMCallAudit, run_budget
 
     with run_budget(settings):
-        final = await graph.ainvoke(
-            initial, config={"callbacks": [LLMCallAudit(out_dir)]}
-        )
+        final = await graph.run(initial, context=RunContext(audit=LLMCallAudit(out_dir)))
     manifest_path = Path(final["manifest_path"])
     return ProjectManifest.model_validate_json(
         manifest_path.read_text(encoding="utf-8")

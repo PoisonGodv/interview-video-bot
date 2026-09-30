@@ -1,14 +1,16 @@
-"""轻量级原生异步工作流 / 状态机引擎 (AsyncStateGraph / WorkflowEngine)。
+"""轻量级原生异步工作流 / 状态机引擎 (WorkflowEngine → CompiledWorkflow)。
 
 设计原则:
-1. 零第三方依赖: 仅使用 Python 3.10+ 标准库 (asyncio, typing, inspect, logging 等);
-2. 语义与接口对齐: 完全兼容 LangGraph 的 StateGraph / START / END / ainvoke / astream 契约;
+1. 零第三方依赖: 仅使用 Python 标准库 (asyncio, typing, inspect, logging 等);
+2. 接口: add_node / add_edge(START|END) / add_conditional_edges → compile() →
+   run / stream(异步) 与 run_sync / stream_sync(同步便捷);
 3. 健壮的状态流转保证:
    - 编译期拓扑与死链检查;
    - 运行期步数上限保护 (防无限循环 / 递归失控);
    - 节点级错误上下文封装 (保留失败节点名与最新状态快照);
    - 支持同步与异步节点 / 路由函数混合编排;
-   - 自动适配 LangChain RunnableConfig 上下文 (若环境安装了 langchain_core, 透传回调)。
+   - 显式运行上下文 RunContext (审计器 / 步数上限 / 附加数据): 可作为节点第二参数传入,
+     执行期间也可经 current_run_context() 在任意深度取得(如 LLM 客户端取审计器)。
 """
 from __future__ import annotations
 
@@ -18,11 +20,14 @@ import logging
 from collections.abc import AsyncGenerator, Callable, Generator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
+
+if TYPE_CHECKING:
+    from .llm_audit import LLMCallAudit
 
 logger = logging.getLogger(__name__)
 
-# 特殊保留节点标识符 (与 LangGraph 契约完全一致)
+# 特殊保留节点标识符
 START = "__start__"
 END = "__end__"
 
@@ -74,53 +79,38 @@ class GraphEdge:
 
 @dataclass
 class GraphView:
-    """与 LangGraph get_graph() 结构兼容的只读拓扑视图。"""
+    """只读拓扑视图 (节点含 __start__ / __end__)。"""
 
     nodes: dict[str, GraphNode] = field(default_factory=dict)
     edges: list[GraphEdge] = field(default_factory=list)
 
 
-_current_workflow_config: ContextVar[dict[str, Any] | None] = ContextVar(
-    "_current_workflow_config", default=None
+@dataclass
+class RunContext:
+    """单次工作流运行的显式上下文。
+
+    audit: LLM 调用审计器(llm.get_chat_model 未显式传 audit 时取用);
+    recursion_limit: 覆盖编译期步数上限;
+    extra: 调用方自定义数据, 引擎不解释。
+    """
+
+    audit: LLMCallAudit | None = None
+    recursion_limit: int | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+_current_run_context: ContextVar[RunContext | None] = ContextVar(
+    "_current_run_context", default=None
 )
 
 
-def get_current_workflow_config() -> dict[str, Any] | None:
-    """获取当前正在执行的工作流节点的配置 (如 callbacks、metadata 等)。"""
-    return _current_workflow_config.get()
-
-
-def _propagate_config(config: dict[str, Any] | None) -> tuple[Any, Any]:
-    """将 config 注入当前上下文 ContextVar，支持跨异步协程透传。"""
-    if not config:
-        return (None, None)
-    native_token = _current_workflow_config.set(config)
-    lc_token = None
-    try:
-        from langchain_core.runnables.config import var_child_runnable_config
-
-        lc_token = var_child_runnable_config.set(config)
-    except (ImportError, AttributeError):
-        pass
-    return (native_token, lc_token)
-
-
-def _reset_config(tokens: tuple[Any, Any]) -> None:
-    """重置上下文 ContextVar。"""
-    native_token, lc_token = tokens
-    if native_token is not None:
-        _current_workflow_config.reset(native_token)
-    if lc_token is not None:
-        try:
-            from langchain_core.runnables.config import var_child_runnable_config
-
-            var_child_runnable_config.reset(lc_token)
-        except Exception:
-            pass
+def current_run_context() -> RunContext | None:
+    """当前正在执行的工作流的 RunContext(不在工作流内返回 None)。"""
+    return _current_run_context.get()
 
 
 class CompiledWorkflow(Generic[StateT]):
-    """已编译的状态图工作流实例。支持 ainvoke / astream / invoke / stream。"""
+    """已编译的状态图工作流实例。支持 run / stream / run_sync / stream_sync。"""
 
     def __init__(
         self,
@@ -144,7 +134,7 @@ class CompiledWorkflow(Generic[StateT]):
         return self._nodes
 
     def get_graph(self) -> GraphView:
-        """返回兼容 LangGraph 协议的图拓扑视图 (包含 __start__, __end__ 与所有节点)。"""
+        """返回图拓扑视图 (包含 __start__, __end__ 与所有节点)。"""
         nodes_dict: dict[str, GraphNode] = {
             START: GraphNode(id=START, name=START),
             END: GraphNode(id=END, name=END),
@@ -171,20 +161,12 @@ class CompiledWorkflow(Generic[StateT]):
         node_name: str,
         fn: Callable[..., Any],
         state: dict[str, Any],
-        config: dict[str, Any] | None = None,
+        context: RunContext,
     ) -> Any:
-        """执行单个节点函数，支持 async/sync，支持根据签名传 (state) 或 (state, config)。"""
-        sig = inspect.signature(fn)
-        params = list(sig.parameters.values())
-
-        # 判断是否需要传递 config 参数
-        accepts_config = False
-        if len(params) >= 2:
-            accepts_config = True
-        elif any(p.name in ("config", "runnable_config") for p in params):
-            accepts_config = True
-
-        call_args: tuple[Any, ...] = (state, config) if accepts_config else (state,)
+        """执行单个节点函数，支持 async/sync，按签名传 (state) 或 (state, context)。"""
+        params = list(inspect.signature(fn).parameters.values())
+        accepts_context = len(params) >= 2 or any(p.name == "context" for p in params)
+        call_args: tuple[Any, ...] = (state, context) if accepts_context else (state,)
 
         try:
             if inspect.iscoroutinefunction(fn):
@@ -236,150 +218,109 @@ class CompiledWorkflow(Generic[StateT]):
         # 无后续边定义时自然结束
         return END
 
-    async def astream(
+    def _max_steps_for(self, context: RunContext) -> int:
+        return context.recursion_limit if context.recursion_limit else self._max_steps
+
+    async def _steps(
+        self,
+        initial_state: Mapping[str, Any],
+        context: RunContext | None,
+    ) -> AsyncGenerator[tuple[str, Any, dict[str, Any]], None]:
+        """逐步执行, 产出 (节点名, 节点输出, 合并后的 state)。"""
+        ctx = context or RunContext()
+        state = dict(initial_state)
+        current_node = self._entry_point
+        steps = 0
+        max_steps = self._max_steps_for(ctx)
+
+        token = _current_run_context.set(ctx)
+        try:
+            while current_node != END:
+                steps += 1
+                if steps > max_steps:
+                    raise WorkflowRecursionError(
+                        f"工作流步数达到上限 {max_steps}，疑似存在无限环路 (卡在节点 '{current_node}')。"
+                    )
+
+                output = await self._execute_node(
+                    current_node, self._nodes[current_node], state, ctx
+                )
+                if isinstance(output, Mapping):
+                    state.update(output)
+                yield current_node, output, state
+                current_node = await self._resolve_next(current_node, state)
+        finally:
+            _current_run_context.reset(token)
+
+    async def stream(
         self,
         initial_state: Mapping[str, Any],
         stream_mode: str = "updates",
-        config: dict[str, Any] | None = None,
-        **kwargs: Any,
+        context: RunContext | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """异步生成器: 流式执行工作流，按步输出 updates 或 values。
 
         stream_mode="updates" 时，每步产出 {node_name: node_output}
         stream_mode="values" 时，每步产出最新全量 state 字典
         """
-        state = dict(initial_state)
-        current_node = self._entry_point
-        steps = 0
+        async for node, output, state in self._steps(initial_state, context):
+            if stream_mode == "values":
+                yield dict(state)
+            else:
+                yield {node: dict(output) if isinstance(output, Mapping) else {}}
 
-        # 支持在 config 中覆盖 recursion_limit
-        max_steps = self._max_steps
-        if config and "recursion_limit" in config:
-            try:
-                max_steps = int(config["recursion_limit"])
-            except (ValueError, TypeError):
-                pass
-
-        tokens = _propagate_config(config)
-        try:
-            while current_node != END:
-                steps += 1
-                if steps > max_steps:
-                    raise WorkflowRecursionError(
-                        f"工作流步数达到上限 {max_steps}，疑似存在无限环路 (卡在节点 '{current_node}')。"
-                    )
-
-                node_fn = self._nodes[current_node]
-                output = await self._execute_node(current_node, node_fn, state, config)
-
-                # 状态增量合并
-                if isinstance(output, Mapping):
-                    state.update(output)
-
-                if stream_mode == "updates":
-                    yield {current_node: dict(output) if isinstance(output, Mapping) else {}}
-                elif stream_mode == "values":
-                    yield dict(state)
-                else:
-                    yield {current_node: dict(output) if isinstance(output, Mapping) else {}}
-
-                current_node = await self._resolve_next(current_node, state)
-        finally:
-            _reset_config(tokens)
-
-    async def ainvoke(
+    async def run(
         self,
         initial_state: Mapping[str, Any],
-        config: dict[str, Any] | None = None,
-        **kwargs: Any,
+        context: RunContext | None = None,
     ) -> dict[str, Any]:
         """异步执行完整工作流，返回最终状态字典。"""
-        state = dict(initial_state)
-        current_node = self._entry_point
-        steps = 0
+        final: dict[str, Any] = dict(initial_state)
+        async for _node, _output, state in self._steps(initial_state, context):
+            final = state
+        return final
 
-        max_steps = self._max_steps
-        if config and "recursion_limit" in config:
-            try:
-                max_steps = int(config["recursion_limit"])
-            except (ValueError, TypeError):
-                pass
-
-        tokens = _propagate_config(config)
-        try:
-            while current_node != END:
-                steps += 1
-                if steps > max_steps:
-                    raise WorkflowRecursionError(
-                        f"工作流步数达到上限 {max_steps}，疑似存在无限环路 (卡在节点 '{current_node}')。"
-                    )
-
-                node_fn = self._nodes[current_node]
-                output = await self._execute_node(current_node, node_fn, state, config)
-
-                if isinstance(output, Mapping):
-                    state.update(output)
-
-                current_node = await self._resolve_next(current_node, state)
-
-            return state
-        finally:
-            _reset_config(tokens)
-
-    def invoke(
+    def run_sync(
         self,
         initial_state: Mapping[str, Any],
-        config: dict[str, Any] | None = None,
-        **kwargs: Any,
+        context: RunContext | None = None,
     ) -> dict[str, Any]:
         """同步运行便捷入口。若在已有事件循环中调用，安全委托到后台线程运行。"""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        return _run_coro_sync(self.run(initial_state, context=context))
 
-        if loop and loop.is_running():
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                fut = pool.submit(asyncio.run, self.ainvoke(initial_state, config=config, **kwargs))
-                return fut.result()
-        return asyncio.run(self.ainvoke(initial_state, config=config, **kwargs))
-
-    def stream(
+    def stream_sync(
         self,
         initial_state: Mapping[str, Any],
         stream_mode: str = "updates",
-        config: dict[str, Any] | None = None,
-        **kwargs: Any,
+        context: RunContext | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         """同步流式生成器便捷入口。"""
         async def _drain() -> list[dict[str, Any]]:
-            chunks = []
-            async for chunk in self.astream(
-                initial_state, stream_mode=stream_mode, config=config, **kwargs
-            ):
-                chunks.append(chunk)
-            return chunks
+            return [
+                chunk
+                async for chunk in self.stream(
+                    initial_state, stream_mode=stream_mode, context=context
+                )
+            ]
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        yield from _run_coro_sync(_drain())
 
-        if loop and loop.is_running():
-            import concurrent.futures
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                fut = pool.submit(asyncio.run, _drain())
-                yield from fut.result()
-        else:
-            chunks = asyncio.run(_drain())
-            yield from chunks
+def _run_coro_sync(coro: Any) -> Any:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return asyncio.run(coro)
 
 
 class WorkflowEngine(Generic[StateT]):
-    """轻量级原生异步状态图/工作流构建器 (与 LangGraph StateGraph API 契约对齐)。"""
+    """轻量级原生异步状态图/工作流构建器。"""
 
     def __init__(self, state_schema: Any = None) -> None:
         self.state_schema = state_schema
@@ -492,9 +433,3 @@ class WorkflowEngine(Generic[StateT]):
             entry_point=self._entry_point,
             state_schema=self.state_schema,
         )
-
-
-# 完全兼容 LangGraph 类名别名
-StateGraph = WorkflowEngine
-AsyncStateGraph = WorkflowEngine
-CompiledStateGraph = CompiledWorkflow

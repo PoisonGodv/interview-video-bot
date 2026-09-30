@@ -1,14 +1,14 @@
 """原生 HTTP LLM 客户端: 直接基于 httpx 的 OpenAI 兼容接口 + 测试用假模型。
 
-彻底移除 LangChain / LangGraph 依赖，具备:
+对外只暴露 ``await client.chat(messages) -> ChatResult``(messages 为 str 或 OpenAI 格式 dict 列表):
 1. 纯净异步 HTTP 通信 (POST /chat/completions);
 2. 异常分类与快速失败: 401/403/404 鉴权与配置错误立即抛出，不浪费重试;
 3. 抖动与指数退避重试: 针对 429 限流 / 5xx 服务端错误 / 超时网络波动自动重试,
    优先遵循 Retry-After(秒数或 HTTP-date, 上限 60s), 429 退避基数更大;
    finish_reason=length 抛 LLMTruncatedError(不重试, 提示调大 LLM_MAX_TOKENS);
-4. 备用模型降级 (with_fallbacks): 主模型彻底失败时无缝切换到备用模型;
+4. 备用模型降级 (构造参数 fallbacks): 主模型彻底失败时切换到备用模型;
 5. 审计打点集成 (LLMCallAudit): 精确捕获耗时、Prompt/Response 字符数及 token 消耗;
-6. 测试替身 (fake_chat_model): 离线内存流式出参，支持 ainvoke 与 with_fallbacks。
+6. 测试替身 (fake_chat_model): 离线内存按序出参, 同样实现 chat()。
 """
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ import logging
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from pydantic import SecretStr
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# 1. 核心异常定义 (语义与 OpenAI SDK 对齐，无需安装 openai 库)
+# 1. 核心异常定义
 # ===========================================================================
 
 class LLMError(Exception):
@@ -142,13 +142,9 @@ def retry_delay(exc: BaseException, attempt: int, rand: Callable[[], float] = ra
 
 def is_fatal_error(exc: BaseException) -> bool:
     """判断是否为致命鉴权/权限/配置错误 (此类错误重试毫无意义，应直接熔断)。"""
-    if isinstance(exc, (AuthenticationError, PermissionDeniedError, NotFoundError, LLMConnectionError)):
-        return True
-    # 兼容通过 monkeypatch 或环境注入的 openai 异常
-    exc_type = type(exc).__name__
-    if exc_type in ("AuthenticationError", "PermissionDeniedError", "NotFoundError"):
-        return True
-    return False
+    return isinstance(
+        exc, (AuthenticationError, PermissionDeniedError, NotFoundError, LLMConnectionError)
+    )
 
 
 # ===========================================================================
@@ -156,8 +152,8 @@ def is_fatal_error(exc: BaseException) -> bool:
 # ===========================================================================
 
 @dataclass
-class ChatResponse:
-    """模型调用响应封装，兼容 str(res) 和 res.content。"""
+class ChatResult:
+    """一次 chat 调用的结果: 文本 content + 实际模型名 + token 用量。"""
 
     content: str
     model: str | None = None
@@ -168,7 +164,83 @@ class ChatResponse:
 
     def __repr__(self) -> str:
         snippet = self.content[:60] + "..." if len(self.content) > 60 else self.content
-        return f"ChatResponse(content={snippet!r}, model={self.model!r})"
+        return f"ChatResult(content={snippet!r}, model={self.model!r})"
+
+
+Messages = str | Sequence[Mapping[str, Any]]
+
+
+class ChatModel(Protocol):
+    """chains 层依赖的最小模型接口(HTTPChatClient / FakeChatModel / 测试桩均满足)。"""
+
+    async def chat(
+        self,
+        messages: Messages,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ChatResult: ...
+
+
+def normalize_messages(messages: Messages) -> list[dict[str, str]]:
+    """str → 单条 user 消息; dict 序列 → 仅保留 role/content 的 OpenAI 格式列表。"""
+    if isinstance(messages, str):
+        return [{"role": "user", "content": messages}]
+    out: list[dict[str, str]] = []
+    for m in messages:
+        if not isinstance(m, Mapping):
+            raise TypeError(f"消息必须是 {{role, content}} 字典, 收到 {type(m).__name__}")
+        out.append({"role": str(m.get("role", "user")), "content": str(m.get("content", ""))})
+    return out
+
+
+def _parse_completion(resp: httpx.Response) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """200 响应体 → (data, choices[0], content); 非 JSON / 结构异常统一抛 LLMAPIError(可重试)。"""
+    snippet = resp.text[:200]
+    try:
+        data = resp.json()
+    except ValueError:
+        raise LLMAPIError(
+            f"API 响应不是合法 JSON(HTTP 200): {snippet}", response_text=resp.text
+        ) from None
+    if not isinstance(data, dict):
+        raise LLMAPIError(f"API 响应结构异常(非 JSON 对象): {snippet}", response_text=resp.text)
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LLMAPIError(f"API 响应中没有 choices 内容: {snippet}", response_text=resp.text)
+    first_choice = choices[0]
+    msg = first_choice.get("message") if isinstance(first_choice, dict) else None
+    if not isinstance(msg, dict):
+        raise LLMAPIError(f"API 响应 choices[0] 缺少 message: {snippet}", response_text=resp.text)
+    content = msg.get("content")
+    if isinstance(content, list):  # 部分网关返回内容分片 [{"type": "text", "text": ...}]
+        content = "".join(
+            str(p.get("text", "")) if isinstance(p, dict) else str(p) for p in content
+        )
+    elif content is None:
+        content = ""
+    elif not isinstance(content, str):
+        raise LLMAPIError(
+            f"API 响应 message.content 类型异常({type(content).__name__}): {snippet}",
+            response_text=resp.text,
+        )
+    return data, first_choice, content
+
+
+def _parse_usage(raw: Any) -> dict[str, int]:
+    raw = raw if isinstance(raw, dict) else {}
+
+    def _int(key: str) -> int:
+        try:
+            return max(0, int(raw.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "input_tokens": _int("prompt_tokens"),
+        "output_tokens": _int("completion_tokens"),
+        "total_tokens": _int("total_tokens"),
+    }
 
 
 # ===========================================================================
@@ -208,64 +280,19 @@ class HTTPChatClient:
         self._sleep = sleep
         self._rand = rand
 
-    def with_fallbacks(self, fallbacks: Sequence[HTTPChatClient]) -> HTTPChatClient:
-        """注册备用客户端序列。"""
-        new_client = HTTPChatClient(
-            model=self.model,
-            api_key=self._raw_key,
-            base_url=self.base_url,
-            temperature=self.temperature,
-            timeout=self.timeout,
-            max_tokens=self.max_tokens,
-            max_retries=self.max_retries,
-            fallbacks=fallbacks,
-            audit=self.audit,
-            connect_timeout=self.connect_timeout,
-            sleep=self._sleep,
-            rand=self._rand,
-        )
-        return new_client
-
-    def _normalize_messages(self, messages: Any) -> list[dict[str, str]]:
-        """规整各类形态的输入消息为符合 OpenAI 契约的 list[dict[str, str]]。"""
-        if isinstance(messages, str):
-            return [{"role": "user", "content": messages}]
-
-        out: list[dict[str, str]] = []
-        if isinstance(messages, Iterable):
-            for m in messages:
-                if isinstance(m, dict):
-                    role = m.get("role", "user")
-                    content = str(m.get("content", ""))
-                    out.append({"role": role, "content": content})
-                elif hasattr(m, "role") and hasattr(m, "content"):
-                    out.append({"role": str(m.role), "content": str(m.content)})
-                elif hasattr(m, "content"):
-                    # 兼容类似 AIMessage / HumanMessage 的对象
-                    name = type(m).__name__.lower()
-                    role = "system" if "system" in name else ("assistant" if "ai" in name else "user")
-                    out.append({"role": role, "content": str(m.content)})
-                elif isinstance(m, (tuple, list)) and len(m) == 2:
-                    out.append({"role": str(m[0]), "content": str(m[1])})
-                else:
-                    out.append({"role": "user", "content": str(m)})
-        return out
-
-    async def ainvoke(
+    async def chat(
         self,
-        messages: Any,
+        messages: Messages,
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        **kwargs: Any,
-    ) -> ChatResponse:
-        """异步调用主入口。"""
+    ) -> ChatResult:
+        """发起一次 chat 调用: 本模型按退避重试, 可恢复错误耗尽后依次尝试备用模型。"""
         try:
             return await self._call_with_retries(
                 messages,
                 temperature=temperature if temperature is not None else self.temperature,
                 max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
-                **kwargs,
             )
         except Exception as exc:
             if isinstance(exc, (LLMTruncatedError, LLMBudgetExceededError)) or (
@@ -282,11 +309,8 @@ class HTTPChatClient:
                 )
                 for fallback in self.fallbacks:
                     try:
-                        return await fallback.ainvoke(
-                            messages,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            **kwargs,
+                        return await fallback.chat(
+                            messages, temperature=temperature, max_tokens=max_tokens
                         )
                     except Exception as fb_exc:
                         if is_fatal_error(fb_exc) or isinstance(fb_exc, LLMBudgetExceededError):
@@ -296,20 +320,19 @@ class HTTPChatClient:
 
     async def _call_with_retries(
         self,
-        messages: Any,
+        messages: Messages,
         *,
         temperature: float,
         max_tokens: int | None,
-        **kwargs: Any,
-    ) -> ChatResponse:
-        norm_messages = self._normalize_messages(messages)
+    ) -> ChatResult:
+        norm_messages = normalize_messages(messages)
         endpoint = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self._raw_key}",
             "Content-Type": "application/json",
         }
         body: dict[str, Any] = {
-            "model": kwargs.get("model", self.model),
+            "model": self.model,
             "messages": norm_messages,
             "temperature": temperature,
         }
@@ -344,21 +367,8 @@ class HTTPChatClient:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
                 if resp.status_code == 200:
-                    data = resp.json()
-                    choices = data.get("choices") or []
-                    if not choices:
-                        raise LLMAPIError("API 响应中没有 choices 内容", response_text=resp.text)
-
-                    first_choice = choices[0]
-                    msg = first_choice.get("message") or {}
-                    content = msg.get("content") or ""
-
-                    raw_usage = data.get("usage") or {}
-                    usage_dict = {
-                        "input_tokens": raw_usage.get("prompt_tokens", 0),
-                        "output_tokens": raw_usage.get("completion_tokens", 0),
-                        "total_tokens": raw_usage.get("total_tokens", 0),
-                    }
+                    data, first_choice, content = _parse_completion(resp)
+                    usage_dict = _parse_usage(data.get("usage"))
 
                     if budget is not None:
                         budget.add_tokens(
@@ -383,9 +393,9 @@ class HTTPChatClient:
                             content=content,
                         )
 
-                    return ChatResponse(
+                    return ChatResult(
                         content=content,
-                        model=data.get("model", self.model),
+                        model=data.get("model") or self.model,
                         usage=usage_dict,
                     )
 
@@ -465,29 +475,18 @@ class FakeChatModel:
         self._cursor = 0
         self.call_history: list[list[dict[str, str]]] = []
 
-    def with_fallbacks(self, fallbacks: Any) -> FakeChatModel:
-        return self
-
-    async def ainvoke(self, messages: Any, **kwargs: Any) -> ChatResponse:
-        norm = []
-        if isinstance(messages, str):
-            norm = [{"role": "user", "content": messages}]
-        elif isinstance(messages, list):
-            for m in messages:
-                if isinstance(m, dict):
-                    norm.append(m)
-                elif hasattr(m, "role") and hasattr(m, "content"):
-                    norm.append({"role": str(m.role), "content": str(m.content)})
-                elif hasattr(m, "content"):
-                    norm.append({"role": "user", "content": str(m.content)})
-                else:
-                    norm.append({"role": "user", "content": str(m)})
-        self.call_history.append(norm)
-
+    async def chat(
+        self,
+        messages: Messages,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ChatResult:
+        self.call_history.append(normalize_messages(messages))
         if self._cursor < len(self.responses):
             resp = self.responses[self._cursor]
             self._cursor += 1
-            return ChatResponse(content=resp, model="fake-model")
+            return ChatResult(content=resp, model="fake-model")
         raise RuntimeError("FakeChatModel 预设回复已用尽")
 
 
@@ -500,15 +499,12 @@ def fake_chat_model(responses: list[str]) -> FakeChatModel:
 # 5. LLM 工厂
 # ===========================================================================
 
-def _audit_from_workflow_config() -> LLMCallAudit | None:
-    """未显式传 audit 时, 取当前工作流 config.callbacks 里的 LLMCallAudit。"""
-    from .workflow_engine import get_current_workflow_config
+def _audit_from_run_context() -> LLMCallAudit | None:
+    """未显式传 audit 时, 取当前工作流 RunContext 上的审计器。"""
+    from .workflow_engine import current_run_context
 
-    cfg = get_current_workflow_config() or {}
-    for cb in cfg.get("callbacks") or []:
-        if isinstance(cb, LLMCallAudit):
-            return cb
-    return None
+    ctx = current_run_context()
+    return ctx.audit if ctx is not None else None
 
 
 def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTTPChatClient:
@@ -520,7 +516,7 @@ def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTT
         )
 
     if audit is None:
-        audit = _audit_from_workflow_config()
+        audit = _audit_from_run_context()
     base_url = settings.llm_base_url or "https://api.openai.com/v1"
     primary = HTTPChatClient(
         model=settings.llm_model,
@@ -548,7 +544,7 @@ def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTT
             max_retries=settings.llm_max_retries,
             audit=audit,
         )
-        return primary.with_fallbacks([fallback])
+        primary.fallbacks = [fallback]
 
     return primary
 
@@ -566,7 +562,10 @@ __all__ = [
     "is_fatal_error",
     "parse_retry_after",
     "retry_delay",
-    "ChatResponse",
+    "ChatResult",
+    "ChatModel",
+    "Messages",
+    "normalize_messages",
     "HTTPChatClient",
     "FakeChatModel",
     "fake_chat_model",

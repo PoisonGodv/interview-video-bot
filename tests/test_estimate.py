@@ -113,12 +113,12 @@ def _client(**kw) -> HTTPChatClient:
 async def test_budget_max_calls_blocks_before_request(monkeypatch):
     calls = _patch_ok_transport(monkeypatch)
     fallback = _client()
-    client = _client().with_fallbacks([fallback])
+    client = _client(fallbacks=[fallback])
     with run_budget(_settings(llm_max_calls_per_run=2)):
-        await client.ainvoke("a")
-        await client.ainvoke("b")
+        await client.chat("a")
+        await client.chat("b")
         with pytest.raises(LLMBudgetExceededError, match="LLM_MAX_CALLS_PER_RUN=2"):
-            await client.ainvoke("c")
+            await client.chat("c")
     assert calls["n"] == 2  # 超限不发请求、不切备用模型
 
 
@@ -126,11 +126,11 @@ async def test_budget_max_tokens(monkeypatch):
     calls = _patch_ok_transport(monkeypatch, total_tokens=600)
     client = _client()
     with run_budget(_settings(llm_max_tokens_per_run=1000)) as budget:
-        await client.ainvoke("a")
-        await client.ainvoke("b")  # 600 < 1000, 放行
+        await client.chat("a")
+        await client.chat("b")  # 600 < 1000, 放行
         assert budget.tokens == 1200
         with pytest.raises(LLMBudgetExceededError, match="LLM_MAX_TOKENS_PER_RUN"):
-            await client.ainvoke("c")
+            await client.chat("c")
     assert calls["n"] == 2
 
 
@@ -141,7 +141,7 @@ async def test_budget_error_not_swallowed_by_invoke_or_review(monkeypatch):
     _patch_ok_transport(monkeypatch)
     client = _client()
     with run_budget(_settings(llm_max_calls_per_run=1)):
-        await client.ainvoke("warmup")
+        await client.chat("warmup")
         with pytest.raises(LLMBudgetExceededError):
             await invoke_structured("p", client, {}, SeriesPlan, sc.parse_series_plan_json)
         with pytest.raises(LLMBudgetExceededError):
@@ -158,16 +158,16 @@ def _fake_series_chains(monkeypatch, client):
     ])
 
     async def fake_plan(llm, theme, episodes, episode_sec):
-        await llm.ainvoke("plan")
+        await llm.chat("plan")
         return plan
 
     async def fake_outline(llm, plan_, episode, chapter_sec):
-        await llm.ainvoke("outline")
+        await llm.chat("outline")
         return EpisodeOutline(episode_index=episode.index, title=episode.title,
                               chapters=[sc.ChapterSpec(title="c", est_sec=150)])
 
     async def fake_write(llm, plan_, outline, chapter, ch_no, prev, settings):
-        await llm.ainvoke("chapter")
+        await llm.chat("chapter")
         return ChapterDraft(scenes=[Scene(header="h", narration="口播。")], summary="摘要")
 
     monkeypatch.setattr(sc, "plan_series", fake_plan)
@@ -237,7 +237,7 @@ def test_cli_series_rejects_absurd_bounds(monkeypatch, tmp_path):
 # ---------- Web ----------
 
 def test_web_series_estimate_endpoints(tmp_path):
-    client = TestClient(create_app(_settings(tmp_path, llm_max_calls_per_run=50)))
+    client = TestClient(create_app(_settings(tmp_path, llm_max_calls_per_run=50)), base_url="http://localhost")
     r = client.get("/api/series/estimate", params={"episodes": 2, "duration_min": 10})
     assert r.status_code == 200
     d = r.json()
@@ -252,7 +252,7 @@ def test_web_series_estimate_endpoints(tmp_path):
 
 
 def test_web_job_bounds_match_cli(tmp_path):
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = TestClient(create_app(_settings(tmp_path)), base_url="http://localhost")
     r = client.post("/api/jobs", json={"mode": "series", "episodes": SERIES_MAX_EPISODES + 1})
     assert r.status_code == 422
     r = client.post("/api/jobs", json={"mode": "series", "duration_min": SERIES_MAX_EPISODE_MIN + 1})

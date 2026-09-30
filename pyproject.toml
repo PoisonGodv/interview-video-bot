@@ -32,7 +32,7 @@ ivb = "interview_video.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-interview_video = ["templates/*.html", "static/*.html"]
+interview_video = ["templates/*.html", "static/*.html", "data/*.json"]
 
 [tool.setuptools.dynamic]
 version = {attr = "interview_video.__version__"}

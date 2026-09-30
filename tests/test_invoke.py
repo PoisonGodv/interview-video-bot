@@ -5,8 +5,8 @@ import pytest
 from pydantic import BaseModel
 
 from interview_video.chains import parse_json_lenient
-from interview_video.chains._invoke import _fatal_llm_error, invoke_structured, invoke_text
-from interview_video.llm import AuthenticationError, ChatResponse, fake_chat_model
+from interview_video.chains._invoke import invoke_structured, invoke_text
+from interview_video.llm import AuthenticationError, fake_chat_model, is_fatal_error
 from interview_video.prompts import ChatPromptTemplate
 
 GOOD = '{"name": "正常"}'
@@ -60,36 +60,17 @@ async def test_invoke_structured_falls_back_to_text():
     assert item.name == "正常"
 
 
-class _StubStructuredLLM:
-    """模拟 provider with_structured_output 报错并包含 raw 文本。"""
-
-    def __init__(self, bad_text: str = BAD, fixed_text: str = GOOD) -> None:
-        self.bad_text = bad_text
-        self.fixed_text = fixed_text
-
-    async def ainvoke(self, messages, **kwargs):
-        return ChatResponse(content=self.fixed_text)
-
-    def with_structured_output(self, schema, **kwargs):
-        return lambda payload: {
-            "raw": self.bad_text,
-            "parsed": None,
-            "parsing_error": ValueError("输出与 schema 不匹配"),
-        }
+def _parse_nm(text: str) -> _Item:
+    """宽松回退解析: 接受 {"nm": ...} 旧字段名(schema 校验必然失败, 只有回退能救)。"""
+    return _Item(name=parse_json_lenient(text)["nm"])
 
 
-async def test_invoke_structured_local_reparse_zero_cost():
-    """raw 文本本身可解析 → 本地重解析成功, 不再调 LLM。"""
-    stub = _StubStructuredLLM(bad_text=GOOD)
-    item = await invoke_structured(PROMPT, stub, {"x": "测试"}, _Item, _parse, stage="t")
+async def test_invoke_structured_boundary_failure_rescued_by_fallback_parser():
+    """边界检查 + 自修复均失败 → fallback_parser 对原始输出本地重解析救回, 不再多调 LLM。"""
+    llm = fake_chat_model(['{"nm": "正常"}', '{"nm": "正常"}'])
+    item = await invoke_structured(PROMPT, llm, {"x": "测试"}, _Item, _parse_nm, stage="t")
     assert item.name == "正常"
-
-
-async def test_invoke_structured_repair_reask():
-    """raw 不可解析 → 修复重问一次, 用 ainvoke 的输出。"""
-    stub = _StubStructuredLLM(bad_text=BAD, fixed_text=GOOD)
-    item = await invoke_structured(PROMPT, stub, {"x": "测试"}, _Item, _parse, stage="t")
-    assert item.name == "正常"
+    assert len(llm.call_history) == 2  # 首次 + 一次边界修复重问
 
 
 async def test_invoke_structured_self_repair_via_boundary():
@@ -101,26 +82,61 @@ async def test_invoke_structured_self_repair_via_boundary():
 
 # ---------- 异常分类 ----------
 
-def test_fatal_llm_error():
-    # 原生错误
-    assert _fatal_llm_error(AuthenticationError("401")) is True
-    assert _fatal_llm_error(ValueError("普通错误")) is False
-    assert _fatal_llm_error(Exception()) is False
+def test_is_fatal_error_only_native_types():
+    assert is_fatal_error(AuthenticationError("401")) is True
+    assert is_fatal_error(ValueError("普通错误")) is False
+    assert is_fatal_error(Exception()) is False
 
-
-def test_fatal_llm_error_with_openai_shim(monkeypatch: pytest.MonkeyPatch):
-    import sys
-    import types
-
-    # 模拟外部库抛出的 AuthenticationError
-    fake_mod = types.ModuleType("openai")
-
-    class _FakeAuthError(Exception):
+    class AuthenticationError_(Exception):
         pass
 
-    fake_mod.AuthenticationError = _FakeAuthError
-    monkeypatch.setitem(sys.modules, "openai", fake_mod)
-    assert _fatal_llm_error(_FakeAuthError("401")) is True
+    AuthenticationError_.__name__ = "AuthenticationError"
+    assert is_fatal_error(AuthenticationError_("同名外部异常")) is False  # 不再按类名鸭子匹配
+
+
+class _FatalLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, **kwargs):
+        self.calls += 1
+        raise AuthenticationError("401")
+
+
+async def test_fatal_error_fails_fast_in_both_layers():
+    for call in (
+        lambda llm: invoke_structured(PROMPT, llm, {"x": "测试"}, _Item, _parse, stage="t"),
+        lambda llm: invoke_text(PROMPT, llm, {"x": "测试"}, _parse, stage="t"),
+    ):
+        llm = _FatalLLM()
+        with pytest.raises(RuntimeError, match="鉴权"):
+            await call(llm)
+        assert llm.calls == 1  # 不修复重问、不回退
+
+
+# ---------- 边界规则由调用方显式传入 ----------
+
+_NARR = "这是一段足够长的口播文案, 用来满足每个场景六十五到一百一十字的口播长度要求, 同时保持口语化表达, 让观众听得懂记得住, 继续补充一些内容凑够字数。"
+
+
+async def test_boundary_rules_explicit_per_caller():
+    from interview_video.boundary import BoundaryRules
+    from interview_video.models import ChapterDraft
+
+    draft = ChapterDraft.model_validate(
+        {"scenes": [{"kind": "point", "header": "开场", "narration": _NARR}], "summary": "摘要"}
+    ).model_dump_json()
+    parse = ChapterDraft.model_validate_json
+
+    llm = fake_chat_model([draft])
+    out = await invoke_structured(
+        "p", llm, {}, ChapterDraft, parse, stage="t", boundary_rules=BoundaryRules.non_script()
+    )
+    assert len(out.scenes) == 1 and len(llm.call_history) == 1
+
+    llm = fake_chat_model([draft, draft])  # 默认完整脚本规则: 1 镜/无 ending → 触发修复重问
+    await invoke_structured("p", llm, {}, ChapterDraft, parse, stage="t")
+    assert len(llm.call_history) == 2
 
 
 # ---------- 红线闸门: 回退解析结果同样重扫 ----------
@@ -138,10 +154,13 @@ async def test_invoke_text_redline_gate():
 
 
 async def test_invoke_structured_local_reparse_redline_gate():
-    """结构化桩 raw 可本地解析但命中红线 → 不得绕过闸门。"""
-    stub = _StubStructuredLLM(bad_text=REDLINE)
-    with pytest.raises(ValueError, match="红线"):
-        await invoke_structured(PROMPT, stub, {"x": "测试"}, _Item, _parse, stage="t")
+    """边界失败后本地回退解析救回的结果命中红线 → 不得绕过闸门。"""
+    from interview_video.chains._invoke import RedlineGateError
+
+    bad = '{"nm": "跟着学三天包过"}'
+    llm = fake_chat_model([bad, bad])
+    with pytest.raises(RedlineGateError, match="红线"):
+        await invoke_structured(PROMPT, llm, {"x": "测试"}, _Item, _parse_nm, stage="t")
 
 
 async def test_invoke_structured_boundary_fallback_redline_gate():

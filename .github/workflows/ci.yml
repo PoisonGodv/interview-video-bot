@@ -6,8 +6,12 @@ on:
   pull_request:
   workflow_dispatch: {}
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,9 +19,43 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          cache-dependency-glob: uv.lock
       - name: Install deps
-        run: uv sync --extra dev
+        run: uv sync --extra dev --python 3.12
       - name: Lint (ruff)
         run: uv run ruff check src tests
-      - name: Test (offline unit tests)
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install deps
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+      - name: Test (offline unit tests; integration skipped)
         run: uv run pytest -q
+
+  integration-ffmpeg:
+    # 只跑依赖本地 ffmpeg 的集成测试(lavfi 造素材, 不联网/不起浏览器)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install deps
+        run: uv sync --extra dev --python 3.12
+      - name: Test (ffmpeg integration)
+        run: uv run pytest -q --run-integration tests/test_assemble.py tests/test_content_features.py

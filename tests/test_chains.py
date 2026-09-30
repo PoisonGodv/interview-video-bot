@@ -151,7 +151,7 @@ def test_fix_script_narration_empty_raises():
 
 
 def test_generate_topics_fallback():
-    """假模型不支持 with_structured_output(NotImplementedError) → 回退 JSON 路径。"""
+    """假模型走边界主路径: prompt→fake→JSON 解析→Topic。"""
     topics = [
         {
             "title": f"选题{i}",
