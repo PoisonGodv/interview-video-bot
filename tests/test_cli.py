@@ -197,6 +197,7 @@ def test_main_short_error_no_traceback(monkeypatch: pytest.MonkeyPatch, capsys, 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("IVB_DEBUG", raising=False)
     monkeypatch.setattr("sys.argv", ["ivb", "topics", "-n", "2"])
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")  # 过前置检查, 走到顶层兜底
 
     def _no_llm(settings, audit=None):
         raise RuntimeError("未配置 LLM_API_KEY(测试注入)")
@@ -333,7 +334,7 @@ def test_generate_tts_and_voice_routing(
 ) -> None:
     from interview_video import cli as cli_mod
 
-    base = Settings(_env_file=None, out_root=tmp_path)
+    base = Settings(_env_file=None, out_root=tmp_path, llm_api_key="sk-test")
     monkeypatch.setattr(cli_mod, "load_settings", lambda: base)
     seen: dict = {}
 
@@ -507,3 +508,41 @@ def test_cli_upload_refuses_without_force(
     assert r.exit_code == 1 and "--force" in r.output and len(fake_uploader) == 1
     r = runner.invoke(app, ["upload", str(d), "-y", "--force"])
     assert r.exit_code == 0 and "BV2" in r.output
+
+
+# ---------- 无 key 前置检查 / --sample ----------
+
+
+def test_generate_without_key_fails_before_mkdir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from interview_video import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_settings", lambda: Settings(_env_file=None, out_root=tmp_path / "o"))
+    out_dir = tmp_path / "o" / "x"
+    result = runner.invoke(app, ["generate", "--topic", "自我介绍", "--out", str(out_dir)])
+    assert result.exit_code == 2
+    assert "LLM_API_KEY" in result.output and "--sample" in result.output
+    assert not out_dir.exists()
+
+
+def test_topics_and_series_without_key_exit_2(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from interview_video import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_settings", lambda: Settings(_env_file=None, out_root=tmp_path))
+    r = runner.invoke(app, ["topics", "-n", "2"])
+    assert r.exit_code == 2 and "LLM_API_KEY" in r.output
+    r = runner.invoke(app, ["series", "主题", "--yes"])
+    assert r.exit_code == 2 and "LLM_API_KEY" in r.output
+
+
+def test_generate_sample_without_key(fake_media: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from interview_video import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_settings", lambda: Settings(_env_file=None, out_root=tmp_path))
+    out_dir = tmp_path / "demo"
+    result = runner.invoke(app, ["generate", "--sample", "--out", str(out_dir)])
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "final.mp4").exists()
+    flat = "".join(result.output.split()).replace("│", "")
+    assert "--regen-meta" in flat  # 无 key 元数据降级时提示补生成命令
+    r = runner.invoke(app, ["generate", "--sample", "--script-file", str(SAMPLE_SCRIPT)])
+    assert r.exit_code == 2

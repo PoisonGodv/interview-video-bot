@@ -100,3 +100,45 @@ async def test_legacy_sidecar_without_voice_key_still_hits(tmp_path: Path, monke
     }), encoding="utf-8")
     media = await tts_mod.synthesize_scenes(_script("口播。"), scenes_dir, Settings(_env_file=None))
     assert media[0].duration == 2.0
+
+
+async def test_duration_uses_audio_length_when_cues_short(tmp_path: Path, monkeypatch):
+    """cue 只覆盖一小段音频: 时长按音频算, 字幕改用估算, 不截断口播。"""
+    async def fake_synth(index, text, mp3_path, settings, provider=None):
+        mp3_path.write_bytes(b"FAKE_MP3")
+        return [Cue(start=0.0, end=1.0, text="字幕")]
+
+    monkeypatch.setattr(tts_mod, "_synthesize_with_retry", fake_synth)
+    monkeypatch.setattr(tts_mod, "_probe_audio_duration", lambda p: 10.0)
+    media = await tts_mod.synthesize_scenes(
+        _script("第一句口播。第二句口播。"), tmp_path / "scenes", Settings(_env_file=None)
+    )
+    assert media[0].duration == 10.0 + tts_mod._TAIL_PAD
+    assert media[0].cues[-1].end == 10.0
+
+
+async def test_cached_duration_corrected_by_audio_length(tmp_path: Path, monkeypatch):
+    """旧缓存 duration 比 mp3 短: 命中缓存时按音频修正。"""
+    scenes_dir = tmp_path / "scenes"
+    scenes_dir.mkdir()
+    mp3 = scenes_dir / "scene_000.mp3"
+    mp3.write_bytes(b"FAKE_MP3")
+    settings = Settings(_env_file=None)
+    tts_mod._save_scene_cache(
+        mp3, "口播。", [Cue(start=0.0, end=1.5, text="口播")], 1.9,
+        tts_mod._voice_key(settings.tts_provider, settings),
+    )
+    monkeypatch.setattr(tts_mod, "_probe_audio_duration", lambda p: 6.0)
+    media = await tts_mod.synthesize_scenes(_script("口播。"), scenes_dir, settings)
+    assert media[0].duration == 6.0 + tts_mod._TAIL_PAD
+
+
+async def test_duration_falls_back_to_cues_without_ffprobe(tmp_path: Path, monkeypatch):
+    async def fake_synth(index, text, mp3_path, settings, provider=None):
+        mp3_path.write_bytes(b"FAKE_MP3")
+        return [Cue(start=0.0, end=1.5, text="字幕")]
+
+    monkeypatch.setattr(tts_mod, "_synthesize_with_retry", fake_synth)
+    monkeypatch.setattr(tts_mod, "_probe_audio_duration", lambda p: None)
+    media = await tts_mod.synthesize_scenes(_script("口播。"), tmp_path / "s", Settings(_env_file=None))
+    assert media[0].duration == 1.5 + tts_mod._TAIL_PAD

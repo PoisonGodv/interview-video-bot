@@ -70,3 +70,46 @@ def test_exclusion_only_masks_overlapping_span():
 def test_negated_promise_passes_but_affirmative_blocks():
     assert scan_redlines("谁能保证一次过呢") == []
     assert "包过承诺" in scan_redlines("我们能保证一次过")
+
+
+# ---- G06: 扩展红线语料(必须拦截 / 必须放行) ----
+MUST_CATCH = [
+    ("应届生月薪过万不是梦", "编造薪资数字"),
+    ("起薪一般在8k左右", "编造薪资数字"),
+    ("年薪轻松百万", "编造薪资数字"),
+    ("保证你能过面试", "包过承诺"),
+    ("跟着练肯定能拿offer", "包过承诺"),
+    ("包你上岸", "包过承诺"),
+    ("女生不适合做程序员", "歧视性表述"),
+    ("35岁以上基本没人要", "歧视性表述"),
+    ("大专生不要投大厂", "歧视性表述"),
+    ("加我微信领取资料", "私域引流"),
+    ("V我领取面试题库", "私域引流"),
+    ("私信领取简历模板", "私域引流"),
+    ("评论区扣1进群", "私域引流"),
+    ("vx号在主页", "私域引流"),
+]
+
+MUST_PASS = [
+    "35岁不要焦虑",
+    "35岁不要焦虑，经验就是优势",
+    "女生不要自卑，技术面前人人平等",
+    "谁说女生不适合做程序员",
+    "别信35岁没人要这种说法",
+    "薪资因城市和公司差异较大",
+    "月薪多少因城市而异，建议查公开数据",
+    "没人能保证你一定能过面试",
+    "关注我，评论区交流你的面试经历",
+    "融入群体很重要",
+    "可以用微信支付报名费吗",
+]
+
+
+def test_expanded_redline_corpus_catches():
+    for text, rule in MUST_CATCH:
+        assert rule in scan_redlines(text), text
+
+
+def test_expanded_redline_corpus_passes():
+    for text in MUST_PASS:
+        assert scan_redlines(text) == [], (text, scan_redlines(text))

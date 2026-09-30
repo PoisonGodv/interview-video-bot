@@ -337,6 +337,7 @@ async def test_pipeline_topic_title_reuses_backlog_details(fake_media, tmp_path:
 def _cli_settings(monkeypatch, tmp_path: Path, **kw) -> Settings:
     from interview_video import cli as cli_mod
 
+    kw.setdefault("llm_api_key", "sk-test")  # LLM/流水线已打桩, 过「需 LLM」前置检查
     s = _s(tmp_path, **kw)
     monkeypatch.setattr(cli_mod, "load_settings", lambda: s)
     return s

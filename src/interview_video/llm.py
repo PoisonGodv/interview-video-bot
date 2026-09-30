@@ -507,13 +507,26 @@ def _audit_from_run_context() -> LLMCallAudit | None:
     return ctx.audit if ctx is not None else None
 
 
+def missing_key_message(settings: Settings) -> str:
+    """未配 LLM_API_KEY 时的指引: 指向实际读取的 .env(没有则提示 ivb init)与免 key 冒烟。"""
+    from .config import user_env_file
+
+    env = settings._env_path
+    where = (
+        f"编辑 {env} 填写 LLM_API_KEY(及 LLM_BASE_URL/LLM_MODEL)"
+        if env is not None
+        else f"尚无配置文件: 运行 ivb init 生成 {user_env_file()} 后填写 LLM_API_KEY"
+    )
+    return (
+        f"未配置 LLM_API_KEY(任意 OpenAI 兼容服务)。{where}; "
+        "只想免 key 试跑: ivb generate --sample(或 --script-file <脚本.json>)"
+    )
+
+
 def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTTPChatClient:
     """根据 settings 构建真实模型客户端 (支持主备模型降级)。"""
-    if settings.llm_api_key is None or not settings.llm_api_key.get_secret_value().strip():
-        raise RuntimeError(
-            "未配置 LLM_API_KEY(任意 OpenAI 兼容服务)。"
-            "请 cp .env.example .env 并填写 LLM_API_KEY/LLM_BASE_URL/LLM_MODEL"
-        )
+    if not settings.llm_ready():
+        raise RuntimeError(missing_key_message(settings))
 
     if audit is None:
         audit = _audit_from_run_context()

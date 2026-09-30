@@ -123,6 +123,18 @@ def format_validation_error(exc: ValidationError) -> str:
     return "; ".join(parts)
 
 
+# 免 LLM 冒烟脚本: 随包分发(package data), 源码仓库里退回 examples/ 原件
+SAMPLE_SCRIPT_CANDIDATES = (
+    Path(__file__).parent / "data" / "sample_script.json",
+    Path(__file__).resolve().parents[2] / "examples" / "sample_script.json",
+)
+
+
+def sample_script_path() -> Path | None:
+    """内置示例脚本(ivb generate --sample / Web「用示例脚本」); 安装包不完整时返回 None。"""
+    return next((p for p in SAMPLE_SCRIPT_CANDIDATES if p.is_file()), None)
+
+
 def load_script_file(path: Path | str) -> Script:
     """读取并校验脚本 JSON; 任何问题都转成带绝对路径与字段位置的 ScriptFileError。"""
     p = Path(path).expanduser()

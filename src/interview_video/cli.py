@@ -16,7 +16,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from . import __version__
-from .config import Settings, describe_paths, load_settings
+from .config import ConfigError, Settings, describe_paths, load_settings
 from .estimate import SERIES_MAX_EPISODE_MIN, SERIES_MAX_EPISODES, SERIES_MIN_EPISODE_MIN
 from .graph import (
     PIPELINE_STAGES,
@@ -50,6 +50,29 @@ def _root(
     ),
 ) -> None:
     """AI 面试求职短视频流水线: 选题 → 脚本 → TTS → 渲染 → 合成 → B站。"""
+
+
+def _settings_or_exit() -> Settings:
+    """load_settings; .env 校验失败时逐字段打印(环境变量名 + 原因 + .env 路径)并退出 2。"""
+    try:
+        return load_settings()
+    except ConfigError as exc:
+        where = str(exc.env_path) if exc.env_path else "(未找到 .env, 来自进程环境变量)"
+        console.print(f"[bold red]配置有误[/], 请修改 {where}:")
+        for line in exc.lines:
+            console.print(f"  [red]-[/] {line}")
+        console.print("[dim]改完可运行 ivb doctor 复查[/]")
+        raise typer.Exit(2) from None
+
+
+def _require_llm(settings: Settings) -> None:
+    """需要 LLM 的操作在建目录/花钱之前检查 key, 给出指向实际 .env 的指引。"""
+    if settings.llm_ready():
+        return
+    from .llm import missing_key_message
+
+    console.print(f"[bold red]{missing_key_message(settings)}[/]")
+    raise typer.Exit(2)
 
 
 def _announce_paths(settings: Settings) -> None:
@@ -254,7 +277,7 @@ def topics(
 
     选题库 output/topics_backlog.json: 已有标题会作为「需避开」传给 LLM, 生成视频后自动标记已用。
     """
-    settings = load_settings()
+    settings = _settings_or_exit()
     from . import backlog as backlog_mod
 
     if list_ or next_:
@@ -281,7 +304,8 @@ def topics(
     from .chains import topic as topic_mod
     from .llm import get_chat_model
 
-    llm = get_chat_model(settings)  # 未配 key 直接抛错, 不静默失败
+    _require_llm(settings)
+    llm = get_chat_model(settings)
     avoid = backlog_mod.avoid_titles(settings, industry)
     result: list[Topic] = asyncio.run(
         topic_mod.generate_topics(llm, industry, n, avoid=avoid or None)
@@ -308,6 +332,9 @@ def generate(
     ),
     topic: str | None = typer.Option(None, "--topic", "-t", help="选题标题提示"),
     script_file: Path | None = typer.Option(None, "--script-file", help="跳过 LLM, 直接用现成脚本 JSON"),
+    sample: bool = typer.Option(
+        False, "--sample", help="用内置示例脚本冒烟(免 LLM key), 等同 --script-file <内置 sample_script.json>",
+    ),
     tts: str | None = typer.Option(None, "--tts", help=_TTS_HELP),
     voice: str | None = typer.Option(None, "--voice", help=_VOICE_HELP),
     out: Path | None = typer.Option(None, "--out", "-o", help="输出目录(默认 output/<slug>-<YYYYmmdd-HHMM>/)"),
@@ -327,7 +354,17 @@ def generate(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="BILI_UPLOAD_ENABLED 时跳过上传确认"),
 ) -> None:
-    """跑完整流水线生成视频。--script-file 模式全程不需要 LLM key。"""
+    """跑完整流水线生成视频。--sample / --script-file 模式全程不需要 LLM key。"""
+    if sample:
+        if script_file is not None or resume is not None:
+            console.print("[red]--sample 不能与 --script-file / --resume 同时使用[/]")
+            raise typer.Exit(2)
+        from .models import sample_script_path
+
+        script_file = sample_script_path()
+        if script_file is None:
+            console.print("[red]内置示例脚本 sample_script.json 缺失(安装包不完整)[/]")
+            raise typer.Exit(2)
     if stop_after is not None and stop_after not in STOP_AFTER_CHOICES:
         console.print(f"[red]--stop-after 仅支持: {', '.join(STOP_AFTER_CHOICES)}[/]")
         raise typer.Exit(2)
@@ -337,7 +374,7 @@ def generate(
     dtime = _parse_publish_at(publish_at)  # 先校验, 不合法时不白跑流水线
     if script_file is not None:
         _load_script_or_exit(script_file)  # 坏脚本在建目录/跑流水线前就报出来
-    settings = load_settings()
+    settings = _settings_or_exit()
     _apply_tts(settings, tts, voice)
     _apply_video(settings, aspect, bgm)
     _announce_paths(settings)
@@ -356,6 +393,8 @@ def generate(
     else:
         out_dir = Path(out) if out else _default_out_dir(settings, script_file, topic, industry or "互联网")
     industry = industry or (resume_industry(out_dir) if resume is not None else None) or "互联网"
+    if script_file is None and preset is None:
+        _require_llm(settings)  # 要写脚本却没 key: 在建目录前就停下
     out_dir.mkdir(parents=True, exist_ok=True)
     console.print(f"[bold]输出目录:[/] {out_dir.resolve()}")
     run_started = datetime.now()
@@ -420,7 +459,10 @@ def generate(
     meta_error = (manifest.generation or {}).get("meta_error")
     if manifest.meta is None:
         reason = meta_error or "未知原因"
-        lines += ["", f"[yellow]BiliMeta: 未生成(已降级: {reason})[/]"]
+        lines += [
+            "", f"[yellow]BiliMeta: 未生成(已降级: {reason})[/]",
+            f"[dim]配好 LLM 后补生成元数据(不重做音视频): ivb generate --resume {out_dir} --regen-meta[/]",
+        ]
     elif meta_error:
         lines += [f"[yellow]元数据重新生成失败, 沿用旧版: {meta_error}[/]"]
     usage = _usage_line(out_dir, since=run_started)
@@ -567,7 +609,7 @@ def batch(
             console.print(f"[red]--start 格式应为 YYYY-mm-dd, 收到 {start!r}[/]")
             raise typer.Exit(2) from None
 
-    settings = load_settings()
+    settings = _settings_or_exit()
     _apply_tts(settings, tts, voice)
     _apply_video(settings, aspect, bgm)
     _announce_paths(settings)
@@ -624,6 +666,10 @@ def _batch_run(
     if not items:
         console.print("[yellow]选题库没有未用选题, 先运行 ivb topics -i <行业> 生成[/]")
         raise typer.Exit(1)
+    if any(
+        not (item.project and (Path(item.project) / "script.json").is_file()) for item in items
+    ):
+        _require_llm(settings)  # 有选题要写脚本: 未配 key 时一条都不跑, 也不计失败次数
     console.print(f"[bold]批量生成 {len(items)} 条[/](选题库剩余 {len(remaining)} 条)")
 
     rows: list[tuple[str, str, str, str]] = []
@@ -734,7 +780,7 @@ def upload(
 ) -> None:
     """读 project.json 上传 B站(需 BILI_UPLOAD_ENABLED + cookie 三件套); 成功后写 upload.json。"""
     dtime = _parse_publish_at(publish_at)
-    settings = load_settings()
+    settings = _settings_or_exit()
     if not yes:
         typer.confirm(f"确认上传 {project_dir} 到B站?", abort=True)
     _upload(project_dir, settings, force=force, dtime=dtime)
@@ -767,7 +813,7 @@ def series(
     dry_run: bool = typer.Option(False, "--dry-run", help="只打印费用预估, 不调用 LLM/TTS"),
 ) -> None:
     """多 agent 系列长视频: 一个主题 → N 集 × M 分钟(策划/编剧/章节写手/审稿)。"""
-    settings = load_settings()
+    settings = _settings_or_exit()
     _apply_tts(settings, tts, voice)
     _apply_video(settings, aspect, bgm)
     _announce_paths(settings)
@@ -787,6 +833,7 @@ def series(
         console.print(Panel("\n".join(est.lines()), title="费用预估(粗估)", border_style="cyan"))
         if dry_run:
             return
+        _require_llm(settings)
         if not yes and not typer.confirm("按以上预估开始生成?"):
             raise typer.Abort()
     elif dry_run:
@@ -899,7 +946,7 @@ def eval(
     out: Path | None = typer.Option(None, "--out", "-o", help="报告 JSON 落盘路径"),
 ) -> None:
     """生成质量评测: 真实模型跑 golden 用例 → 契约/红线检查(+可选 judge)。"""
-    settings = load_settings()
+    settings = _settings_or_exit()
     from .evals import GOLDEN_CASES, run_evals
 
     report = asyncio.run(run_evals(settings, GOLDEN_CASES[:limit], judge=judge))
@@ -949,9 +996,14 @@ def doctor(
     """环境自检: ffmpeg/ffprobe、chromium、中文字体、.env、LLM/TTS/B站配置。"""
     from . import doctor as doctor_mod
 
-    settings = load_settings()
-    checks = doctor_mod.run_doctor(settings)
-    if ping and settings.llm_ready():
+    try:
+        settings = load_settings()
+    except ConfigError as exc:  # 配置坏了也照常查二进制/浏览器/字体, 配置项逐条 FAIL
+        settings = None
+        checks = doctor_mod.run_doctor_with_config_error(exc)
+    else:
+        checks = doctor_mod.run_doctor(settings)
+    if ping and settings is not None and settings.llm_ready():
         checks.append(asyncio.run(doctor_mod.ping_llm(settings)))
     for c in checks:
         mark = "[green]OK[/]" if c.ok else ("[red]FAIL[/]" if c.required else "[yellow]WARN[/]")
@@ -971,7 +1023,7 @@ def web(
 
     from .web import access_urls, create_app
 
-    settings = load_settings()
+    settings = _settings_or_exit()
     _announce_paths(settings)
     web_app = create_app(settings, host=host)
     token = web_app.state.web_token

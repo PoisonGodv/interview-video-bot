@@ -279,6 +279,27 @@ class BoundaryChecker:
                                 )
                             )
 
+                for fname, limit in (
+                    ("question", rules.max_question_chars),
+                    ("answer", rules.max_answer_chars),
+                ):
+                    fval = (
+                        getattr(scene, fname, None)
+                        if hasattr(scene, fname)
+                        else (scene.get(fname) if isinstance(scene, dict) else None)
+                    )
+                    if fval and len(str(fval)) > limit:
+                        label = "面试问题" if fname == "question" else "答案要点"
+                        violations.append(
+                            Violation(
+                                category="length",
+                                field=f"scenes[{i}].{fname}",
+                                message=f"场景 {i+1} {label}超长: 当前 {len(str(fval))} 字 (上限 {limit} 字)",
+                                value=str(fval),
+                                fix_hint=f"屏显{label} {fname} 必须 <= {limit} 字，请精简(细节放进口播)。",
+                            )
+                        )
+
                 narration = (
                     getattr(scene, "narration", None)
                     if hasattr(scene, "narration")
@@ -398,3 +419,41 @@ class BoundaryChecker:
                         pass
 
         return violations
+
+
+# 元数据长度上限(与 chains.metadata / bilibili 保持一致)
+META_MAX_TITLE_CHARS = 80
+META_MAX_DESC_CHARS = 2000
+META_MAX_TAGS = 10
+
+
+def _fmt_violation(v: Violation) -> str:
+    hint = f" -> {v.fix_hint}" if v.fix_hint else ""
+    return f"[{v.field}] {v.message}{hint}"
+
+
+def lint_script(script: Any, rules: BoundaryRules | None = None) -> list[str]:
+    """人工编辑/外部导入脚本的非阻断体检: 长度结构 + 业务红线, 返回可读警告列表。"""
+    checker = BoundaryChecker(rules or BoundaryRules())
+    violations = checker.check_length_and_structure(script)
+    if checker.rules.check_redlines:
+        violations.extend(scan_object_redlines(script))
+    return [_fmt_violation(v) for v in violations]
+
+
+def lint_meta(meta: Any) -> list[str]:
+    """投稿元数据(标题/简介/标签)的非阻断体检: 长度 + 业务红线。"""
+    warnings: list[str] = []
+    title = str(getattr(meta, "title", "") or "")
+    desc = str(getattr(meta, "desc", "") or "")
+    tags = list(getattr(meta, "tags", None) or [])
+    if not title.strip():
+        warnings.append("[title] 标题为空")
+    elif len(title) > META_MAX_TITLE_CHARS:
+        warnings.append(f"[title] 标题超长: 当前 {len(title)} 字 (上限 {META_MAX_TITLE_CHARS} 字), 投稿时会被截断")
+    if len(desc) > META_MAX_DESC_CHARS:
+        warnings.append(f"[desc] 简介超长: 当前 {len(desc)} 字 (上限 {META_MAX_DESC_CHARS} 字)")
+    if len(tags) > META_MAX_TAGS:
+        warnings.append(f"[tags] 标签过多: 当前 {len(tags)} 个 (上限 {META_MAX_TAGS} 个), 投稿时会被截断")
+    warnings.extend(_fmt_violation(v) for v in scan_object_redlines(meta))
+    return warnings

@@ -465,3 +465,44 @@ def test_fix_script_deterministic():
     fixed = fix_script_deterministic(script)
     assert len(fixed.scenes[0].narration) <= 110
     assert fixed.scenes[-1].kind == "ending"
+
+
+# ---- G07/G10: 人工脚本/元数据体检 + qa 问答长度 ----
+
+def test_qa_question_answer_length_checked():
+    from interview_video.boundary import BoundaryChecker
+    from interview_video.models import Scene, Script
+
+    script = Script(title="t", scenes=[
+        Scene(kind="qa", header="h", narration="n" * 80, question="问" * 41, answer="答" * 61),
+    ])
+    fields = {v.field for v in BoundaryChecker().check_length_and_structure(script)}
+    assert "scenes[0].question" in fields and "scenes[0].answer" in fields
+
+    ok = Script(title="t", scenes=[
+        Scene(kind="qa", header="h", narration="n" * 80, question="问" * 40, answer="答" * 60),
+    ])
+    fields = {v.field for v in BoundaryChecker().check_length_and_structure(ok)}
+    assert not {"scenes[0].question", "scenes[0].answer"} & fields
+
+
+def test_lint_script_reports_redlines_and_length():
+    from interview_video.boundary import lint_script
+    from interview_video.models import Scene, Script
+
+    script = Script(title="t", scenes=[
+        Scene(kind="point", header="超长的画面标题超过十二个字了", narration="加我微信领取资料。" * 8),
+    ])
+    warnings = lint_script(script)
+    joined = "\n".join(warnings)
+    assert "私域引流" in joined and "scenes[0].header" in joined and "分镜数量不足" in joined
+
+
+def test_lint_meta_reports_redlines_and_length():
+    from interview_video.boundary import lint_meta
+    from interview_video.models import BiliMeta
+
+    warnings = lint_meta(BiliMeta(title="包你上岸" + "字" * 80, desc="x", tags=["t"] * 11))
+    joined = "\n".join(warnings)
+    assert "包过承诺" in joined and "标题超长" in joined and "标签过多" in joined
+    assert lint_meta(BiliMeta(title="面试自我介绍怎么说", desc="好内容", tags=["面试"])) == []

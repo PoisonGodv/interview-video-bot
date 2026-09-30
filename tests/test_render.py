@@ -190,3 +190,24 @@ def test_render_project_screenshots(script, settings, tmp_path):
     # scenes/scene_%03d.png 命名
     assert [p.name for p in result.frames] == ["scene_000.png", "scene_001.png", "scene_002.png"]
     assert result.frames[0].parent.name == "scenes"
+
+
+def test_qa_html_long_text_steps_down_font(script, settings):
+    """超长问题/答案: 加 len-l 类(字号下调 + 行数截断), 短文本不加。"""
+    qa_scene = next(s for s in script.scenes if s.kind == "qa").model_copy(
+        update={"question": "问" * 45, "answer": "答" * 70}
+    )
+    html = _render_html(
+        _build_env(), "qa.html",
+        brand=settings.brand, title=script.title, script=script,
+        scene=qa_scene, index=1, total=len(script.scenes),
+    )
+    assert html.count('class="body len-l"') == 2
+    assert "-webkit-line-clamp" in html
+    short = qa_scene.model_copy(update={"question": "为什么离职？", "answer": "讲成长"})
+    html = _render_html(
+        _build_env(), "qa.html",
+        brand=settings.brand, title=script.title, script=script,
+        scene=short, index=1, total=len(script.scenes),
+    )
+    assert 'class="body"' in html and "len-l" not in html.split("</style>")[-1]

@@ -43,7 +43,19 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def _isolated_out_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """默认 OUT_ROOT 指向本测试的 tmp_path/output: 选题库/日志等旁路写入不落到仓库或用户目录。"""
+    """测试密封: 不读开发者真实 .env / 进程环境, 旁路写入不落到仓库或用户目录。
+
+    - cwd 切到 tmp_path(``./.env`` 不存在); IVB_CONFIG_DIR 指向空目录(用户级 .env 不存在);
+    - 删掉 IVB_ENV_FILE 与所有 Settings 字段同名(大写)的环境变量, 避免本机 LLM/TTS key 让单测打到真实服务;
+    - OUT_ROOT 指向 tmp_path/output。
+    """
+    monkeypatch.chdir(tmp_path)
+    cfg_dir = tmp_path / "_ivb_config"
+    cfg_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("IVB_CONFIG_DIR", str(cfg_dir))
+    monkeypatch.delenv("IVB_ENV_FILE", raising=False)
+    for field in Settings.model_fields:
+        monkeypatch.delenv(field.upper(), raising=False)
     monkeypatch.setenv("OUT_ROOT", str(tmp_path / "output"))
 
 

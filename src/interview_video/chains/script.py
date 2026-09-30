@@ -12,6 +12,9 @@ from .redlines import RED_LINES
 # narration 字数约束(与 models.Scene.narration 描述一致: 每场景 65~110 字)
 MAX_NARRATION_CHARS = 110
 MIN_NARRATION_CHARS = 65
+# qa 镜屏显字数上限(与 boundary.BoundaryRules.max_question_chars/max_answer_chars 一致)
+MAX_QUESTION_CHARS = 40
+MAX_ANSWER_CHARS = 60
 
 # 句末标点(优先截断点) 与 停顿标点(兜底截断点)
 _SENTENCE_END = "。！？!?…"
@@ -124,7 +127,8 @@ def _build_prompt() -> ChatPromptTemplate:
                 "再做关注/下期引导;\n"
                 "- 每镜字段: kind, header(画面标题 <=12字), "
                 "bullets(屏显要点, 每条 <=14字, 0~4 条), narration(口播);\n"
-                "- qa 镜额外填 question(面试问题)与 answer(答案要点屏显);\n"
+                f"- qa 镜额外填 question(面试问题, <={MAX_QUESTION_CHARS}字)与 "
+                f"answer(答案要点屏显, <={MAX_ANSWER_CHARS}字, 细节放进 narration);\n"
                 f"- narration 口语化, 每场景 {MIN_NARRATION_CHARS}~{MAX_NARRATION_CHARS} 字"
                 "(约 15~25 秒), 全片时长向 {target_sec} 秒靠拢;\n"
                 "- 遵守 system 中的内容红线。\n\n"

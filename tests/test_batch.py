@@ -22,6 +22,7 @@ SAMPLE_SCRIPT = Path(__file__).resolve().parents[1] / "src" / "interview_video" 
 
 def _settings(monkeypatch, tmp_path: Path, **kw) -> Settings:
     kw.setdefault("out_root", tmp_path / "output")
+    kw.setdefault("llm_api_key", "sk-test")  # 流水线已打桩; 有 key 才过「写脚本需 LLM」前置检查
     s = Settings(_env_file=None, **kw)
     monkeypatch.setattr(cli_mod, "load_settings", lambda: s)
     return s

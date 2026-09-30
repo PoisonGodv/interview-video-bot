@@ -56,6 +56,8 @@ _RETRY_BASE_DELAY = 1.0
 
 # 兜底时长: 最后 cue 结束后再留的余量(秒), 避免画面切太早
 _TAIL_PAD = 0.4
+# 字幕时间轴覆盖音频时长低于该比例时视为不可信, 改用字数估算
+_MIN_CUE_COVERAGE = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +594,8 @@ async def synthesize_scenes(
 
     幂等缓存: mp3 与旁车 scene_%03d.cues.json 都在、且口播文本指纹与
     通道/音色键一致时直接复用(备用通道产物不命中主通道, 下次重试主通道)(断点续跑/失败重试不重复付 TTS 费); 删掉 mp3 或改了文本会重合成。
-    duration 兜底 = 最后 cue end + 0.4s; 无 cue 时仅留 0.4s。
+    duration = max(音频实际时长, 最后 cue end) + 0.4s(ffprobe 不可用时退回 cue end);
+    cue 为空或覆盖不足音频 80% 时改用 estimate_cues 按字数估算字幕。
     落盘/渲染的 cue 文本已按 format_display_cues 整理(行尾逗号去掉、行中逗号换空格)。
     """
     scenes_dir.mkdir(parents=True, exist_ok=True)
@@ -603,16 +606,45 @@ async def synthesize_scenes(
         cached = _load_scene_cache(mp3_path, scene.narration, primary_key)
         if cached is not None:
             cues, duration = cached
+            audio_dur = _probe_audio_duration(mp3_path)
+            if audio_dur and audio_dur + _TAIL_PAD > duration:
+                # 旧缓存 duration 只按 cue 末尾算, 可能比音频短(成片截断口播), 按音频修正
+                duration = _scene_duration(cues, audio_dur)
             cues = format_display_cues(cues)  # 旧缓存可能未整理, 幂等
             logger.info("场景 %d TTS 命中缓存, 跳过合成", i)
         else:
             cues, voice_key = await _synthesize_scene(i, scene.narration, mp3_path, settings)
             cues = split_long_cues(cues, settings.subtitle_max_chars)  # edge 超长单词/条再细分
-            duration = cues[-1].end + _TAIL_PAD if cues else _TAIL_PAD
+            audio_dur = _probe_audio_duration(mp3_path)
+            if audio_dur and (not cues or cues[-1].end < _MIN_CUE_COVERAGE * audio_dur):
+                logger.warning(
+                    "场景 %d 字幕时间轴仅覆盖 %.1fs / 音频 %.1fs, 改用按字数估算的字幕",
+                    i, cues[-1].end if cues else 0.0, audio_dur,
+                )
+                cues = estimate_cues(scene.narration, audio_dur, settings.subtitle_max_chars)
+            duration = _scene_duration(cues, audio_dur)
             cues = format_display_cues(cues)
             _save_scene_cache(mp3_path, scene.narration, cues, duration, voice_key)
         media.append(SceneMedia(index=i, mp3=mp3_path, cues=cues, duration=duration))
     return media
+
+
+def _probe_audio_duration(mp3_path: Path) -> float | None:
+    """ffprobe 读音频实际时长; ffprobe 缺失/文件不可解析时返回 None(调用方退回 cue 末尾)。"""
+    from .assemble import ffprobe_duration  # 延迟导入, 避免模块级耦合
+
+    try:
+        dur = ffprobe_duration(mp3_path)
+    except Exception as exc:  # noqa: BLE001 - 探测失败不阻断, 只失去校正
+        logger.debug("ffprobe 读取 %s 时长失败: %s", mp3_path, exc)
+        return None
+    return dur if dur > 0 else None
+
+
+def _scene_duration(cues: list[Cue], audio_dur: float | None) -> float:
+    """场景时长 = max(音频时长, 最后 cue end) + 尾部留白, 保证 -t 截断不吃掉口播。"""
+    last_end = cues[-1].end if cues else 0.0
+    return max(audio_dur or 0.0, last_end) + _TAIL_PAD
 
 
 # ---------------------------------------------------------------------------

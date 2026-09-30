@@ -38,9 +38,10 @@ def test_inline_comment_value_becomes_none(tmp_path: Path) -> None:
     assert s.llm_base_url is None and s.bili_jct is None
 
 
-def test_base_url_must_be_http() -> None:
+def test_base_url_scheme_auto_prefixed_or_rejected() -> None:
+    assert Settings(_env_file=None, llm_base_url="api.deepseek.com").llm_base_url == "https://api.deepseek.com"
     with pytest.raises(ValueError, match="http"):
-        Settings(_env_file=None, llm_base_url="api.deepseek.com")
+        Settings(_env_file=None, llm_base_url="ftp://api.deepseek.com")
 
 
 def test_ready_helpers() -> None:
@@ -115,6 +116,7 @@ def _isolate_env(monkeypatch, tmp_path: Path) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("IVB_CONFIG_DIR", raising=False)  # 本组测试走 HOME 下的用户级目录
     monkeypatch.delenv("IVB_ENV_FILE", raising=False)
     monkeypatch.delenv("OUT_ROOT", raising=False)
     monkeypatch.delenv("BRAND", raising=False)
@@ -196,3 +198,80 @@ def test_logging_rotates_and_quiets_noise(tmp_path: Path) -> None:
             if getattr(h, "_ivb_managed", False):
                 root.removeHandler(h)
                 h.close()
+
+
+# ---------- 友好配置错误 / 大小写容错 / DeepSeek base_url ----------
+
+def test_tts_provider_case_and_space_insensitive() -> None:
+    s = Settings(_env_file=None, tts_provider=" Doubao ", tts_fallback_provider="EDGE")
+    assert s.tts_provider == "doubao" and s.tts_fallback_provider == "edge"
+
+
+def test_load_settings_config_error_lists_fields_and_env_path(monkeypatch, tmp_path: Path) -> None:
+    from interview_video.config import ConfigError, load_settings
+
+    _isolate_env(monkeypatch, tmp_path)
+    Path(".env").write_text(
+        "TTS_PROVIDER=azure\nFPS=abc\nLLM_API_KEY=sk-secret-value\n", encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_settings()
+    exc = ei.value
+    assert exc.env_path == (tmp_path / "cwd" / ".env").resolve()
+    assert any(x.startswith("TTS_PROVIDER:") and "azure" in x for x in exc.lines)
+    assert any(x.startswith("FPS:") for x in exc.lines)
+    assert "sk-secret-value" not in str(exc)
+
+
+def test_cli_bad_config_prints_fields_exit_2(monkeypatch, tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from interview_video.cli import app
+
+    _isolate_env(monkeypatch, tmp_path)
+    Path(".env").write_text("TTS_PROVIDER=azure\n", encoding="utf-8")
+    r = CliRunner().invoke(app, ["topics", "--list"])
+    assert r.exit_code == 2 and "TTS_PROVIDER" in r.output and "Traceback" not in r.output
+
+
+def test_doctor_still_runs_with_bad_config(monkeypatch, tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from interview_video.cli import app
+
+    _isolate_env(monkeypatch, tmp_path)
+    Path(".env").write_text("TTS_PROVIDER=azure\n", encoding="utf-8")
+    monkeypatch.setattr(doctor_mod, "check_chromium", lambda: doctor_mod.Check("chromium", True, "x"))
+    r = CliRunner().invoke(app, ["doctor"])
+    assert r.exit_code == 1
+    assert "ffmpeg" in r.output and "中文字体" in r.output
+    assert "FAIL" in r.output and "TTS_PROVIDER" in r.output
+
+
+def test_doctor_warns_deepseek_without_base_url() -> None:
+    checks = {c.name: c for c in doctor_mod.check_config(
+        Settings(_env_file=None, llm_model="deepseek-chat", llm_api_key="k"))}
+    c = checks["LLM_BASE_URL"]
+    assert not c.ok and not c.required and "https://api.deepseek.com" in c.detail
+    ok = {c.name: c for c in doctor_mod.check_config(
+        Settings(_env_file=None, llm_model="gpt-4o-mini", llm_api_key="k"))}
+    assert ok["LLM_BASE_URL"].ok
+
+
+def test_doctor_lists_features_needing_llm_key() -> None:
+    checks = {c.name: c for c in doctor_mod.check_config(Settings(_env_file=None))}
+    detail = checks["LLM_API_KEY"].detail
+    assert "ivb topics" in detail and "ivb batch" in detail and "--sample" in detail
+
+
+def test_missing_key_message_points_to_loaded_env(tmp_path: Path) -> None:
+    from interview_video.llm import get_chat_model, missing_key_message
+
+    s = Settings(_env_file=None)
+    s._env_path = tmp_path / "my.env"
+    msg = missing_key_message(s)
+    assert str(tmp_path / "my.env") in msg and "--sample" in msg and "cp .env.example" not in msg
+    s._env_path = None
+    assert "ivb init" in missing_key_message(s)
+    with pytest.raises(RuntimeError, match="LLM_API_KEY"):
+        get_chat_model(s)

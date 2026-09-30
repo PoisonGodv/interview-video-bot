@@ -210,7 +210,9 @@ def test_cli_series_dry_run_prints_estimate_without_llm(monkeypatch, tmp_path):
 
 
 def test_cli_series_requires_confirmation(monkeypatch, tmp_path):
-    monkeypatch.setattr("interview_video.cli.load_settings", lambda: _settings(tmp_path))
+    monkeypatch.setattr(
+        "interview_video.cli.load_settings", lambda: _settings(tmp_path, llm_api_key="sk-test"),
+    )
     monkeypatch.setattr("interview_video.doctor.preflight", lambda s: None)
     ran = []
 

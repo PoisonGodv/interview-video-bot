@@ -5,6 +5,42 @@
 
 ## [Unreleased]
 
+首跑体验: 没 key / 配置写错时早失败、说人话; Web 端可见环境检查与失败原因。
+
+### 新增
+
+- `ivb generate --sample`: 用内置示例脚本冒烟(免 LLM key), 不必再找 `examples/sample_script.json` 路径。
+- Web 首页「环境检查」卡片(复用 `/api/doctor`): 只列 FAIL/WARN 及提示, 必需项失败时标红并自动展开;
+  未配置 LLM 时自动勾选「用示例脚本」并给出说明。
+- Web 作品库详情: 元数据降级/重生成失败时显示 `meta_error` 与补生成命令
+  `ivb generate --resume <目录> --regen-meta`(接口字段 `meta_error` / `regen_meta_cmd`)。
+- `ivb doctor`: `LLM_MODEL` 为 deepseek-* 却未配 `LLM_BASE_URL` 时 WARN(建议 `https://api.deepseek.com`);
+  未配 key 时列出不可用的命令/功能。
+
+### 变更
+
+- 未配置 `LLM_API_KEY` 时, `topics` / `generate`(需写脚本时) / `batch`(有选题需写脚本时) / 新建 `series`
+  在创建输出目录前退出(码 2); Web `POST /api/jobs` 非示例脚本任务直接 400, 不再留下空的失败目录。
+  提示指向实际读取的 .env(无配置时提示 `ivb init`), 不再写死 `cp .env.example .env`。
+- `.env` 校验失败时逐字段打印「变量名: 原因(当前值)」与 .env 路径并退出 2(密钥类不回显值);
+  `ivb doctor` 在配置有误时仍检查 ffmpeg/chromium/字体, 并把坏字段列为 FAIL。
+- `TTS_PROVIDER` / `TTS_FALLBACK_PROVIDER` 忽略大小写与首尾空白; `LLM_BASE_URL` 未写协议时自动补 `https://`。
+- Web `/api/topics`: 上游模型/解析失败返回 502 + JSON 原因, 预算超限返回 400; 其它未预期异常统一回 JSON。
+- Web 作品库识别 CLI/批量写的 `error.log`(可点开查看), 失败条目的 `error` 显示首要原因(失败阶段 + 异常行)。
+- README: 安装改为 `make install`(uv sync), 列出 ffmpeg/中文字体前置依赖, `BILI_TID` 示例改为 209。
+- 内容红线扩展: 薪资词后隔修饰字的「月薪过万 / 起薪一般在8k」、「保证你能过面试 / 肯定能拿offer」、
+  「女生不适合 / 35岁以上没人要」等群体否定评价均会拦截; 新增「私域引流」规则(加微信/vx/V我/私信领取/进群)。
+  反驳语境(「谁说女生不适合…」「35岁不要焦虑」)放行。
+- 人工编辑的脚本/元数据做非阻断体检: Web `PUT /api/projects/{name}/script` 与 `/meta` 返回 `warnings`
+  (红线 + 字数/分镜数), 页面黄色逐条提示; `--script-file` / 续跑时脚本体检结果写 WARNING 日志。
+- qa 镜屏显字数上限: `question` <= 40 字、`answer` <= 60 字(写进脚本 prompt 与边界检查);
+  `qa.html` 按文本长度下调字号并限制行数, 超长文字不再顶出画面。
+- 场景时长改为 max(mp3 实际时长, 最后字幕结束) + 0.4s, 不再因 edge 字幕时间轴偏短截掉口播尾巴;
+  字幕时间轴覆盖不足音频 80% 时改用按字数估算; 命中旧缓存时也按音频时长修正。
+- `final.mp4` 与 `project.json` 先写临时文件再原子替换; 续跑开始时旧 `project.json` 改名为
+  `project.prev.json`(成功后删除), 续跑失败/取消的目录不再被当作已完成作品。
+- 测试密封: 单测不再读取本机 `.env` 与 `LLM_*` / `TTS_*` 等环境变量。
+
 ## [0.4.0] - 2026-09-30
 
 可用可好用: 修复 B站真实上传、字幕按原文标点断行、脚本校验与友好报错、续跑保留元数据、红线误杀、

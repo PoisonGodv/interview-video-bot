@@ -15,13 +15,19 @@ from interview_video.web import STAGES, create_app
 
 @pytest.fixture()
 def settings(tmp_path) -> Settings:
-    # _env_file=None: 不读项目根真实 .env, 保证测试无 key 状态确定
-    return Settings(_env_file=None, out_root=tmp_path / "output")
+    # _env_file=None: 不读项目根真实 .env; 假 key 只为过「写脚本需 LLM」前置检查(流水线/LLM 均打桩)
+    return Settings(_env_file=None, out_root=tmp_path / "output", llm_api_key="sk-test")
 
 
 @pytest.fixture()
 def client(settings) -> TestClient:
     return TestClient(create_app(settings), base_url="http://localhost")
+
+
+@pytest.fixture()
+def nokey_client(tmp_path) -> TestClient:
+    s = Settings(_env_file=None, out_root=tmp_path / "output")
+    return TestClient(create_app(s), base_url="http://localhost")
 
 
 @pytest.fixture()
@@ -68,8 +74,8 @@ def test_index(client):
     assert r.status_code == 200 and "操作台" in r.text
 
 
-def test_settings_endpoint(client):
-    d = client.get("/api/settings").json()
+def test_settings_endpoint(nokey_client):
+    d = nokey_client.get("/api/settings").json()
     assert d["llm_configured"] is False
     assert d["doubao_configured"] is False and d["bili_configured"] is False
     assert d["tts_provider"] == "edge"
@@ -78,9 +84,46 @@ def test_settings_endpoint(client):
 
 # ---------- 选题 ----------
 
-def test_topics_requires_llm_key(client):
-    r = client.post("/api/topics", json={"industry": "护理", "n": 3})
+def test_topics_requires_llm_key(nokey_client):
+    r = nokey_client.post("/api/topics", json={"industry": "护理", "n": 3})
     assert r.status_code == 400 and "LLM_API_KEY" in r.json()["detail"]
+
+
+def test_series_job_requires_llm_key_even_with_sample(nokey_client):
+    r = nokey_client.post("/api/jobs", json={"mode": "series", "use_sample_script": True})
+    assert r.status_code == 400 and "LLM_API_KEY" in r.json()["detail"]
+
+
+def test_topics_upstream_error_returns_json_502(client, monkeypatch):
+    monkeypatch.setattr("interview_video.llm.get_chat_model", lambda s: object())
+
+    async def boom(llm, industry, n, avoid=None):
+        raise ValueError("模型输出不是 JSON")
+
+    monkeypatch.setattr("interview_video.chains.topic.generate_topics", boom)
+    r = client.post("/api/topics", json={"industry": "护理", "n": 3})
+    assert r.status_code == 502 and "模型输出不是 JSON" in r.json()["detail"]
+
+
+def test_topics_budget_error_returns_400(client, monkeypatch):
+    from interview_video.llm_audit import LLMBudgetExceededError
+
+    monkeypatch.setattr("interview_video.llm.get_chat_model", lambda s: object())
+
+    async def over(llm, industry, n, avoid=None):
+        raise LLMBudgetExceededError("调用次数超限")
+
+    monkeypatch.setattr("interview_video.chains.topic.generate_topics", over)
+    r = client.post("/api/topics", json={"industry": "护理", "n": 3})
+    assert r.status_code == 400 and "预算" in r.json()["detail"]
+
+
+def test_job_without_llm_key_rejected_before_creating_dir(nokey_client, tmp_path):
+    r = nokey_client.post("/api/jobs", json={"industry": "互联网", "topic_title": "x"})
+    assert r.status_code == 400
+    assert "LLM_API_KEY" in r.json()["detail"] and "示例脚本" in r.json()["detail"]
+    assert [p for p in (tmp_path / "output").iterdir() if p.is_dir()] == []
+    assert nokey_client.get("/api/jobs/active").json() is None
 
 
 def test_topics_success(client, monkeypatch):
@@ -262,7 +305,13 @@ def test_meta_edit_and_upload_guard(portal_app, monkeypatch):
 
         r = client.put(f"/api/projects/{name}/meta",
                        json={"title": "新标题", "desc": "新简介", "tags": ["面试", "汽修"]})
-        assert r.json()["ok"] is True
+        assert r.json()["ok"] is True and r.json()["warnings"] == []
+        r = client.put(f"/api/projects/{name}/meta",
+                       json={"title": "保证你能过面试", "desc": "加我微信领取资料", "tags": ["面试"]})
+        warns = "\n".join(r.json()["warnings"])
+        assert r.json()["ok"] is True and "包过承诺" in warns and "私域引流" in warns
+        client.put(f"/api/projects/{name}/meta",
+                   json={"title": "新标题", "desc": "新简介", "tags": ["面试", "汽修"]})
         detail = client.get(f"/api/projects/{name}").json()
         assert detail["meta"]["title"] == "新标题"
         assert detail["meta"]["tags"] == ["面试", "汽修"]
@@ -353,7 +402,8 @@ def test_script_get_put_and_validation(portal_app, monkeypatch):
         r = client.put(f"/api/projects/{name}/script", json={"title": "x", "scenes": []})
         assert r.status_code == 422
 
-        assert client.put(f"/api/projects/{name}/script", json=_sample_script_dict()).json()["ok"]
+        r = client.put(f"/api/projects/{name}/script", json=_sample_script_dict()).json()
+        assert r["ok"] and any("分镜数量不足" in w for w in r["warnings"])  # 保存不阻断, 只提醒
         assert client.get(f"/api/projects/{name}/script").json()["title"] == "改后标题"
 
         assert client.get("/api/projects/..%2Fx/script").status_code in (400, 404)
@@ -965,3 +1015,44 @@ def test_index_poll_handles_404_and_uses_local_storage():
     assert "localStorage" in html and "sessionStorage" not in html
     assert "/api/session" in html
     assert "e.status === 404" in html
+
+
+def test_cli_error_log_and_meta_error_visible_in_library(client, settings):
+    root = settings.out_root
+    root.mkdir(parents=True, exist_ok=True)
+    # CLI 失败目录: 只有 error.log(脚本前就失败)
+    failed = root / "cli-failed"
+    failed.mkdir()
+    (failed / "error.log").write_text(
+        "time=x\nnode=tts(配音合成)\nerror=TTSAuthError: 额度用完\n\nTraceback ...\n", encoding="utf-8",
+    )
+    # 成片但元数据降级
+    done = root / "cli-done"
+    m = _write_manifest(done, settings, "互联网")
+    m.generation = {"meta_error": "无法初始化 LLM: 未配置 LLM_API_KEY"}
+    (done / "project.json").write_text(m.model_dump_json(), encoding="utf-8")
+
+    items = {p["name"]: p for p in client.get("/api/projects").json()["projects"]}
+    f = items["cli-failed"]
+    assert f["status"] == "failed" and "额度用完" in f["error"] and "tts" in f["error"]
+    assert f["error_log_url"] == "/files/cli-failed/error.log"
+    assert "额度用完" in client.get(f["error_log_url"]).text
+    d = items["cli-done"]
+    assert "LLM_API_KEY" in d["meta_error"] and "--regen-meta" in d["regen_meta_cmd"]
+    assert "LLM_API_KEY" in client.get("/api/projects/cli-done").json()["meta_error"]
+
+
+def test_web_error_log_reason_from_traceback(client, settings):
+    d = settings.out_root / "web-failed"
+    d.mkdir(parents=True)
+    (d / "error-abc.log").write_text(
+        "stage=render series=None\nTraceback (most recent call last):\n"
+        '  File "x.py", line 1, in f\nRuntimeError: chromium 崩了\n', encoding="utf-8",
+    )
+    item = next(p for p in client.get("/api/projects").json()["projects"] if p["name"] == "web-failed")
+    assert item["error"] == "[render] RuntimeError: chromium 崩了"
+
+
+def test_index_has_doctor_panel(client):
+    html = client.get("/").text
+    assert "/api/doctor" in html and "env-card" in html and "use-sample" in html

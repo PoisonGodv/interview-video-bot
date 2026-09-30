@@ -9,7 +9,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Settings
+from .config import ConfigError, Settings
 
 
 @dataclass
@@ -79,14 +79,35 @@ def _nearest_existing(p: Path) -> Path:
     return p
 
 
+# 未配 LLM_API_KEY 时不可用的功能(doctor 列给用户看)
+NEEDS_LLM = (
+    "ivb topics", "ivb generate(不带 --sample/--script-file/--resume)", "ivb batch",
+    "ivb series", "ivb eval", "B站元数据(标题/简介/标签)", "Web 生成选题/写脚本",
+)
+
+
+def check_llm_base_url(settings: Settings) -> Check:
+    """DeepSeek 等非 OpenAI 模型却没配 base_url: 请求会打到 OpenAI 官方并 401/404。"""
+    if settings.llm_base_url:
+        return Check("LLM_BASE_URL", True, settings.llm_base_url, required=False)
+    if settings.llm_model.lower().startswith("deepseek"):
+        return Check(
+            "LLM_BASE_URL", False,
+            f"LLM_MODEL={settings.llm_model} 但 LLM_BASE_URL 为空(将请求 OpenAI 官方); "
+            "DeepSeek 请设 LLM_BASE_URL=https://api.deepseek.com",
+            required=False,
+        )
+    return Check("LLM_BASE_URL", True, "(默认 https://api.openai.com/v1)", required=False)
+
+
 def check_config(settings: Settings) -> list[Check]:
     out = [
         *check_paths(settings),
         Check("LLM_API_KEY", settings.llm_ready(),
               f"模型 {settings.llm_model}" if settings.llm_ready()
-              else "未配置(仅 --script-file 模式可用)", required=False),
-        Check("LLM_BASE_URL", True, settings.llm_base_url or "(默认 https://api.openai.com/v1)",
-              required=False),
+              else "未配置; 以下功能不可用: " + "、".join(NEEDS_LLM)
+                   + "; 免 key 可用 ivb generate --sample 冒烟", required=False),
+        check_llm_base_url(settings),
     ]
     if settings.tts_provider == "doubao":
         out.append(Check(
@@ -135,6 +156,21 @@ async def ping_llm(settings: Settings) -> Check:
 
 def run_doctor(settings: Settings) -> list[Check]:
     return [*check_binaries(), check_chromium(), check_font(settings), *check_config(settings)]
+
+
+def run_doctor_with_config_error(exc: ConfigError) -> list[Check]:
+    """.env 校验失败时: 二进制/浏览器/字体照查(字体用默认配置探测), 每个坏字段一条 FAIL。"""
+    where = str(exc.env_path) if exc.env_path else "(未找到 .env, 来自进程环境变量)"
+    fallback = _default_settings()
+    return [
+        *check_binaries(), check_chromium(), check_font(fallback),
+        *(Check("配置", False, f"{line}; 修改 {where}") for line in exc.lines),
+    ]
+
+
+def _default_settings() -> Settings:
+    """不读 .env 与环境变量的纯默认配置(坏配置时给字体探测等用)。"""
+    return Settings.model_construct()
 
 
 def preflight(settings: Settings) -> None:

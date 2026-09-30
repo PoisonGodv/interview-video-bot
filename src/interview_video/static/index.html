@@ -53,7 +53,15 @@
   .w100 { width: 100%; }
   .msg { font-size: 13px; margin-top: 8px; }
   .msg.err { color: var(--err); } .msg.ok { color: var(--ok); }
+  .msg.warn { color: #fbbf24; white-space: pre-line; }
   a { color: var(--accent); }
+  .card.bad { border-color: var(--err); }
+  .card.warnc { border-color: #fbbf24; }
+  details.env summary { cursor: pointer; font-size: 14px; }
+  .chk { font-size: 13px; margin-top: 6px; }
+  .chk b.fail { color: var(--err); } .chk b.warn { color: #fbbf24; }
+  .chk span { color: var(--dim); }
+  code { background: #0b1226; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -64,6 +72,14 @@
     <span class="badge" id="badge-tts">TTS …</span>
     <span class="badge" id="badge-upload">上传 …</span>
   </header>
+
+  <div class="card" id="env-card" style="display:none">
+    <details class="env" id="env-details">
+      <summary id="env-summary">环境检查</summary>
+      <div id="env-checks"></div>
+      <p class="msg" style="color:var(--dim)">修改 .env 后需重启 <code>ivb web</code> 才生效; 终端运行 <code>ivb doctor</code> 可看同样的结果。</p>
+    </details>
+  </div>
 
   <div class="card">
     <h2>① 选题</h2>
@@ -102,6 +118,7 @@
       <button id="btn-gen">开始生成</button>
       <button class="ghost" id="btn-cancel" style="display:none">取消任务</button>
     </div>
+    <div class="msg" id="sample-hint" style="display:none;color:#fbbf24"></div>
     <div class="msg" id="series-estimate" style="display:none"></div>
     <div class="msg" id="series-progress"></div>
     <div class="stages" id="stages" style="display:none"></div>
@@ -149,6 +166,10 @@ async function api(path, opts = {}) {
   return data;
 }
 const msg = (id, text, cls = "") => { const el = $(id); el.textContent = text; el.className = "msg " + cls; };
+// 保存成功但有体检警告(红线/超长)时黄色逐条展示, 不阻断保存
+const savedMsg = (id, okText, warnings) => (warnings && warnings.length)
+  ? msg(id, okText + ", 但有 " + warnings.length + " 条提醒:\n" + warnings.map(w => "· " + w).join("\n"), "warn")
+  : msg(id, okText, "ok");
 
 async function init() {
   if (ivbToken) await api("/api/session", {method: "POST"}).catch(() => {});
@@ -166,6 +187,13 @@ async function init() {
   b("badge-tts", s.tts_provider !== "doubao" || s.doubao_configured,
     "TTS: " + s.tts_provider, "豆包缺凭证");
   b("badge-upload", s.upload_enabled, "B站上传已开启", "上传未开启");
+  if (!s.llm_configured) {
+    // 没 key 时只能跑示例脚本: 默认勾上, 并说明写脚本/选题需要先配 LLM_API_KEY
+    $("use-sample").checked = true;
+    $("sample-hint").style.display = "block";
+    $("sample-hint").textContent = "未配置 LLM_API_KEY: 已默认勾选「用示例脚本」(免 key 跑通全流程); "
+      + "生成选题/写新脚本需先在 .env 填写 LLM_API_KEY 并重启 ivb web(详见上方环境检查)";
+  }
   if (s.video_aspect) $("aspect").value = s.video_aspect;
   voices = s.voices;
   $("provider").innerHTML = Object.keys(voices).map(p =>
@@ -173,8 +201,25 @@ async function init() {
   fillVoices();
   $("provider").onchange = fillVoices;
   loadProjects();
+  loadDoctor();
   const active = await api("/api/jobs/active").catch(() => null);
   if (active && active.status === "running") attachJob(active.id);
+}
+// 环境检查: 复用 /api/doctor, 只列 FAIL/WARN; 必需项失败时标红并自动展开
+async function loadDoctor() {
+  let d;
+  try { d = await api("/api/doctor"); } catch (e) { return; }
+  const bad = d.checks.filter(c => !c.ok);
+  const card = $("env-card");
+  card.style.display = "block";
+  card.className = "card" + (d.ok ? (bad.length ? " warnc" : "") : " bad");
+  $("env-summary").textContent = !d.ok
+    ? `环境检查: ${bad.filter(c => c.required).length} 项必需未通过(生成视频会失败)`
+    : bad.length ? `环境检查: 必需项通过, ${bad.length} 项提醒` : "环境检查: 全部通过";
+  $("env-checks").innerHTML = bad.map(c =>
+    `<div class="chk"><b class="${c.required ? "fail" : "warn"}">${c.required ? "FAIL" : "WARN"}</b>
+      ${esc(c.name)} <span>${esc(c.detail)}</span></div>`).join("");
+  $("env-details").open = !d.ok;
 }
 // 挂上已在跑的任务(页面刷新 / 409 冲突时)
 function attachJob(id) {
@@ -425,7 +470,10 @@ async function toggleDetail(name) {
     <div class="row" style="margin-top:8px">
       <button data-act="save">保存元数据</button>
       <span class="msg" id="m-${k}"></span></div>`;
-  el.innerHTML = metaHtml + `
+  const metaWarn = !p.draft && p.meta_error ? `
+    <div class="msg" style="color:#fbbf24;margin-top:8px">B站元数据${p.has_meta ? "重新生成失败, 沿用旧版" : "未生成"}: ${esc(p.meta_error)}<br>
+      配好 LLM 后补生成(不重做音视频): <code>${esc(p.regen_meta_cmd)}</code></div>` : "";
+  el.innerHTML = metaWarn + metaHtml + `
     <div style="margin-top:14px"><label class="sub">脚本 script.json(改完保存; 重新生成会复用未改动场景的配音缓存)</label>
       <textarea class="code" id="s-${k}" spellcheck="false"></textarea></div>
     <label class="sub"><input type="checkbox" id="ov-${k}"> 覆盖设置: 用上方「生成视频」里选的配音/音色/画幅(不勾则沿用该作品上次的设置)</label>
@@ -446,12 +494,12 @@ async function saveMeta(name, btn) {
   const k = pid(name);
   btn.disabled = true;
   try {
-    await api(`/api/projects/${encodeURIComponent(name)}/meta`, {method: "PUT", body: {
+    const r = await api(`/api/projects/${encodeURIComponent(name)}/meta`, {method: "PUT", body: {
       title: $("t-" + k).value,
       desc: $("desc-" + k).value,
       tags: $("tags-" + k).value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
     }});
-    msg("m-" + k, "已保存", "ok");
+    savedMsg("m-" + k, "已保存", r && r.warnings);
   } catch (e) { msg("m-" + k, e.message, "err"); }
   btn.disabled = false;
 }
@@ -464,14 +512,15 @@ async function saveScript(name, btn, regen) {
   btn.disabled = true;
   try {
     const base = `/api/projects/${encodeURIComponent(name)}`;
-    await api(base + "/script", {method: "PUT", body});
+    const r = await api(base + "/script", {method: "PUT", body});
+    const warns = (r && r.warnings) || [];
     if (regen) {
       const d = await api(base + "/regenerate", {method: "POST",
         body: overrideBody($("ov-" + k).checked)});
-      msg("sm-" + k, "已保存, 重新生成中(进度见上方「生成视频」)", "ok");
+      savedMsg("sm-" + k, "已保存, 重新生成中(进度见上方「生成视频」)", warns);
       msg("gen-msg", ""); $("btn-gen").disabled = true;
       pollJob(d.job_id);
-    } else msg("sm-" + k, "脚本已保存", "ok");
+    } else savedMsg("sm-" + k, "脚本已保存", warns);
   } catch (e) {
     msg("sm-" + k, e.message, "err");
     if (e.jobId) attachJob(e.jobId);

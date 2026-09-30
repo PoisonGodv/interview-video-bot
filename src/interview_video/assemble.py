@@ -379,12 +379,19 @@ def finalize_video(
             "-filter_complex", bgm_filter(total, settings, loudnorm),
             "-map", "0:v", "-map", "[aout]", "-c:v", "copy",
         ]
-    _run(
-        ["ffmpeg", "-y", *audio_args,
-         "-c:a", "aac", "-b:a", "160k", "-ar", "44100", out_path.name],
-        out_dir,
-        _timeout_for(total),
-    )
+    # 先写临时文件再原子替换: 失败/取消时不会留下半截 final.mp4 冒充成片
+    tmp_path = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
+    try:
+        _run(
+            ["ffmpeg", "-y", *audio_args,
+             "-c:a", "aac", "-b:a", "160k", "-ar", "44100", tmp_path.name],
+            out_dir,
+            _timeout_for(total),
+        )
+        if tmp_path.exists():  # ffmpeg 成功必有产物; 桩化 _run 的单测下不存在
+            os.replace(tmp_path, out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return out_path
 
 

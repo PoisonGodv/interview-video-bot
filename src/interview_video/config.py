@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, PrivateAttr, SecretStr, field_validator
+from pydantic import Field, PrivateAttr, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -156,12 +156,21 @@ class Settings(BaseSettings):
     @field_validator("llm_base_url", "llm_fallback_base_url")
     @classmethod
     def _check_url(cls, v: str | None) -> str | None:
-        if v is not None and not v.startswith(("http://", "https://")):
+        """未写协议(``api.deepseek.com``)自动补 https://; 其它协议仍报错。"""
+        if v is None or v.startswith(("http://", "https://")):
+            return v
+        if "://" in v:
             raise ValueError(f"必须以 http:// 或 https:// 开头, 当前: {v!r}")
-        return v
+        return f"https://{v}"
+
+    @field_validator("tts_provider", "tts_fallback_provider", mode="before")
+    @classmethod
+    def _norm_provider(cls, v: object) -> object:
+        """``Edge`` / `` doubao `` 这类大小写/空白差异不算拼错。"""
+        return v.strip().lower() if isinstance(v, str) else v
 
     def llm_ready(self) -> bool:
-        return self.llm_api_key is not None and bool(self.llm_api_key.get_secret_value())
+        return self.llm_api_key is not None and bool(self.llm_api_key.get_secret_value().strip())
 
     def doubao_ready(self) -> bool:
         if self.tts_doubao_api_key is not None:
@@ -200,9 +209,39 @@ def resolve_env_file() -> Path | None:
     return None
 
 
+_SENSITIVE_HINTS = ("KEY", "TOKEN", "SESSDATA", "JCT", "BUVID", "SECRET")
+
+
+class ConfigError(ValueError):
+    """.env / 环境变量校验失败: 每个字段一行中文说明 + 实际读取的 .env 路径。"""
+
+    def __init__(self, lines: list[str], env_path: Path | None) -> None:
+        self.lines, self.env_path = lines, env_path
+        where = str(env_path) if env_path else "(未找到 .env, 来自进程环境变量)"
+        super().__init__(f"配置有误({where}):\n" + "\n".join(f"- {x}" for x in lines))
+
+
+def config_error_lines(exc: ValidationError) -> list[str]:
+    """ValidationError → ``LLM_BASE_URL: 原因(当前值 'x')``; 密钥类字段不回显值。"""
+    out = []
+    for e in exc.errors():
+        name = str(e["loc"][0]).upper() if e.get("loc") else "(未知字段)"
+        reason = str(e.get("msg", "")).removeprefix("Value error, ")
+        value = e.get("input")
+        shown = ""
+        if isinstance(value, (str, int, float)) and not any(h in name for h in _SENSITIVE_HINTS):
+            shown = f"(当前值 {str(value)[:60]!r})"
+        out.append(f"{name}: {reason}{shown}")
+    return out
+
+
 def load_settings(env_file: str | Path | None = None) -> Settings:
+    """读取配置; 校验失败抛 ConfigError(ValueError 子类, 带逐字段说明与 .env 路径)。"""
     path = Path(env_file).expanduser().resolve() if env_file else resolve_env_file()
-    s = Settings(_env_file=str(path) if path else None)  # type: ignore[call-arg]
+    try:
+        s = Settings(_env_file=str(path) if path else None)  # type: ignore[call-arg]
+    except ValidationError as exc:
+        raise ConfigError(config_error_lines(exc), path) from None
     s._env_path = path
     # 用户级配置不绑定任何项目目录: 其中的相对 OUT_ROOT 按主目录解析, 不随当前目录漂移
     if path is not None and not s.out_root.is_absolute() and path == user_env_file().resolve():

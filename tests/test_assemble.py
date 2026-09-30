@@ -316,3 +316,30 @@ def test_finalize_bars_appear_at_global_times(tmp_path: Path) -> None:
     assert _pixel_at(out, 3.5, 960, 1000)[0] < 60
     assert not (tmp_path / "subbed").exists()
     assert abs(ffprobe_duration(out) - 4.0) < 0.9
+
+
+def test_finalize_writes_tmp_then_atomically_replaces(tmp_path: Path, monkeypatch) -> None:
+    """最后一步 ffmpeg 写 final.tmp.mp4 再 os.replace; 失败时不留半截 final.mp4。"""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd, timeout=300):
+        calls.append(cmd)
+        if cmd[-1] == "final.tmp.mp4":
+            (Path(cwd) / cmd[-1]).write_bytes(b"NEW")
+
+    monkeypatch.setattr(assemble_mod, "_run", fake_run)
+    monkeypatch.setattr(assemble_mod, "ffprobe_duration", lambda p: 2.0)
+    clips = [tmp_path / "clips" / "scene_000.mp4"]
+    out = finalize_video(clips, [], tmp_path / "final.mp4", Settings())
+    assert calls[-1][-1] == "final.tmp.mp4"
+    assert out.read_bytes() == b"NEW" and not (tmp_path / "final.tmp.mp4").exists()
+
+    def failing_run(cmd, cwd, timeout=300):
+        if cmd[-1] == "final.tmp.mp4":
+            (Path(cwd) / cmd[-1]).write_bytes(b"HALF")
+            raise RuntimeError("ffmpeg 失败")
+
+    monkeypatch.setattr(assemble_mod, "_run", failing_run)
+    with pytest.raises(RuntimeError):
+        finalize_video(clips, [], tmp_path / "final.mp4", Settings())
+    assert out.read_bytes() == b"NEW" and not (tmp_path / "final.tmp.mp4").exists()

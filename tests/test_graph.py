@@ -220,3 +220,58 @@ async def test_metadata_node_failure_degrades_not_crashes(
     # 新增生成溯源块
     assert manifest.generation is not None
     assert manifest.generation["tts_provider"] == settings.tts_provider
+
+
+async def test_script_file_path_lints_and_warns(
+    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """--script-file 路径不经 LLM 闸门: 红线/超长只告警不阻断。"""
+    monkeypatch.setattr(llm_mod, "get_chat_model", lambda settings, audit=None: object())
+
+    async def meta_stub(llm, script, chapters, settings):
+        return None
+
+    monkeypatch.setattr(metadata_mod, "write_metadata", meta_stub)
+    data = Script.model_validate_json(SAMPLE_SCRIPT.read_text(encoding="utf-8"))
+    data.scenes[0].narration = "加我微信领取资料, " + data.scenes[0].narration
+    custom = tmp_path / "custom.json"
+    custom.write_text(data.model_dump_json(), encoding="utf-8")
+    with caplog.at_level("WARNING", logger="interview_video.graph"):
+        await run_pipeline(Settings(_env_file=None), tmp_path / "out", script_file=custom)
+    assert any("脚本体检" in r.message and "私域引流" in r.message for r in caplog.records)
+
+
+async def test_resume_stashes_manifest_and_restores_on_success(
+    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """续跑开始时 project.json 挪成 project.prev.json; 失败时项目不再显示为完成, 成功后备份删除。"""
+    from interview_video import assemble as assemble_mod
+
+    monkeypatch.setattr(llm_mod, "get_chat_model", lambda settings, audit=None: object())
+
+    async def meta_stub(llm, script, chapters, settings):
+        return None
+
+    monkeypatch.setattr(metadata_mod, "write_metadata", meta_stub)
+    settings = Settings(_env_file=None)
+    out_dir = tmp_path / "out"
+    await run_pipeline(settings, out_dir, script_file=SAMPLE_SCRIPT)
+    assert (out_dir / "project.json").exists()
+
+    def boom(*a, **k):
+        raise RuntimeError("ffmpeg 失败(模拟)")
+
+    monkeypatch.setattr(assemble_mod, "finalize_video", boom)
+    with pytest.raises(RuntimeError):
+        await run_pipeline(settings, out_dir, script_file=SAMPLE_SCRIPT)
+    assert not (out_dir / "project.json").exists()
+    assert (out_dir / "project.prev.json").exists()
+
+    def ok_finalize(clips, bars, out_path, settings):
+        out_path.write_bytes(b"FAKE_FINAL_MP4")
+        return out_path
+
+    monkeypatch.setattr(assemble_mod, "finalize_video", ok_finalize)
+    await run_pipeline(settings, out_dir, script_file=SAMPLE_SCRIPT)
+    assert (out_dir / "project.json").exists()
+    assert not (out_dir / "project.prev.json").exists()

@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
+from .boundary import lint_meta, lint_script
 from .config import Settings, load_settings
 from .estimate import (
     SERIES_MAX_EPISODE_MIN,
@@ -35,6 +36,7 @@ from .models import (
     Script,
     SeriesPlan,
     load_script_file,
+    sample_script_path,
     validate_script,
 )
 from .models import format_validation_error as _format_validation_error
@@ -68,11 +70,6 @@ VOICES: dict[str, list[dict[str, str]]] = {
 _NAME_RE = re.compile(r"^[\w\-一-鿿]+$")  # 项目目录名白名单(防路径穿越)
 
 _STATIC_DIR = Path(__file__).parent / "static"
-# 免 LLM 冒烟脚本: 随包分发(package data), 源码仓库里退回 examples/ 原件
-_SAMPLE_SCRIPT_CANDIDATES = (
-    Path(__file__).parent / "data" / "sample_script.json",
-    Path(__file__).resolve().parents[2] / "examples" / "sample_script.json",
-)
 
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 _LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -81,10 +78,6 @@ TOKEN_COOKIE = "ivb_token"
 _ASPECTS = ("16:9", "9:16")
 # Web 任务的配音/画幅记录(草稿与系列根目录没有 project.json 时, 重生成/续跑据此沿用)
 _GEN_RECORD = "web_generation.json"
-
-
-def sample_script_path() -> Path | None:
-    return next((p for p in _SAMPLE_SCRIPT_CANDIDATES if p.is_file()), None)
 
 
 def is_loopback(host: str) -> bool:
@@ -337,10 +330,13 @@ def _series_status(root: Path) -> dict[str, Any] | None:
 def _recorded_generation(dirs: list[Path]) -> dict[str, str]:
     """按顺序找第一份生成记录: project.json(generation + voice) 优先, 其次 web_generation.json。"""
     for d in dirs:
-        try:
-            m = ProjectManifest.model_validate_json((d / "project.json").read_text(encoding="utf-8"))
-        except (OSError, ValidationError):
-            m = None
+        m = None
+        for fname in ("project.json", "project.prev.json"):  # 续跑失败时只剩备份
+            try:
+                m = ProjectManifest.model_validate_json((d / fname).read_text(encoding="utf-8"))
+                break
+            except (OSError, ValidationError):
+                continue
         if m is not None and m.generation:
             rec = {"provider": m.generation.get("tts_provider", ""),
                    "aspect": m.generation.get("video_aspect", ""), "voice": m.voice}
@@ -363,6 +359,27 @@ def _write_generation_record(d: Path, s: Settings) -> None:
         (d / _GEN_RECORD).write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
+
+
+def _error_reason(log: Path) -> str | None:
+    """失败日志里的一行原因: CLI error.log 的 node=/error= 行, 否则取堆栈最后一行异常。"""
+    try:
+        lines = [x.strip() for x in log.read_text(encoding="utf-8", errors="replace").splitlines()]
+    except OSError:
+        return None
+    lines = [x for x in lines if x]
+    node = next((x[5:] for x in lines if x.startswith("node=")), None)
+    err = next((x[6:] for x in lines if x.startswith("error=")), None)
+    if err is None:
+        tail = [x for x in lines if not x.startswith(("File ", "Traceback", "^", "~"))]
+        err = tail[-1] if tail else None
+        stage = next((x for x in lines if x.startswith("stage=")), None)
+        if stage and err:
+            node = stage.split()[0][6:]
+    if err is None:
+        return None
+    text = f"[{node}] {err}" if node and node not in ("None", "未知") else err
+    return text[:300]
 
 
 def _sum_usage(root: Path, since: datetime | None = None) -> dict[str, int]:
@@ -390,7 +407,7 @@ def _install_guard(app: FastAPI, settings: Settings, bind_host: str) -> None:
     - 令牌: 配了 WEB_TOKEN 或绑非回环地址时(未配置则生成, 见 app.state.web_token),
       除首页外的请求都要令牌: 写请求须带 X-IVB-Token 头; 读请求(/api、/files)头或 cookie ivb_token 均可
       (<video>/<img> 带不了头, 页面先 POST /api/session 换 HttpOnly cookie);
-    - /files 不外发 *.log(ivb.log 等运行日志), 失败现场 error-*.log 除外。
+    - /files 不外发 *.log(ivb.log 等运行日志), 项目目录内失败现场 error-*.log / error.log 除外。
     """
     wildcard = bind_host in ("0.0.0.0", "::", "")
     allowed = set(_LOOPBACK_NAMES)
@@ -437,7 +454,8 @@ def _install_guard(app: FastAPI, settings: Settings, bind_host: str) -> None:
         path = request.url.path
         if path.startswith("/files/"):
             base = path.rstrip("/").rsplit("/", 1)[-1].lower()
-            if base.endswith(".log") and not (base.startswith("error-") and "/" in path[7:]):
+            is_err_log = base.startswith("error-") or base == "error.log"  # 项目内失败现场
+            if base.endswith(".log") and not (is_err_log and "/" in path[7:]):
                 return JSONResponse({"detail": "Not Found"}, status_code=404)
         if request.method not in _UNSAFE_METHODS:
             if token is not None and path != "/" and not (
@@ -483,6 +501,16 @@ def create_app(
     @app.exception_handler(_Busy)
     async def _busy_handler(_request, exc: _Busy) -> JSONResponse:
         return JSONResponse({"detail": exc.message, "job_id": exc.job_id}, status_code=409)
+
+    @app.exception_handler(Exception)
+    async def _unhandled(_request, exc: Exception) -> JSONResponse:
+        """兜底: 未预期异常也回 JSON(前端能显示原因), 不再是裸 500 文本。"""
+        import logging
+
+        logging.getLogger(__name__).exception("接口异常")
+        return JSONResponse(
+            {"detail": f"服务端错误 {type(exc).__name__}: {exc}"[:500]}, status_code=500,
+        )
 
     def _ensure_idle() -> None:
         if manager.active:
@@ -550,9 +578,20 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(400, str(exc)) from exc
         from . import backlog as backlog_mod
+        from .llm_audit import LLMBudgetExceededError
 
         avoid = await asyncio.to_thread(backlog_mod.avoid_titles, settings, req.industry)
-        topics = await topic_mod.generate_topics(llm, req.industry, req.n, avoid=avoid or None)
+        try:
+            topics = await topic_mod.generate_topics(llm, req.industry, req.n, avoid=avoid or None)
+        except LLMBudgetExceededError as exc:
+            raise HTTPException(
+                400, f"LLM 预算超限: {exc}(调大 LLM_MAX_CALLS_PER_RUN / LLM_MAX_TOKENS_PER_RUN)",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 —— 上游模型/网络/输出解析失败
+            detail = f"选题生成失败 {type(exc).__name__}: {exc}"[:500]
+            if llm_mod.is_fatal_error(exc):
+                detail += "(检查 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL, 改完需重启 ivb web)"
+            raise HTTPException(502, detail) from exc
         await asyncio.to_thread(backlog_mod.add_topics, settings, topics)
         return {"topics": [t.model_dump() for t in topics]}
 
@@ -573,6 +612,15 @@ def create_app(
             raise HTTPException(400, f"未知 TTS 通道: {req.provider}")
         if req.stop_after and req.mode == "series":
             raise HTTPException(400, "系列模式不支持只生成脚本")
+        # 系列模式始终要 LLM(策划/编剧), 「用示例脚本」只对单集生效
+        if (req.mode == "series" or not req.use_sample_script) and not settings.llm_ready():
+            from .llm import missing_key_message
+
+            raise HTTPException(
+                400, missing_key_message(settings).replace(
+                    "ivb generate --sample(或 --script-file <脚本.json>)", "勾选「用示例脚本」",
+                ) + "; 改完 .env 需重启 ivb web",
+            )
         _ensure_idle()
         script_file: Path | None = None
         if req.use_sample_script:
@@ -872,8 +920,12 @@ def create_app(
         except (OSError, ValidationError) as exc:
             raise HTTPException(422, f"{d.name} 的脚本文件损坏: {exc}") from exc
 
+    def _error_logs(d: Path) -> list[Path]:
+        """Web 任务的 error-<id>.log 与 CLI/批量的 error.log。"""
+        return [*d.glob("error-*.log"), *[p for p in (d / "error.log",) if p.is_file()]]
+
     def _latest_error_log(d: Path) -> Path | None:
-        logs = sorted(d.glob("error-*.log"), key=lambda p: p.stat().st_mtime)
+        logs = sorted(_error_logs(d), key=lambda p: p.stat().st_mtime)
         return logs[-1] if logs else None
 
     def _mtime_iso(p: Path) -> str:
@@ -895,7 +947,7 @@ def create_app(
             "draft": True,
             "status": "failed" if err is not None else "draft",
             "has_script": True,
-            "error": None,
+            "error": _error_reason(err) if err is not None else None,
             "error_log_url": _file_url(err) if err is not None else None,
             "cover_url": None,
             "video_url": None,
@@ -926,7 +978,8 @@ def create_app(
         try:
             if (d / "project.json").exists() or (d / "script.json").exists():
                 return _project_summary(d)
-            return _broken_summary(d, "failed", None)
+            err = _latest_error_log(d)
+            return _broken_summary(d, "failed", _error_reason(err) if err is not None else None)
         except (HTTPException, OSError, ValidationError, ValueError) as exc:
             detail = exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
             return _broken_summary(d, "broken", str(detail)[:300])
@@ -948,6 +1001,8 @@ def create_app(
             "duration": round(m.duration_total, 1),
             "created_at": m.created_at.isoformat(),
             "has_meta": m.meta is not None,
+            "meta_error": (m.generation or {}).get("meta_error"),
+            "regen_meta_cmd": f"ivb generate --resume {d.resolve()} --regen-meta",
             "bvid": bvid,
             "draft": False,
             "status": "done",
@@ -959,9 +1014,7 @@ def create_app(
         }
 
     def _in_library(d: Path) -> bool:
-        return _is_project(d, allow_draft=True) or (
-            d.is_dir() and any(d.glob("error-*.log"))
-        )
+        return _is_project(d, allow_draft=True) or (d.is_dir() and bool(_error_logs(d)))
 
     def _sort_ts(item: dict[str, Any]) -> float:
         try:
@@ -1009,7 +1062,7 @@ def create_app(
         )
         m.meta = BiliMeta(title=req.title, desc=req.desc, tags=req.tags)
         (d / "project.json").write_text(m.model_dump_json(indent=2), encoding="utf-8")
-        return {"ok": True}
+        return {"ok": True, "warnings": lint_meta(m.meta)}
 
     @app.get("/api/projects/{name}/script")
     async def get_script(name: str) -> dict[str, Any]:
@@ -1032,7 +1085,7 @@ def create_app(
         except ValidationError as exc:
             raise HTTPException(422, f"脚本格式不合法: {_format_validation_error(exc)}") from exc
         (d / "script.json").write_text(script.model_dump_json(indent=2), encoding="utf-8")
-        return {"ok": True}
+        return {"ok": True, "warnings": lint_script(script)}
 
     @app.post("/api/projects/{name}/regenerate", status_code=202)
     async def regenerate_project(

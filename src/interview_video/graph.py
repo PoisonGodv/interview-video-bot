@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -89,13 +90,19 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWo
         out_dir: Path = state["out_dir"]
         script_file = state.get("script_file")
         preset = state.get("script")
-        if preset is not None:
-            # 系列模式 / --resume: 脚本已预生成, 本节点直通
-            script = preset
-            logger.info("使用预生成脚本: %s", script.title)
-        elif script_file is not None:
-            script = load_script_file(script_file)
-            logger.info("使用脚本文件: %s", script_file)
+        if preset is not None or script_file is not None:
+            if preset is not None:
+                # 系列模式 / --resume: 脚本已预生成, 本节点直通
+                script = preset
+                logger.info("使用预生成脚本: %s", script.title)
+            else:
+                script = load_script_file(script_file)
+                logger.info("使用脚本文件: %s", script_file)
+            # 人工编辑/外部导入的脚本不经 LLM 边界闸门: 做一次非阻断体检(红线/超长)并告警
+            from .boundary import lint_script
+
+            for warning in lint_script(script):
+                logger.warning("脚本体检: %s", warning)
         else:
             from . import llm as llm_mod
             from .chains import script as script_mod
@@ -274,9 +281,8 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWo
             generation=generation,
         )
         manifest_path = out_dir / "project.json"
-        manifest_path.write_text(
-            manifest.model_dump_json(indent=2), encoding="utf-8"
-        )
+        _atomic_write_text(manifest_path, manifest.model_dump_json(indent=2))
+        (out_dir / PREV_MANIFEST).unlink(missing_ok=True)  # 续跑成功, 旧清单备份作废
         from . import assemble as assemble_mod
 
         assemble_mod.cleanup_intermediates(out_dir, keep_clips=settings.keep_intermediates)
@@ -337,20 +343,47 @@ def _safe_backlog(fn, *args) -> None:
         logger.warning("选题库更新失败(不影响本次生成): %s", exc)
 
 
-def _previous_meta(out_dir: Path) -> tuple[BiliMeta | None, dict | None]:
-    """旧 project.json 里的 (meta, script dump); 不存在/损坏返回 (None, None)。"""
+# 续跑开始时旧 project.json 改名为此(跑的过程中项目不再显示为已完成; 成功后删除)
+PREV_MANIFEST = "project.prev.json"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """先写同目录临时文件再 os.replace: 中途崩溃/取消不会留下半截 JSON。"""
+    tmp = path.with_name(f"{path.name}.tmp")
     try:
-        old = ProjectManifest.model_validate_json(
-            (Path(out_dir) / "project.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        return None, None
-    return old.meta, old.script.model_dump(mode="json")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _stash_previous_manifest(out_dir: Path) -> None:
+    """续跑前把旧 project.json 挪成 project.prev.json(失败/取消时保留作参考, 成功后删除)。"""
+    cur = Path(out_dir) / "project.json"
+    if not cur.exists():
+        return
+    try:
+        os.replace(cur, Path(out_dir) / PREV_MANIFEST)
+    except OSError as exc:
+        logger.warning("续跑前备份 project.json 失败(不影响生成): %s", exc)
+
+
+def _previous_meta(out_dir: Path) -> tuple[BiliMeta | None, dict | None]:
+    """旧 project.json(或续跑备份 project.prev.json)里的 (meta, script dump); 都没有返回 (None, None)。"""
+    for fname in ("project.json", PREV_MANIFEST):
+        try:
+            old = ProjectManifest.model_validate_json(
+                (Path(out_dir) / fname).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            continue
+        return old.meta, old.script.model_dump(mode="json")
+    return None, None
 
 
 def resume_industry(out_dir: Path) -> str | None:
     """续跑目录里记录的行业: project.json 优先, 其次 topic.json; 都没有返回 None。"""
-    for fname in ("project.json", "topic.json"):
+    for fname in ("project.json", PREV_MANIFEST, "topic.json"):
         f = Path(out_dir) / fname
         if f.exists():
             try:
@@ -410,6 +443,7 @@ async def run_pipeline(
     await asyncio.to_thread(doctor_mod.preflight, settings)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _stash_previous_manifest(out_dir)
     graph = build_graph(settings)
     initial: PipelineState = {
         "out_dir": out_dir,

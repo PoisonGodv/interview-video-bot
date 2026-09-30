@@ -29,15 +29,17 @@ LLM 调用基于原生 HTTP 客户端(`llm.py`, `httpx` 直连任意 OpenAI 兼�
 
 ## 快速开始
 
-要求: Python ≥3.10, ffmpeg(>=5 即可, **不需要 libass**), 以及 Playwright 的 chromium。
+前置依赖(需自行安装):
+
+- Python ≥3.10 与 [uv](https://docs.astral.sh/uv/);
+- ffmpeg/ffprobe(>=5 即可, **不需要 libass**): macOS `brew install ffmpeg`, Debian/Ubuntu `apt install ffmpeg`;
+- 中文字体(字幕/画面用): macOS 自带; Linux 如 `apt install fonts-noto-cjk`, 或设 `SUBTITLE_FONT_PATH`。
 
 ```bash
-# 1. 创建环境并安装(uv 或 venv 均可)
-uv venv && uv pip install -e ".[dev]"
-# 或: python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-
-# 2. 安装浏览器(画面渲染用)
-.venv/bin/playwright install chromium
+# 1+2. 安装依赖(按 uv.lock 锁定版本, 含 dev) + 画面渲染用的 chromium
+make install
+# 等价于: uv sync --extra dev && uv run playwright install chromium
+# 不用 uv 时: python3 -m venv .venv && .venv/bin/pip install -e ".[dev]" && .venv/bin/playwright install chromium
 
 # 3. 配置(见下文 .env 说明): 生成 ~/.config/ivb/.env(权限 0600, OUT_ROOT=~/ivb-output 绝对路径),
 #    然后编辑填写 LLM_API_KEY 等; 之后在任意目录运行 ivb 都读这份配置
@@ -47,9 +49,14 @@ uv venv && uv pip install -e ".[dev]"
 # 4. 环境自检: ffmpeg/ffprobe、chromium、中文字体、.env、LLM/豆包/B站配置
 .venv/bin/ivb doctor            # --ping 额外发一次极小请求验证 LLM key/base_url
 
-# 5. 无需 LLM key 的冒烟: 用现成脚本跑通全流程
-.venv/bin/ivb generate --script-file examples/sample_script.json
+# 5. 无需 LLM key 的冒烟: 用内置示例脚本跑通全流程(Web 端对应「用示例脚本」勾选框)
+.venv/bin/ivb generate --sample
 ```
+
+未配置 `LLM_API_KEY` 时, `topics`/`generate`(不带 `--sample`/`--script-file`/`--resume`)/`batch`/`series`
+在创建输出目录之前就退出(码 2), 并提示实际读取的 .env 路径; Web 端同样在提交任务时直接返回原因。
+`.env` 写错(如 `TTS_PROVIDER=azure`)时逐字段列出变量名与原因, `ivb doctor` 仍会照常检查 ffmpeg/浏览器/字体。
+`TTS_PROVIDER` 不区分大小写; `LLM_BASE_URL` 省略协议时自动补 `https://`。
 
 `generate`/`series`/Web 任务启动时会先做廉价预检(ffmpeg/chromium/字体),
 缺依赖直接报错, 不会先花掉 LLM/TTS 费用。Linux 需安装中文字体(如 `apt install fonts-noto-cjk`)
@@ -60,7 +67,7 @@ uv venv && uv pip install -e ".[dev]"
 | 命令 | 作用 |
 |---|---|
 | `ivb topics` | 生成选题 / 查看选题库(`--list [--all]`、`--next`) |
-| `ivb generate` | 单集完整流水线(`--topic`/`--script-file`/`--resume`/`--stop-after script`/`--tts`/`--voice`/`--aspect`/`--bgm`/`--publish-at`/`-y`) |
+| `ivb generate` | 单集完整流水线(`--topic`/`--sample`/`--script-file`/`--resume`/`--regen-meta`/`--stop-after script`/`--tts`/`--voice`/`--aspect`/`--bgm`/`--publish-at`/`-y`) |
 | `ivb batch` | 按选题库顺序批量生成 N 条 |
 | `ivb series` | 多 agent 系列长视频(`--episodes`/`--duration`/`--resume`/`--dry-run`/`-y`) |
 | `ivb upload` | 上传 B站(`-y`/`--force`/`--publish-at`) |
@@ -325,7 +332,7 @@ BILI_UPLOAD_ENABLED=false
 BILI_SESSDATA=
 BILI_JCT=
 BILI_BUVID3=
-BILI_TID=36
+BILI_TID=209              # 必须是子分区号(父分区如 36 会被拒); 209=知识·职业职场, 其它见 bilibili.py
 
 # 输出目录 / Web 操作台(可选)
 # OUT_ROOT=output          # 可写绝对路径或 ~/...

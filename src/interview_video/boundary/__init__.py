@@ -41,6 +41,8 @@ from .structure import (
     clamp_chapters,
     clamp_duration,
     fix_script_deterministic,
+    lint_meta,
+    lint_script,
     truncate_narration,
 )
 
@@ -57,6 +59,8 @@ __all__ = [
     "extract_json_text",
     "parse_json_lenient",
     "clamp_duration",
+    "lint_script",
+    "lint_meta",
     "clamp_chapters",
     "truncate_narration",
     "fix_script_deterministic",

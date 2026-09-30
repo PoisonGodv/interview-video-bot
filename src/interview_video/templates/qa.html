@@ -29,7 +29,15 @@
 .qa-card .body {
   font-size: 42px;           /* ≥34px */
   line-height: 1.5;
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;     /* 超长文本截断, 不顶出画面 */
+  word-break: break-all;
 }
+.qa-card .body.len-m { font-size: 38px; }
+.qa-card .body.len-l { font-size: 34px; -webkit-line-clamp: 5; }
 .q-card {
   background: rgba(56, 189, 248, .14);
   border: 2px solid {{ accent }};
@@ -47,7 +55,9 @@
 .qa-cards { gap: 52px; margin-bottom: auto; }
 .qa-card { flex-direction: column; padding: 44px 48px; }
 .qa-card .tag { margin: 0 0 20px 0; font-size: 56px; }
-.qa-card .body { font-size: 50px; }
+.qa-card .body { font-size: 50px; -webkit-line-clamp: 6; }
+.qa-card .body.len-m { font-size: 44px; }
+.qa-card .body.len-l { font-size: 38px; -webkit-line-clamp: 7; }
 {% endblock %}
 {% block content %}
 <div class="topbar">
@@ -59,14 +69,16 @@
   {% if scene.question %}
   <div class="qa-card q-card">
     <div class="tag">Q</div>
-    <div class="body">{{ scene.question }}</div>
+    {% set q_len = scene.question | length %}
+    <div class="body{% if q_len > 36 %} len-l{% elif q_len > 24 %} len-m{% endif %}">{{ scene.question }}</div>
   </div>
   {% endif %}
   {% set answer_text = scene.answer or (scene.bullets | join('；')) %}
   {% if answer_text %}
   <div class="qa-card a-card">
     <div class="tag">A</div>
-    <div class="body">{{ answer_text }}</div>
+    {% set a_len = answer_text | length %}
+    <div class="body{% if a_len > 54 %} len-l{% elif a_len > 36 %} len-m{% endif %}">{{ answer_text }}</div>
   </div>
   {% endif %}
 </div>

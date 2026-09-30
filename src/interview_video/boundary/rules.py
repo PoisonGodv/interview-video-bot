@@ -16,6 +16,9 @@ class BoundaryRules(BaseModel):
     max_narration_chars: int = 110
     max_header_chars: int = 12
     max_bullet_chars: int = 14
+    # qa 镜屏显问题/答案(超长会溢出画面, qa.html 另有字号梯度与行数截断兜底)
+    max_question_chars: int = 40
+    max_answer_chars: int = 60
     require_ending_scene: bool = True
     enforce_scene_count: bool = True
 
