@@ -77,6 +77,28 @@ def fix_script_narration(
     return script
 
 
+# 与 boundary.structure.GREETING_OPENING_RE 同步
+OPENING_GREETINGS_HINT = "大家好/哈喽/嗨/我是/这里是"
+
+# few-shot 片段: 值直接进模板, 花括号必须写成 {{ }}
+FEW_SHOT_EXAMPLE = (
+    "参考示例(只学写法, 不要照抄内容):\n"
+    '开场镜: {{"kind": "point", "header": "一开口就输了", '
+    '"bullets": ["自我介绍", "别背简历"], '
+    '"narration": "自我介绍背简历，等于直接放弃。面试官手里就拿着你的简历，'
+    '你再念一遍只会让他走神。今天用三句话，教你把自我介绍讲成一段让人记住的故事。"}}\n'
+    '要点镜: {{"kind": "qa", "header": "为什么离职", '
+    '"bullets": ["不抱怨", "讲成长"], '
+    '"question": "你为什么从上家公司离职？", "answer": "不吐槽前东家, 讲想要的成长", '
+    '"narration": "被问为什么离职，错误回答是：“领导太难相处，天天加班。”'
+    '正确回答是：“我在上家把订单系统从零做到稳定运行，现在想去更大的业务里挑战高并发。”'
+    '一个在抱怨，一个在讲成长。"}}\n'
+    '结尾镜: {{"kind": "ending", "header": "评论区见", "bullets": ["说说你的答案"], '
+    '"narration": "你被问离职原因时是怎么答的？把你的原话写在评论区，我每期挑几条逐句帮你改。'
+    '下期聊面试最后怎么反问面试官才加分，记得关注一下，别错过。"}}'
+)
+
+
 def _build_prompt() -> ChatPromptTemplate:
     """脚本 prompt: 中文 system(角色+红线) + 分镜结构/字数/JSON 格式要求。
 
@@ -92,13 +114,21 @@ def _build_prompt() -> ChatPromptTemplate:
                 "请围绕该选题为「{brand}」写一条约 {target_sec} 秒的面试求职短视频脚本。\n"
                 "要求:\n"
                 "- 5~8 个分镜; 第 1 镜为 point 开场(必须包含选题 hook);\n"
-                "  中间 point/qa 混排; 最后一镜 kind=ending(关注/下期引导);\n"
+                "  中间 point/qa 混排; 最后一镜 kind=ending;\n"
+                "- 开头钩子(硬性): 第 1 镜 narration 的第 1 句不超过 20 字, "
+                f"禁止问候和自报家门({OPENING_GREETINGS_HINT} 开头一律不合格), "
+                "必须是痛点、反常识观点或具体数字, 让人 3 秒内想看下去;\n"
+                "- 具体例子(硬性): 除开场镜外, 每个 point/qa 镜的 narration 都要给一组"
+                "「错误回答 vs 正确回答」的原话示例, 用引号写出候选人会说的原话, 不要空讲道理;\n"
+                "- 结尾: ending 镜给出和本选题相关的具体评论引导(抛一个观众能直接回答的问题), "
+                "再做关注/下期引导;\n"
                 "- 每镜字段: kind, header(画面标题 <=12字), "
                 "bullets(屏显要点, 每条 <=14字, 0~4 条), narration(口播);\n"
                 "- qa 镜额外填 question(面试问题)与 answer(答案要点屏显);\n"
                 f"- narration 口语化, 每场景 {MIN_NARRATION_CHARS}~{MAX_NARRATION_CHARS} 字"
                 "(约 15~25 秒), 全片时长向 {target_sec} 秒靠拢;\n"
                 "- 遵守 system 中的内容红线。\n\n"
+                f"{FEW_SHOT_EXAMPLE}\n\n"
                 "只输出如下结构的 JSON(不要任何其他文字):\n"
                 '{{"title": "...", "summary": "...", "scenes": ['
                 '{{"kind": "point", "header": "...", "bullets": ["..."], '

@@ -1,6 +1,7 @@
 """长度与结构确定性修正算子 + 全维度边界检查器 (BoundaryChecker)。"""
 from __future__ import annotations
 
+import re
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -11,6 +12,9 @@ from .redlines import scan_object_redlines, scan_text_redlines
 from .rules import BoundaryRules
 
 T = TypeVar("T")
+
+# 首镜口播以问候/自报家门开头判不合格(与 chains.script.OPENING_GREETINGS_HINT 同步)
+GREETING_OPENING_RE = re.compile(r"^[\s\"'“‘「]*(大家好|哈喽|嗨|我是|这里是)")
 
 
 def clamp_duration(sec: int | float, min_sec: int = 60, max_sec: int = 600) -> int:
@@ -303,7 +307,27 @@ class BoundaryChecker:
                             )
                         )
 
-            # 3. 末镜必须是 ending (针对完整 Script)
+            # 3. 首镜开头钩子: 禁止问候/自报家门
+            if scenes:
+                first = scenes[0]
+                narr0 = (
+                    getattr(first, "narration", None)
+                    if hasattr(first, "narration")
+                    else (first.get("narration") if isinstance(first, dict) else None)
+                )
+                m = GREETING_OPENING_RE.match(str(narr0)) if narr0 else None
+                if m:
+                    violations.append(
+                        Violation(
+                            category="structure",
+                            field="scenes[0].narration",
+                            message=f"首镜口播以问候/自报家门开头: '{m.group(1)}'",
+                            value=m.group(1),
+                            fix_hint="第 1 镜第 1 句不超过 20 字, 删掉问候和自报家门, 直接用痛点、反常识观点或具体数字开场。",
+                        )
+                    )
+
+            # 4. 末镜必须是 ending (针对完整 Script)
             if scenes and rules.require_ending_scene:
                 last_scene = scenes[-1]
                 kind = (

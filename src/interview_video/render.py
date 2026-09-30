@@ -7,6 +7,7 @@ kind→模板映射 point→scene.html / qa→qa.html / ending→ending.html,
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -74,8 +75,12 @@ def _render_html(
     industry: str = "",
     width: int = 1920,
     height: int = 1080,
+    reveal: int | None = None,
 ) -> str:
-    """渲染单个模板为 HTML 字符串(纯函数, 便于单测)。竖屏由 width < height 推断。"""
+    """渲染单个模板为 HTML 字符串(纯函数, 便于单测)。竖屏由 width < height 推断。
+
+    reveal: 只显示前 reveal 条要点(动效分步帧用), None=全部显示。
+    """
     template = env.get_template(template_name)
     portrait = width < height
     return template.render(
@@ -91,7 +96,13 @@ def _render_html(
         height=height,
         portrait=portrait,
         title_px=cover_title_px(title, width, portrait),
+        reveal=reveal,
     )
+
+
+def reveal_sidecar(png: Path) -> Path:
+    """要点分步帧清单(scene_XXX.reveal.json), 与场景主帧同目录。"""
+    return Path(png).with_suffix(".reveal.json")
 
 
 def _screenshot_html(page, html: str, path: Path) -> None:
@@ -100,6 +111,33 @@ def _screenshot_html(page, html: str, path: Path) -> None:
     # 等待 webfont/系统字体加载完成, 避免中文缺字截图
     page.evaluate("document.fonts.ready.then(() => true)")
     page.screenshot(path=str(path), full_page=False)
+
+
+def _render_reveal_steps(
+    page, env: Environment, template_name: str, frame_path: Path, settings: Settings, **kw
+) -> None:
+    """VIDEO_MOTION 开启时, 要点页额外渲染 k 张分步帧(前 0..k-1 条), 主帧即全显。
+
+    分步帧与清单先清掉旧的, 避免关闭动效或要点变少后残留旧帧被合成用到。
+    """
+    for old in frame_path.parent.glob(f"{frame_path.stem}_r*.png"):
+        old.unlink(missing_ok=True)
+    sidecar = reveal_sidecar(frame_path)
+    sidecar.unlink(missing_ok=True)
+    scene = kw["scene"]
+    if not settings.video_motion or scene.kind != "point" or not scene.bullets:
+        return
+    steps: list[str] = []
+    for r in range(len(scene.bullets)):
+        procs.checkpoint()
+        step = frame_path.with_name(f"{frame_path.stem}_r{r}.png")
+        _screenshot_html(page, _render_html(env, template_name, reveal=r, **kw), step)
+        steps.append(step.name)
+    steps.append(frame_path.name)
+    sidecar.write_text(
+        json.dumps({"bullets": list(scene.bullets), "frames": steps}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def render_project(
@@ -148,6 +186,12 @@ def render_project(
                 frame_path = scenes_dir / f"scene_{index:03d}.png"
                 _screenshot_html(page, html, frame_path)
                 frames.append(frame_path)
+                _render_reveal_steps(
+                    page, env, template_name, frame_path, settings,
+                    brand=settings.brand, title=script.title, script=script,
+                    scene=scene, index=index, total=total, industry=industry,
+                    width=width, height=height,
+                )
 
             # 封面帧
             procs.checkpoint()

@@ -5,6 +5,61 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-30
+
+可用可好用: 修复 B站真实上传、字幕按原文标点断行、脚本校验与友好报错、续跑保留元数据、红线误杀、
+Web 重生成保留画幅/音色与只读鉴权; 画面动效、分阶段进度、无人值守批量上传、`ivb init`。
+
+### 新增
+
+- `ivb validate <script.json>`: 严格校验脚本并打印每个分镜的字数与预估时长(270 字/分钟)。
+- `ivb init [--force] [--out-root]`: 生成 `~/.config/ivb/.env`(权限 0600, `OUT_ROOT` 写成绝对路径, 默认 `~/ivb-output`);
+  用户级目录可用 `IVB_CONFIG_DIR` 覆盖; 用户级 .env 中相对 `OUT_ROOT` 按主目录解析; doctor 未找到 .env 时提示 `ivb init`。
+- CLI 分阶段进度: generate/batch/series 每个分集显示 `[3/8] 画面渲染… 12.3s`, 每阶段结束打印 ✓/✗ 与耗时;
+  `run_pipeline(on_stage=...)` 回调, `graph.PIPELINE_STAGES`。
+- 画面动效 `VIDEO_MOTION`(默认 true): point 分镜要点按口播时间逐条出现, 每个分镜 1.00→1.04 缓慢放大,
+  场景首尾各 0.15s 黑场淡入淡出(不重叠, 片段时长与音频一致); `VIDEO_MOTION=false` 恢复静态单帧。
+- `ivb generate` 失败时写 `<out_dir>/error.log`(失败节点 + 完整堆栈)并打印绝对路径, 成功后删除旧 error.log;
+  成片后清理 `base.mp4` / `concat.list.txt` / `clips/`(`KEEP_INTERMEDIATES=true` 保留 clips), mp3 与 cue 缓存保留。
+- `ivb generate --regen-meta`: 续跑时强制重新生成 B站元数据。
+- 无人值守批量: `ivb batch --retry-failed --upload --slots 20:00,12:00 --start YYYY-mm-dd --refill N`;
+  选题库记录 `attempts/last_error/failed_at`, 失败目录下次自动用已有 script.json 续跑, 失败 3 次跳过;
+  TTS 鉴权、LLM 鉴权/预算、B站 cookie 失效立即中止整批(不计入选题失败次数);
+  定时发布在 2 小时后 ~ 15 天内挑下一个空闲时段(扫描 `OUT_ROOT/*/upload.json` 的 dtime);
+  选题库读写 `fcntl.flock` 跨进程锁, 整批互斥锁 `OUT_ROOT/.batch.lock`; README 补 crontab 示例。
+- Web: `POST /api/session` 设置 HttpOnly/SameSite=Strict 的 `ivb_token` cookie(`<video>`/`<img>` 可带鉴权加载);
+  `ivb web --host 0.0.0.0` 打印 127.0.0.1 与各局域网 IP 链接; 重生成/系列续跑支持 `aspect` 与「覆盖设置」开关。
+- 脚本提示词: 第 1 句 ≤20 字、禁止问候/自报家门开头(结构规则确定性拦截并触发重问)、
+  每个 point/qa 分镜给「错误回答 vs 正确回答」原话、ending 带选题相关评论引导, 附 few-shot 示例; 系列提示词同步。
+
+### 变更
+
+- 默认 `BILI_TID` 由 36(父分区, 投稿会被拒)改为 209(知识·职业职场); `ivb doctor` 在开启上传时校验分区号。
+- 启用 `WEB_TOKEN` 时 `/api/*` 与 `/files/*` 的读请求也需鉴权(请求头或 cookie; 写请求仍只认请求头);
+  `/files` 拒绝 `*.log`(项目目录内 `error-*.log` 除外); 页面 token 改存 localStorage。
+- manifest 的 video/cover/srt 存绝对路径; doubao 通道时 `voice` 记录 `TTS_DOUBAO_VOICE`;
+  失败原因写入 `generation.meta_error`, CLI 完成面板显示真实原因(不再固定显示「无 LLM key」)。
+- `summarize_usage(out_dir, since=)`: CLI 与 Web 任务只统计本次运行的 LLM 用量(续跑不再重复累计)。
+- 工作流节点失败只在终端显示一次(节点内堆栈降为 debug 写日志); 日志提示与输出目录打印绝对路径。
+- 示例脚本改为钩子开头、qa 带错误/正确回答示例、结尾评论引导。
+
+### 修复
+
+- B站上传必定失败: 封面以 URL 字符串传给 `VideoMeta` 触发 FileNotFoundError; 现以 `Picture.from_file` 传入, 由上传器上传一次。
+- B站上传异常统一为 `BiliUploadError`(中文说明; `-101`/未登录提示重新抓 SESSDATA), CLI/Web 不再打印裸堆栈;
+  单次上传超时 `max(300s, 每 MB 20s)`, 分片失败超过 10 次中止, 网络类错误退避 5s/20s 重试 2 次;
+  project.json 中的路径失效时回退到项目目录内同名文件(项目目录可移动); 标题 ≤80、简介 ≤2000(保留 AI 声明)、tag ≤20 字且最多 10 个。
+- 字幕标点全丢、词在中间被截断: edge 词级 cue 沿原文对齐拼回标点, 句末标点必断、逗号类在半行以上断、
+  超长时回退到行内最后一个标点(闭引号内的句号同样算句末); 显示时去掉行尾逗号类、行中逗号换空格。
+- 脚本文件为空/坏 JSON/字段错误时打印一行带绝对路径与字段位置的中文错误并以退出码 2 结束, 不再创建输出目录;
+  空 scenes、空口播、qa 缺问/答被拒(外部输入严格校验: `--script-file`、`--resume`、Web 编辑与续跑)。
+- `--resume` 清空或重复生成 B站元数据: 脚本未变复用旧 meta, 生成失败保留旧 meta。
+- 红线误杀/漏检: 「很多人想一次过」「35岁不要焦虑」「不要只盯着985」不再误拦; 「保证/包…一次过/上岸」、
+  公司侧年龄歧视、「15k到20k」「15K-20K」区间薪资可拦截。
+- Web 重生成/系列续跑丢失画幅与音色: 按 请求 → 项目记录(project.json / web_generation.json) → .env 取值, 仅通道一致时沿用音色。
+- Web 轮询吞错: 任务 404(服务重启)时停止轮询并恢复按钮提示续跑, 401 停止, 连续 5 次网络错误提示。
+- qa 页缺问/答时显示「None」: 缺问题隐藏 Q 卡, 缺答案以要点兜底或隐藏。
+
 ## [0.3.0] - 2026-09-30
 
 可用性与内容生产力: 环境自检、断点续跑与脚本审改、费用护栏、Web 安全与可取消、竖屏/BGM/选题库/批量/定时发布。

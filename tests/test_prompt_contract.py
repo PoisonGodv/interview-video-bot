@@ -75,3 +75,44 @@ def test_metadata_template_variables_not_prefilled():
     template_text = _meta_prompt().messages[1].template
     assert "{chapter_lines}" in template_text
     assert "{brand}" in template_text
+
+
+def test_script_prompt_hook_examples_and_comment_cta():
+    text = _render_script()
+    assert "不超过 20 字" in text
+    for w in ("大家好", "哈喽", "我是", "这里是"):
+        assert w in text
+    assert "错误回答 vs 正确回答" in text
+    assert "评论引导" in text
+    assert "参考示例" in text
+
+
+def test_script_prompt_few_shot_renders_valid_scenes():
+    """few-shot 里的花括号正确转义, 渲染后每个示例镜都是合法 Scene 且自身合规。"""
+    import json
+    import re
+
+    from interview_video.boundary import BoundaryChecker, BoundaryRules, scan_object_redlines
+    from interview_video.chains.script import FEW_SHOT_EXAMPLE
+    from interview_video.models import Scene
+
+    text = _render_script()
+    assert "{{" not in text and "}}" not in text
+    shots = [json.loads(m) for m in re.findall(r"^\S+镜: (\{.*\})$", text, re.M)]
+    assert len(shots) == 3 and FEW_SHOT_EXAMPLE.count("镜: ") == 3
+    scenes = [Scene.model_validate(s) for s in shots]
+    assert [s.kind for s in scenes] == ["point", "qa", "ending"]
+    checker = BoundaryChecker(BoundaryRules.non_script())
+    assert checker.check_length_and_structure({"scenes": shots}) == []
+    assert scan_object_redlines(shots) == []
+
+
+def test_series_prompts_forbid_greeting_opening():
+    from interview_video.chains.series import _CHAPTER_PROMPT, _OUTLINE_PROMPT
+
+    outline = _OUTLINE_PROMPT.messages[1].template
+    assert "自我介绍式引入" not in outline
+    assert "评论引导" in outline
+    chapter = _CHAPTER_PROMPT.messages[1].template
+    assert "大家好" in chapter and "不超过 20 字" in chapter
+    assert "错误回答 vs 正确回答" in chapter

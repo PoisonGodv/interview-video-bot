@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,9 +18,15 @@ from rich.panel import Panel
 from . import __version__
 from .config import Settings, describe_paths, load_settings
 from .estimate import SERIES_MAX_EPISODE_MIN, SERIES_MAX_EPISODES, SERIES_MIN_EPISODE_MIN
-from .graph import STOP_AFTER_CHOICES, resume_industry, run_pipeline, run_script_stage
+from .graph import (
+    PIPELINE_STAGES,
+    STOP_AFTER_CHOICES,
+    resume_industry,
+    run_pipeline,
+    run_script_stage,
+)
 from .logging_setup import setup_logging
-from .models import ProjectManifest, Topic
+from .models import ProjectManifest, Script, ScriptFileError, Topic, load_script_file
 
 app = typer.Typer(
     name="ivb",
@@ -109,22 +116,107 @@ def _upload(out_dir: Path, settings: Settings, force: bool, dtime: int | None = 
     except AlreadyUploadedError as exc:
         console.print(f"[yellow]{exc}[/]")
         raise typer.Exit(1) from None
+    except RuntimeError as exc:  # BiliUploadError 等: 中文说明已在消息里, 不打堆栈
+        console.print(f"[bold red]上传失败[/]: {exc}")
+        raise typer.Exit(1) from None
     console.print(f"[bold green]上传成功[/]: https://www.bilibili.com/video/{bvid}")
     if dtime is not None:
         when = datetime.fromtimestamp(dtime).strftime("%Y-%m-%d %H:%M")
         console.print(f"[cyan]定时发布[/]: {when}(审核通过后按时公开)")
 
 
-def _usage_line(out_dir: Path) -> str | None:
+def _usage_line(out_dir: Path, since: datetime | None = None) -> str | None:
     from .llm_audit import summarize_usage
 
-    u = summarize_usage(out_dir)
+    u = summarize_usage(out_dir, since=since)
     if not u["calls"]:
         return None
     return (
         f"LLM: {u['calls']} 次调用, tokens 入 {u['input_tokens']} / 出 {u['output_tokens']}"
-        f" / 共 {u['total_tokens']}(明细 {Path(out_dir) / 'llm_calls.jsonl'})"
+        f" / 共 {u['total_tokens']}(明细 {(Path(out_dir) / 'llm_calls.jsonl').resolve()})"
     )
+
+
+_STAGE_LABELS = dict(PIPELINE_STAGES)
+_STAGE_ORDER = [k for k, _ in PIPELINE_STAGES]
+
+
+class _StageProgress:
+    """run_pipeline 的 on_stage 回调: 进行中节点显示 spinner + 计时, 完成打印 ✓ 与耗时。"""
+
+    def __init__(self, prefix: str = "") -> None:
+        self.prefix = prefix
+        self.node: str | None = None
+        self.t0 = 0.0
+        self._status = None
+
+    def _label(self, node: str) -> str:
+        n = len(_STAGE_ORDER)
+        i = _STAGE_ORDER.index(node) + 1 if node in _STAGE_ORDER else 0
+        return f"{self.prefix}[{i}/{n}] {_STAGE_LABELS.get(node, node)}"
+
+    def __rich__(self) -> str:
+        if self.node is None:
+            return ""
+        return f"{self._label(self.node)}… {time.monotonic() - self.t0:.1f}s"
+
+    def __enter__(self) -> _StageProgress:
+        self._status = console.status(self, spinner="dots")
+        self._status.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._status is not None:
+            self._status.stop()
+        if exc_type is not None and self.node is not None:
+            console.print(
+                f"  [red]✗[/] {self._label(self.node)} 失败 "
+                f"[dim]{time.monotonic() - self.t0:.1f}s[/]"
+            )
+
+    def __call__(self, node: str, status: str) -> None:
+        if status == "start":
+            self.node, self.t0 = node, time.monotonic()
+            if self._status is not None:
+                self._status.update(self)
+        elif status == "done":
+            t0 = self.t0 if self.node == node else time.monotonic()
+            console.print(f"  [green]✓[/] {self._label(node)} [dim]{time.monotonic() - t0:.1f}s[/]")
+            if self.node == node:
+                self.node = None
+
+
+def _write_error_log(out_dir: Path, exc: BaseException, node: str | None) -> Path | None:
+    """失败现场写 <out_dir>/error.log(失败节点 + 完整堆栈), 返回绝对路径; 写失败返回 None。"""
+    import traceback
+
+    from .workflow_engine import WorkflowExecutionError
+
+    if isinstance(exc, WorkflowExecutionError):
+        node = exc.node
+    stage = f"{node}({_STAGE_LABELS[node]})" if node in _STAGE_LABELS else (node or "未知")
+    body = (
+        f"time={datetime.now().isoformat(timespec='seconds')}\n"
+        f"node={stage}\n"
+        f"error={type(exc).__name__}: {exc}\n\n"
+        + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    )
+    path = (Path(out_dir) / "error.log").resolve()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    except OSError as err:
+        logger.warning("写 error.log 失败: %s", err)
+        return None
+    return path
+
+
+def _load_script_or_exit(path: Path) -> Script:
+    try:
+        return load_script_file(path)
+    except ScriptFileError as exc:
+        console.print(f"[bold red]脚本校验失败:[/] {exc}")
+        raise typer.Exit(2) from None
 
 
 def _slug(text: str) -> str:
@@ -230,6 +322,9 @@ def generate(
     aspect: str | None = typer.Option(None, "--aspect", help=_ASPECT_HELP),
     bgm: Path | None = typer.Option(None, "--bgm", help=_BGM_HELP),
     publish_at: str | None = typer.Option(None, "--publish-at", help=_PUBLISH_AT_HELP),
+    regen_meta: bool = typer.Option(
+        False, "--regen-meta", help="续跑时强制重新生成B站元数据(默认脚本未变则复用 project.json 里的)",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="BILI_UPLOAD_ENABLED 时跳过上传确认"),
 ) -> None:
     """跑完整流水线生成视频。--script-file 模式全程不需要 LLM key。"""
@@ -240,6 +335,8 @@ def generate(
         console.print("[red]--stop-after 与 --resume 不能同时使用[/]")
         raise typer.Exit(2)
     dtime = _parse_publish_at(publish_at)  # 先校验, 不合法时不白跑流水线
+    if script_file is not None:
+        _load_script_or_exit(script_file)  # 坏脚本在建目录/跑流水线前就报出来
     settings = load_settings()
     _apply_tts(settings, tts, voice)
     _apply_video(settings, aspect, bgm)
@@ -249,9 +346,7 @@ def generate(
         out_dir = Path(resume)
         script_json = out_dir / "script.json"
         if script_json.exists():
-            from .models import Script
-
-            preset = Script.model_validate_json(script_json.read_text(encoding="utf-8"))
+            preset = _load_script_or_exit(script_json)
             console.print(f"[yellow]断点续跑[/]: 复用 {script_json}")
         elif not out_dir.is_dir():
             console.print(f"[red]--resume 目录不存在: {out_dir}[/]")
@@ -262,7 +357,8 @@ def generate(
         out_dir = Path(out) if out else _default_out_dir(settings, script_file, topic, industry or "互联网")
     industry = industry or (resume_industry(out_dir) if resume is not None else None) or "互联网"
     out_dir.mkdir(parents=True, exist_ok=True)
-    console.print(f"[bold]输出目录:[/] {out_dir}")
+    console.print(f"[bold]输出目录:[/] {out_dir.resolve()}")
+    run_started = datetime.now()
 
     if stop_after == "script":
         script = asyncio.run(
@@ -280,24 +376,32 @@ def generate(
         )
         return
 
+    progress = _StageProgress()
     try:
-        manifest: ProjectManifest = asyncio.run(
-            run_pipeline(
-                settings,
-                out_dir,
-                industry=industry,
-                topic_title=topic,
-                script_file=script_file,
-                script=preset,
+        with progress:
+            manifest: ProjectManifest = asyncio.run(
+                run_pipeline(
+                    settings,
+                    out_dir,
+                    industry=industry,
+                    topic_title=topic,
+                    script_file=script_file,
+                    script=preset,
+                    on_stage=progress,
+                    regen_meta=regen_meta,
+                )
             )
-        )
-    except Exception:
+    except Exception as exc:
+        err_path = _write_error_log(out_dir, exc, progress.node)
+        if err_path is not None:
+            console.print(f"[red]失败详情已写入:[/] {err_path}")
         if (out_dir / "script.json").exists():
             console.print(
                 f"[yellow]脚本已保存, 修复问题后可续跑(不再付 LLM 费用):[/] "
                 f"ivb generate --resume {out_dir}"
             )
         raise
+    (out_dir / "error.log").unlink(missing_ok=True)  # 续跑成功后清掉上次失败的现场
 
     # rich 打印产物清单
     lines = [
@@ -313,9 +417,13 @@ def generate(
             f"标题: {manifest.meta.title}",
             f"标签: {' '.join('#' + t for t in manifest.meta.tags)}",
         ]
-    else:
-        lines += ["", "[yellow]BiliMeta: 未生成(无 LLM key, 已降级)[/]"]
-    usage = _usage_line(out_dir)
+    meta_error = (manifest.generation or {}).get("meta_error")
+    if manifest.meta is None:
+        reason = meta_error or "未知原因"
+        lines += ["", f"[yellow]BiliMeta: 未生成(已降级: {reason})[/]"]
+    elif meta_error:
+        lines += [f"[yellow]元数据重新生成失败, 沿用旧版: {meta_error}[/]"]
+    usage = _usage_line(out_dir, since=run_started)
     if usage:
         lines += ["", usage]
     console.print(Panel("\n".join(lines), title="生成完成", border_style="green"))
@@ -331,6 +439,87 @@ def generate(
 
 
 @app.command()
+def validate(
+    script_file: Path = typer.Argument(..., help="待校验的 script.json"),
+) -> None:
+    """校验脚本 JSON(不调 LLM/TTS): 通过时打印每个分镜字数与预估时长。"""
+    from rich.table import Table
+
+    from .estimate import SPEECH_CHARS_PER_MIN
+
+    script = _load_script_or_exit(script_file)
+    table = Table(title=f"《{script.title}》{len(script.scenes)} 个分镜")
+    for col in ("#", "类型", "标题", "字数", "预估"):
+        table.add_column(col)
+    total_chars = 0
+    for i, sc in enumerate(script.scenes):
+        n = len(sc.narration.strip())
+        total_chars += n
+        table.add_row(str(i), sc.kind, sc.header, str(n), f"{n * 60 / SPEECH_CHARS_PER_MIN:.0f}s")
+    console.print(table)
+    total_sec = total_chars * 60 / SPEECH_CHARS_PER_MIN
+    console.print(
+        f"[bold green]校验通过[/]: 共 {total_chars} 字, 预估 {total_sec:.0f}s"
+        f"(按 {SPEECH_CHARS_PER_MIN} 字/分钟粗估)"
+    )
+
+
+def _batch_fatal(exc: BaseException) -> str | None:
+    """鉴权/额度/预算/环境类错误(后续每条都会同样失败)返回中止原因, 否则 None。"""
+    from .llm import is_fatal_error
+    from .llm_audit import LLMBudgetExceededError
+    from .tts import TTSAuthError
+    from .workflow_engine import WorkflowExecutionError
+
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, TTSAuthError):
+            return f"TTS 鉴权/额度错误: {cur}"
+        if isinstance(cur, LLMBudgetExceededError):
+            return f"LLM 预算超限: {cur}"
+        if is_fatal_error(cur):
+            return f"LLM 鉴权/配置错误: {cur}"
+        msg = str(cur)
+        if "LLM_API_KEY" in msg or msg.startswith("环境自检未通过"):
+            return msg.splitlines()[0]
+        nxt = cur.original_error if isinstance(cur, WorkflowExecutionError) else None
+        cur = nxt or cur.__cause__ or cur.__context__
+    return None
+
+
+def _batch_resume_script(item) -> tuple[Path | None, Script | None]:
+    """选题上次失败留下的目录里有合法 script.json 时返回 (目录, 脚本), 用于续跑不再写脚本。"""
+    if not item.project:
+        return None, None
+    out_dir = Path(item.project)
+    script_json = out_dir / "script.json"
+    if not script_json.is_file():
+        return None, None
+    try:
+        return out_dir, load_script_file(script_json)
+    except ScriptFileError as exc:
+        console.print(f"[yellow]旧目录脚本无效, 重新生成: {exc}[/]")
+        return None, None
+
+
+def _batch_refill(settings: Settings, industry: str | None, want: int, have: int) -> None:
+    from . import backlog as backlog_mod
+    from .chains import topic as topic_mod
+    from .llm import get_chat_model
+
+    ind = industry or "互联网"
+    need = want - have
+    console.print(f"[cyan]待用选题 {have} 条 < {want}, 先生成 {need} 条选题补充({ind})[/]")
+    llm = get_chat_model(settings)
+    avoid = backlog_mod.avoid_titles(settings, ind)
+    result = asyncio.run(topic_mod.generate_topics(llm, ind, need, avoid=avoid or None))
+    added = backlog_mod.add_topics(settings, result)
+    console.print(f"[green]选题库新增 {len(added)} 条[/]")
+
+
+@app.command()
 def batch(
     industry: str | None = typer.Option(None, "--industry", "-i", help="只取该行业的选题(默认不限)"),
     n: int = typer.Option(3, "--n", "-n", min=1, help="本批生成条数(取选题库前 N 条未用选题)"),
@@ -338,37 +527,157 @@ def batch(
     voice: str | None = typer.Option(None, "--voice", help=_VOICE_HELP),
     aspect: str | None = typer.Option(None, "--aspect", help=_ASPECT_HELP),
     bgm: Path | None = typer.Option(None, "--bgm", help=_BGM_HELP),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="包含已连续失败 3 次的选题(默认跳过)",
+    ),
+    upload: bool = typer.Option(False, "--upload", help="每条成功后自动上传B站(需 BILI_UPLOAD_ENABLED + cookie)"),
+    slots: str | None = typer.Option(
+        None, "--slots",
+        help="配合 --upload 定时发布: 每日时段 HH:MM, 多个逗号分隔(如 20:00,12:00); 自动跳过已排期时段",
+    ),
+    start: str | None = typer.Option(None, "--start", help="配合 --slots: 从该日期(YYYY-mm-dd)起排期, 默认今天"),
+    refill: int | None = typer.Option(
+        None, "--refill", min=1, help="待用选题少于该数时先调 LLM 生成选题补充(默认 --industry 或 互联网)",
+    ),
 ) -> None:
-    """批量生产: 按选题库顺序逐条生成视频; 单条失败记录后继续, 结束打印汇总表。"""
-    from rich.table import Table
+    """批量生产: 按选题库顺序逐条生成视频; 单条失败记账后继续, 结束打印汇总表。
 
+    失败的选题下次运行续跑旧目录(复用 script.json); 鉴权/额度/预算错误立即中止整批。
+    """
     from . import backlog as backlog_mod
+
+    slot_list: list[tuple[int, int]] = []
+    start_day = None
+    if (slots or start) and not upload:
+        console.print("[red]--slots/--start 需与 --upload 一起使用[/]")
+        raise typer.Exit(2)
+    if start and not slots:
+        console.print("[red]--start 需与 --slots 一起使用[/]")
+        raise typer.Exit(2)
+    if slots:
+        try:
+            slot_list = backlog_mod.parse_slots(slots)
+        except ValueError as exc:
+            console.print(f"[red]--slots: {exc}[/]")
+            raise typer.Exit(2) from None
+    if start:
+        try:
+            start_day = datetime.strptime(start.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            console.print(f"[red]--start 格式应为 YYYY-mm-dd, 收到 {start!r}[/]")
+            raise typer.Exit(2) from None
 
     settings = load_settings()
     _apply_tts(settings, tts, voice)
     _apply_video(settings, aspect, bgm)
     _announce_paths(settings)
-    items = backlog_mod.pending(settings, industry)[:n]
+    if upload:
+        from .bilibili import build_credential, tid_error
+
+        if not settings.bili_upload_enabled or build_credential(settings) is None:
+            console.print("[red]--upload 需在 .env 设置 BILI_UPLOAD_ENABLED=true 并配置 cookie 三件套[/]")
+            raise typer.Exit(2)
+        if err := tid_error(settings.bili_tid):
+            console.print(f"[red]{err}[/]")
+            raise typer.Exit(2)
+
+    try:
+        with backlog_mod.batch_lock(settings):
+            _batch_run(
+                settings, industry=industry, n=n, retry_failed=retry_failed,
+                upload=upload, slot_list=slot_list, start_day=start_day, refill=refill,
+            )
+    except backlog_mod.BatchLockedError as exc:
+        console.print(f"[yellow]{exc}[/]")
+        raise typer.Exit(1) from None
+
+
+def _batch_run(
+    settings: Settings, *, industry: str | None, n: int, retry_failed: bool,
+    upload: bool, slot_list: list[tuple[int, int]], start_day, refill: int | None,
+) -> None:
+    from rich.table import Table
+
+    from . import backlog as backlog_mod
+
+    max_attempts = None if retry_failed else backlog_mod.MAX_ATTEMPTS
+    if refill is not None:
+        have = len(backlog_mod.pending(settings, industry, max_attempts=max_attempts))
+        if have < refill:
+            try:
+                _batch_refill(settings, industry, refill, have)
+            except Exception as exc:  # noqa: BLE001
+                if reason := _batch_fatal(exc):
+                    console.print(f"[bold red]补充选题失败, 批量中止:[/] {reason}")
+                    raise typer.Exit(1) from None
+                logger.exception("补充选题失败")
+                console.print(f"[yellow]补充选题失败, 用现有选题继续: {type(exc).__name__}: {exc}[/]")
+
+    remaining = backlog_mod.pending(settings, industry, max_attempts=max_attempts)
+    items = remaining[:n]
+    if max_attempts is not None:
+        skipped = len(backlog_mod.pending(settings, industry)) - len(remaining)
+        if skipped:
+            console.print(
+                f"[yellow]跳过 {skipped} 条已失败 {max_attempts} 次的选题(加 --retry-failed 重试)[/]"
+            )
     if not items:
         console.print("[yellow]选题库没有未用选题, 先运行 ivb topics -i <行业> 生成[/]")
         raise typer.Exit(1)
-    console.print(f"[bold]批量生成 {len(items)} 条[/](选题库剩余 {len(backlog_mod.pending(settings, industry))} 条)")
+    console.print(f"[bold]批量生成 {len(items)} 条[/](选题库剩余 {len(remaining)} 条)")
 
     rows: list[tuple[str, str, str, str]] = []
+    abort: str | None = None
     for idx, item in enumerate(items, 1):
-        out_dir = _default_out_dir(settings, None, item.title, item.industry)
-        console.print(f"[bold cyan]({idx}/{len(items)})[/] {item.title} → {out_dir}")
+        out_dir, preset = _batch_resume_script(item)
+        if out_dir is None:
+            out_dir = _default_out_dir(settings, None, item.title, item.industry)
+        tag = "[yellow]续跑[/] " if preset is not None else ""
+        console.print(f"[bold cyan]({idx}/{len(items)})[/] {tag}{item.title} → {out_dir}")
+        progress = _StageProgress()
         try:
-            manifest = asyncio.run(run_pipeline(
-                settings, out_dir, industry=item.industry, topic_title=item.title,
-            ))
-            rows.append((item.title, "成功", f"{manifest.duration_total:.0f}s", str(out_dir)))
+            with progress:
+                manifest = asyncio.run(run_pipeline(
+                    settings, out_dir, industry=item.industry, topic_title=item.title,
+                    script=preset, on_stage=progress,
+                ))
         except KeyboardInterrupt:
             rows.append((item.title, "中断", "", str(out_dir)))
             break
         except Exception as exc:  # noqa: BLE001 —— 单条失败不影响后续
             logger.exception("批量生成失败: %s", item.title)
-            rows.append((item.title, "失败", f"{type(exc).__name__}: {exc}"[:80], str(out_dir)))
+            if out_dir.is_dir():
+                _write_error_log(out_dir, exc, progress.node)
+            detail = f"{type(exc).__name__}: {exc}"
+            abort = _batch_fatal(exc)
+            has_script = (out_dir / "script.json").exists()
+            try:
+                # 鉴权/预算类不怪选题, 不计失败次数; 仍记目录以便下次续跑
+                attempts = backlog_mod.mark_failed(
+                    settings, item.title, item.industry, out_dir if has_script else None,
+                    detail, count=abort is None,
+                )
+            except OSError as err:
+                logger.warning("选题库记账失败: %s", err)
+                attempts = item.attempts
+            rows.append((item.title, "中止" if abort else f"失败#{attempts}", detail[:80], str(out_dir)))
+            if abort:
+                break
+            continue
+        (out_dir / "error.log").unlink(missing_ok=True)
+        detail = f"{manifest.duration_total:.0f}s"
+        if upload:
+            try:
+                status, info, abort = _batch_upload(settings, out_dir, slot_list, start_day)
+            except KeyboardInterrupt:
+                rows.append((item.title, "中断", f"{detail} 上传被中断", str(out_dir)))
+                break
+            detail = f"{detail} {info}".strip()
+            rows.append((item.title, status, detail, str(out_dir)))
+            if abort:
+                break
+        else:
+            rows.append((item.title, "成功", detail, str(out_dir)))
 
     table = Table(title="批量生成汇总")
     for col in ("选题", "结果", "时长/原因", "目录"):
@@ -377,12 +686,43 @@ def batch(
         color = "green" if status == "成功" else "red"
         table.add_row(title, f"[{color}]{status}[/]", detail, path)
     console.print(table)
+    if abort:
+        console.print(f"[bold red]批量已中止:[/] {abort}\n修复配置后重新运行, 失败条目会续跑旧目录。")
     failed = sum(1 for r in rows if r[1] != "成功")
     if failed:
         console.print(
-            f"[yellow]{failed} 条未完成; 已有 script.json 的可 ivb generate --resume <目录> 续跑[/]"
+            f"[yellow]{failed} 条未完成; 下次 ivb batch 会自动续跑已有 script.json 的目录"
+            f"(或手动 ivb generate --resume <目录>); 已成片未上传的可 ivb upload <目录>[/]"
         )
         raise typer.Exit(1)
+
+
+def _batch_upload(
+    settings: Settings, out_dir: Path, slot_list: list[tuple[int, int]], start_day,
+) -> tuple[str, str, str | None]:
+    """成片后上传(可选按时段定时发布); 返回 (状态, 说明, 中止原因)。"""
+    from . import backlog as backlog_mod
+    from . import bilibili as bili_mod
+
+    dtime = None
+    if slot_list:
+        dtime = backlog_mod.next_slot(
+            slot_list, backlog_mod.taken_dtimes(settings.out_root), start=start_day,
+        )
+        if dtime is None:
+            return "未上传", "15 天内无空闲发布时段", None
+    try:
+        bvid = asyncio.run(bili_mod.upload_project(out_dir, settings, dtime=dtime))
+    except bili_mod.AlreadyUploadedError as exc:
+        return "成功", f"已上传过 {exc.bvid}", None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("批量上传失败: %s", out_dir)
+        text = str(exc)
+        # cookie 失效/未配置(提示含 SESSDATA)每条都会失败, 中止整批
+        fatal = f"B站上传鉴权错误: {text.splitlines()[0]}" if "SESSDATA" in text else None
+        return "上传失败", f"{type(exc).__name__}: {text}"[:80], fatal
+    when = datetime.fromtimestamp(dtime).strftime("%m-%d %H:%M") if dtime else "立即发布"
+    return "成功", f"{bvid} {when}", None
 
 
 @app.command()
@@ -509,6 +849,7 @@ async def _series_main(
                 f"[green]第 {p['ep_idx'] + 1} 集脚本完成({len(p['script'].scenes)} 镜)[/]"
             )
 
+    run_started = datetime.now()
     if resume_dir is not None:
         root = Path(resume_dir)
         console.print(f"[yellow]断点续跑[/] → {root}")
@@ -533,7 +874,10 @@ async def _series_main(
                     console.print(f"[yellow]第 {i + 1} 集已有成片, 跳过[/] → {out_dir}")
                     continue
                 console.print(f"[bold]第 {i + 1}/{len(scripts)} 集媒体合成[/] → {out_dir}")
-                await run_pipeline(settings, out_dir, industry=theme, script=script)
+                with _StageProgress(prefix=f"第{i + 1}集 ") as progress:
+                    await run_pipeline(
+                        settings, out_dir, industry=theme, script=script, on_stage=progress,
+                    )
     except Exception:
         if (root / "series.json").exists():
             console.print(
@@ -541,7 +885,7 @@ async def _series_main(
             )
         raise
     body = f"共 {len(scripts)} 集 → {root}"
-    usage = _usage_line(root)
+    usage = _usage_line(root, since=run_started)
     if usage:
         body += f"\n策划/编剧 {usage}"
     console.print(Panel(body, title="系列生成完成", border_style="green"))
@@ -578,6 +922,27 @@ def eval(
 
 
 @app.command()
+def init(
+    force: bool = typer.Option(False, "--force", "-f", help="覆盖已存在的用户级 .env"),
+    out_root: str = typer.Option(
+        "~/ivb-output", "--out-root", help="写入 OUT_ROOT 的输出目录(会展开为绝对路径)",
+    ),
+) -> None:
+    """生成用户级配置 ~/.config/ivb/.env(权限 0600), 之后可在任意目录运行 ivb。"""
+    from .config import init_user_env, user_env_file
+
+    try:
+        path = init_user_env(force=force, out_root=out_root)
+    except FileExistsError:
+        console.print(f"[yellow]已存在 {user_env_file()}, 未覆盖; 确需重建加 --force[/]")
+        raise typer.Exit(1) from None
+    console.print(f"[bold green]已生成[/] {path}(权限 0600)")
+    if Path(".env").is_file():
+        console.print("[yellow]注意: 当前目录存在 ./.env, 在此目录运行时它优先于用户级配置[/]")
+    console.print("下一步: 编辑该文件填写 LLM_API_KEY 等, 然后运行 [bold]ivb doctor[/] 自检")
+
+
+@app.command()
 def doctor(
     ping: bool = typer.Option(False, "--ping", help="额外发一次极小 LLM 请求验证 key/base_url"),
 ) -> None:
@@ -604,17 +969,16 @@ def web(
     """启动 Web 操作台(选题/生成进度/作品库/元数据编辑/上传)。"""
     import uvicorn
 
-    from .web import create_app
+    from .web import access_urls, create_app
 
     settings = load_settings()
     _announce_paths(settings)
     web_app = create_app(settings, host=host)
-    url = f"http://{host}:{port}/"
     token = web_app.state.web_token
     if token:
-        url += f"#token={token}"
-        console.print("[yellow]写操作需令牌(X-IVB-Token), 请用下方带 #token= 的链接打开; 固定令牌可设 WEB_TOKEN[/]")
-    console.print(f"[bold green]Web 操作台[/] → {url}")
+        console.print("[yellow]访问需令牌, 请用下方带 #token= 的链接打开; 固定令牌可设 WEB_TOKEN[/]")
+    for url in access_urls(host, port, token):
+        console.print(f"[bold green]Web 操作台[/] → {url}")
     uvicorn.run(web_app, host=host, port=port, log_level="warning")
 
 
@@ -624,7 +988,7 @@ def main() -> None:
     try:  # 日志文件目录跟随 out_root; 失败退化为仅控制台
         out_root = load_settings().out_root
         setup_logging(out_root)
-        log_hint = str(out_root / "ivb.log")
+        log_hint = str((out_root / "ivb.log").resolve())
     except Exception:  # noqa: BLE001
         setup_logging()
     try:

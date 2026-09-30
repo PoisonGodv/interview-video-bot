@@ -1,10 +1,12 @@
 """配置: pydantic-settings, 环境变量 = 字段名大写(与 drivecast 命名一致)。
 
-.env 查找顺序(首个存在者生效): ``$IVB_ENV_FILE`` → ``./.env`` → ``~/.config/ivb/.env``。
+.env 查找顺序(首个存在者生效): ``$IVB_ENV_FILE`` → ``./.env`` → ``~/.config/ivb/.env``
+(用户级目录可用 ``$IVB_CONFIG_DIR`` 覆盖; ``ivb init`` 生成该文件)。
 """
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -71,6 +73,8 @@ class Settings(BaseSettings):
     video_width: int = 1920
     video_height: int = 1080
     fps: int = 30
+    video_motion: bool = True  # 画面动效: 要点逐条出现 + 缓慢放大 + 场景间黑场过渡(false=静态单帧)
+    keep_intermediates: bool = False  # 成片后保留 clips/ 分镜片段(默认删除; mp3 与字幕 cue 始终保留)
 
     # ---- 背景音乐(可选) ----
     bgm_file: Path | None = None       # 未设置=不加 BGM; 循环铺满全片, 结尾淡出
@@ -90,14 +94,14 @@ class Settings(BaseSettings):
     loudness_lra: float = 11.0
 
     # ---- B站 ----
-    bili_tid: int = 36
+    bili_tid: int = 209
     bili_upload_enabled: bool = False
     bili_sessdata: SecretStr | None = None
     bili_jct: SecretStr | None = None
     bili_buvid3: SecretStr | None = None
 
     # ---- 输出 ----
-    out_root: Path = Path("output")  # 相对路径按当前目录解析; 可写绝对路径或 ~/...
+    out_root: Path = Path("output")  # 相对路径按当前目录解析(用户级 .env 中按主目录); 可写绝对路径或 ~/...
 
     # ---- Web 操作台 ----
     # 写操作令牌(请求头 X-IVB-Token); 未设置时: 绑回环不校验, 绑非回环地址启动时自动生成并打印
@@ -168,7 +172,15 @@ class Settings(BaseSettings):
         return all((self.bili_sessdata, self.bili_jct, self.bili_buvid3))
 
 
-USER_ENV_FILE = Path("~/.config/ivb/.env")
+def user_config_dir() -> Path:
+    """用户级配置目录: ``$IVB_CONFIG_DIR``(测试/多账号用) 或 ``~/.config/ivb``。"""
+    if explicit := os.environ.get("IVB_CONFIG_DIR", "").strip():
+        return Path(explicit).expanduser()
+    return Path("~/.config/ivb").expanduser()
+
+
+def user_env_file() -> Path:
+    return user_config_dir() / ".env"
 
 
 def env_file_candidates() -> list[Path]:
@@ -176,7 +188,7 @@ def env_file_candidates() -> list[Path]:
     out = []
     if explicit := os.environ.get("IVB_ENV_FILE", "").strip():
         out.append(Path(explicit).expanduser())
-    out += [Path(".env"), USER_ENV_FILE.expanduser()]
+    out += [Path(".env"), user_env_file()]
     return out
 
 
@@ -192,7 +204,52 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
     path = Path(env_file).expanduser().resolve() if env_file else resolve_env_file()
     s = Settings(_env_file=str(path) if path else None)  # type: ignore[call-arg]
     s._env_path = path
+    # 用户级配置不绑定任何项目目录: 其中的相对 OUT_ROOT 按主目录解析, 不随当前目录漂移
+    if path is not None and not s.out_root.is_absolute() and path == user_env_file().resolve():
+        s.out_root = Path.home() / s.out_root
     return s
+
+
+DEFAULT_USER_OUT_ROOT = "~/ivb-output"
+
+_MINIMAL_ENV_TEMPLATE = """\
+# interview-video-bot 配置(ivb init 生成); 完整说明见项目 .env.example
+# 注意: 注释请单独成行, 不要写在 KEY= 后面
+LLM_MODEL=deepseek-chat
+LLM_API_KEY=
+# 例 https://api.deepseek.com ; OpenAI 官方可留空
+LLM_BASE_URL=
+TTS_PROVIDER=edge
+BILI_UPLOAD_ENABLED=false
+OUT_ROOT=
+"""
+
+
+def env_template() -> str:
+    """优先用仓库根的 .env.example(源码/可编辑安装), 找不到时退回内置精简模板。"""
+    example = Path(__file__).resolve().parents[2] / ".env.example"
+    if example.is_file():
+        return example.read_text(encoding="utf-8")
+    return _MINIMAL_ENV_TEMPLATE
+
+
+def init_user_env(force: bool = False, out_root: str | Path = DEFAULT_USER_OUT_ROOT) -> Path:
+    """生成用户级 .env(权限 0600), OUT_ROOT 写成绝对路径; 已存在且未 force 时抛 FileExistsError。"""
+    target = user_env_file()
+    if target.exists() and not force:
+        raise FileExistsError(str(target))
+    out_abs = Path(out_root).expanduser().resolve()
+    text = env_template()
+    line = f"OUT_ROOT={out_abs}"
+    text, n = re.subn(r"(?m)^#?[ \t]*OUT_ROOT=.*$", lambda _: line, text, count=1)
+    if not n:
+        text = text.rstrip("\n") + f"\n{line}\n"
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(target, 0o600)  # 覆盖已存在文件时 os.open 的 mode 不生效
+    return target
 
 
 def describe_paths(settings: Settings) -> str:

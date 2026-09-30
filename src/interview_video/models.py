@@ -5,13 +5,28 @@
 """
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 SceneKind = Literal["point", "qa", "ending"]
+
+_STRICT_KEY = "strict_script"
+
+
+def _strict(info: ValidationInfo) -> bool:
+    return bool(info.context and info.context.get(_STRICT_KEY))
 
 
 # ---------- 内容层(LLM 产出) ----------
@@ -41,11 +56,95 @@ class Scene(BaseModel):
     question: str | None = Field(default=None, description="kind=qa 时的面试问题")
     answer: str | None = Field(default=None, description="kind=qa 时的答案要点(屏显)")
 
+    @field_validator("narration")
+    @classmethod
+    def _narration_not_blank(cls, v: str, info: ValidationInfo) -> str:
+        if _strict(info) and not v.strip():
+            raise ValueError("口播 narration 不能为空")
+        return v
+
+    @model_validator(mode="after")
+    def _qa_fields(self, info: ValidationInfo) -> Scene:
+        if _strict(info) and self.kind == "qa":
+            missing = [f for f in ("question", "answer") if not (getattr(self, f) or "").strip()]
+            if missing:
+                raise ValueError(f"kind=qa 时 {'/'.join(missing)} 不能为空")
+        return self
+
 
 class Script(BaseModel):
     title: str
     scenes: list[Scene] = Field(description="5~8 个分镜, 第一镜开场, 最后一镜 kind=ending")
     summary: str = ""
+
+    @field_validator("scenes")
+    @classmethod
+    def _scenes_not_empty(cls, v: list[Scene], info: ValidationInfo) -> list[Scene]:
+        if _strict(info) and not v:
+            raise ValueError("不能为空(至少 1 个分镜)")
+        return v
+
+
+def validate_script(data: object) -> Script:
+    """外部输入(脚本文件/Web 编辑/续跑)的严格校验: scenes 非空、口播非空、qa 须有问答。
+
+    直接构造 Script(...) 或解析 LLM 输出不走严格模式(由边界规则负责修复)。
+    """
+    if isinstance(data, (str, bytes)):
+        return Script.model_validate_json(data, context={_STRICT_KEY: True})
+    return Script.model_validate(data, context={_STRICT_KEY: True})
+
+
+class ScriptFileError(ValueError):
+    """脚本文件不存在 / JSON 语法错误 / 字段不合法。"""
+
+
+_ZH_MSG = {
+    "missing": "缺少必填字段",
+    "too_short": "不能为空(至少 1 项)",
+    "string_type": "须为字符串",
+    "list_type": "须为数组",
+    "model_type": "须为对象",
+    "model_attributes_type": "须为对象",
+}
+
+
+def format_validation_error(exc: ValidationError) -> str:
+    """ValidationError → 'scenes[1].kind: ...; ...'(下标用 [i], 便于对照 JSON)。"""
+    parts = []
+    for e in exc.errors():
+        loc = ""
+        for p in e["loc"]:
+            loc += f"[{p}]" if isinstance(p, int) else (f".{p}" if loc else str(p))
+        msg = _ZH_MSG.get(e["type"]) or e["msg"].removeprefix("Value error, ")
+        if e["type"] == "literal_error":
+            msg = "须为 " + "/".join(re.findall(r"'([^']*)'", str(e.get("ctx", {}).get("expected", ""))))
+        parts.append(f"{loc or '(根)'}: {msg}")
+    return "; ".join(parts)
+
+
+def load_script_file(path: Path | str) -> Script:
+    """读取并校验脚本 JSON; 任何问题都转成带绝对路径与字段位置的 ScriptFileError。"""
+    p = Path(path).expanduser()
+    where = p.resolve()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ScriptFileError(f"脚本文件不存在: {where}") from None
+    except OSError as exc:
+        raise ScriptFileError(f"脚本文件读取失败 ({where}): {exc}") from None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ScriptFileError(
+            f"{p.name} 不是合法 JSON ({where}): 第 {exc.lineno} 行第 {exc.colno} 列 {exc.msg}"
+        ) from None
+    try:
+        return validate_script(data)
+    except ValidationError as exc:
+        raise ScriptFileError(
+            f"{p.name} 格式错误 ({where}): {format_validation_error(exc)}"
+        ) from None
 
 
 # ---------- 媒体层 ----------

@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import re
 import secrets
+import socket
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +18,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
@@ -27,7 +29,15 @@ from .estimate import (
     SERIES_MIN_EPISODE_MIN,
     estimate_series,
 )
-from .models import BiliMeta, ProjectManifest, Script, SeriesPlan
+from .models import (
+    BiliMeta,
+    ProjectManifest,
+    Script,
+    SeriesPlan,
+    load_script_file,
+    validate_script,
+)
+from .models import format_validation_error as _format_validation_error
 
 # 流水线节点 → 中文阶段名(与 graph.py 的节点名一一对应)
 STAGES: list[tuple[str, str]] = [
@@ -67,6 +77,10 @@ _SAMPLE_SCRIPT_CANDIDATES = (
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 _LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 TOKEN_HEADER = "X-IVB-Token"
+TOKEN_COOKIE = "ivb_token"
+_ASPECTS = ("16:9", "9:16")
+# Web 任务的配音/画幅记录(草稿与系列根目录没有 project.json 时, 重生成/续跑据此沿用)
+_GEN_RECORD = "web_generation.json"
 
 
 def sample_script_path() -> Path | None:
@@ -81,6 +95,41 @@ def is_loopback(host: str) -> bool:
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
         return False
+
+
+def lan_ips() -> list[str]:
+    """本机局域网 IPv4(绑 0.0.0.0 时打印可访问链接用); 探测失败返回空列表。"""
+    ips: list[str] = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))  # UDP connect 不发包, 只为取出口地址
+            ips.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        ips += socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        pass
+    seen: list[str] = []
+    for ip in ips:
+        try:
+            if ipaddress.ip_address(ip).is_loopback or ip in seen:
+                continue
+        except ValueError:
+            continue
+        seen.append(ip)
+    return seen
+
+
+def access_urls(host: str, port: int, token: str | None) -> list[str]:
+    """启动时打印的访问链接; 绑通配地址时列出局域网 IP(0.0.0.0 本身在别的设备上打不开)。"""
+    hosts = [host]
+    if host in ("0.0.0.0", "::", ""):
+        hosts = ["127.0.0.1", *lan_ips()]
+    elif ":" in host and not host.startswith("["):
+        hosts = [f"[{host}]"]
+    suffix = f"#token={token}" if token else ""
+    return [f"http://{h}:{port}/{suffix}" for h in hosts]
 
 
 def _hostname(netloc: str) -> str | None:
@@ -125,8 +174,10 @@ class EstimateRequest(BaseModel):
 
 
 class RegenerateRequest(BaseModel):
+    """不传的字段沿用项目上次生成时的记录(project.json / web_generation.json), 再退回 .env。"""
     provider: str | None = None
     voice: str | None = None
+    aspect: Literal["16:9", "9:16"] | None = None
 
 
 class UploadRequest(BaseModel):
@@ -152,6 +203,7 @@ class Job:
         self.resume_dir = resume_dir
         self.out_dir: Path | None = resume_dir
         self.status = "running"  # running | done | failed | cancelled
+        self.started_at = datetime.now()  # 本次任务 LLM 用量只统计此后的记录(续跑目录有旧记录)
         self.current_stage: str | None = None
         self.done_stages: list[str] = []
         self.error: str | None = None
@@ -265,12 +317,6 @@ async def _execute_script_stage(
     )
 
 
-def _format_validation_error(exc: ValidationError) -> str:
-    return "; ".join(
-        f"{'.'.join(str(p) for p in e['loc']) or '(根)'}: {e['msg']}" for e in exc.errors()
-    )
-
-
 def _series_status(root: Path) -> dict[str, Any] | None:
     """系列根目录进度: 规划集数 vs 已出片集数; 无 series.json 返回 None。"""
     try:
@@ -288,14 +334,45 @@ def _series_status(root: Path) -> dict[str, Any] | None:
     }
 
 
-def _sum_usage(root: Path) -> dict[str, int]:
+def _recorded_generation(dirs: list[Path]) -> dict[str, str]:
+    """按顺序找第一份生成记录: project.json(generation + voice) 优先, 其次 web_generation.json。"""
+    for d in dirs:
+        try:
+            m = ProjectManifest.model_validate_json((d / "project.json").read_text(encoding="utf-8"))
+        except (OSError, ValidationError):
+            m = None
+        if m is not None and m.generation:
+            rec = {"provider": m.generation.get("tts_provider", ""),
+                   "aspect": m.generation.get("video_aspect", ""), "voice": m.voice}
+            return {k: v for k, v in rec.items() if v}
+        try:
+            raw = json.loads((d / _GEN_RECORD).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict):
+            return {k: v for k in ("provider", "aspect", "voice")
+                    if isinstance(v := raw.get(k), str) and v}
+    return {}
+
+
+def _write_generation_record(d: Path, s: Settings) -> None:
+    voice = s.tts_doubao_voice if s.tts_provider == "doubao" else s.tts_voice
+    rec = {"provider": s.tts_provider, "aspect": s.video_aspect, "voice": voice}
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / _GEN_RECORD).write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _sum_usage(root: Path, since: datetime | None = None) -> dict[str, int]:
     """系列根目录(策划/编剧) + 各分集目录(元数据)的 llm_calls.jsonl 合计。"""
     from .llm_audit import summarize_usage
 
-    total = summarize_usage(root)
+    total = summarize_usage(root, since=since)
     for d in root.iterdir():
         if d.is_dir():
-            for k, v in summarize_usage(d).items():
+            for k, v in summarize_usage(d, since=since).items():
                 total[k] += v
     return total
 
@@ -305,12 +382,15 @@ def _sum_usage(root: Path) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 def _install_guard(app: FastAPI, settings: Settings, bind_host: str) -> None:
-    """Host 白名单(防 DNS 重绑定) + 写请求同源校验(防 CSRF) + 非回环绑定时写请求令牌。
+    """Host 白名单(防 DNS 重绑定) + 写请求同源校验(防 CSRF) + 非回环绑定时令牌。
 
     - Host 头: 回环名 / --host 本身 / WEB_ALLOWED_HOSTS; 绑通配地址(0.0.0.0/::)时另放行 IP 字面量
       (重绑定攻击必须用域名);
     - POST/PUT/DELETE/PATCH: 有 Origin(无则 Referer)时其 host:port 必须等于 Host 头; 都没有视为非浏览器客户端;
-    - 令牌: 配了 WEB_TOKEN 或绑非回环地址时, 写请求须带 X-IVB-Token(未配置则生成, 见 app.state.web_token)。
+    - 令牌: 配了 WEB_TOKEN 或绑非回环地址时(未配置则生成, 见 app.state.web_token),
+      除首页外的请求都要令牌: 写请求须带 X-IVB-Token 头; 读请求(/api、/files)头或 cookie ivb_token 均可
+      (<video>/<img> 带不了头, 页面先 POST /api/session 换 HttpOnly cookie);
+    - /files 不外发 *.log(ivb.log 等运行日志), 失败现场 error-*.log 除外。
     """
     wildcard = bind_host in ("0.0.0.0", "::", "")
     allowed = set(_LOOPBACK_NAMES)
@@ -338,24 +418,40 @@ def _install_guard(app: FastAPI, settings: Settings, bind_host: str) -> None:
                 return False
         return False
 
+    def _match(value: str | None) -> bool:
+        return token is not None and value is not None and secrets.compare_digest(
+            value.encode(), token.encode()
+        )
+
+    def _unauthorized() -> JSONResponse:
+        return JSONResponse(
+            {"detail": f"缺少或错误的操作令牌({TOKEN_HEADER}), 请用启动时打印的带 #token= 的链接打开"},
+            status_code=401,
+        )
+
     @app.middleware("http")
     async def _guard(request: Request, call_next):
         host_header = request.headers.get("host", "")
         if not _host_ok(host_header):
             return JSONResponse({"detail": f"拒绝的 Host: {host_header}"}, status_code=403)
-        if request.method in _UNSAFE_METHODS:
+        path = request.url.path
+        if path.startswith("/files/"):
+            base = path.rstrip("/").rsplit("/", 1)[-1].lower()
+            if base.endswith(".log") and not (base.startswith("error-") and "/" in path[7:]):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
+        if request.method not in _UNSAFE_METHODS:
+            if token is not None and path != "/" and not (
+                _match(request.headers.get(TOKEN_HEADER)) or _match(request.cookies.get(TOKEN_COOKIE))
+            ):
+                return _unauthorized()
+        else:
             source = request.headers.get("origin") or request.headers.get("referer")
             if source is not None:
                 parts = urlsplit(source)
                 if not parts.netloc or parts.netloc.lower() != host_header.lower():
                     return JSONResponse({"detail": "跨站请求被拒绝(Origin 不匹配)"}, status_code=403)
-            if token is not None and not secrets.compare_digest(
-                request.headers.get(TOKEN_HEADER, "").encode(), token.encode()
-            ):
-                return JSONResponse(
-                    {"detail": f"缺少或错误的操作令牌({TOKEN_HEADER}), 请用启动时打印的带 #token= 的链接打开"},
-                    status_code=401,
-                )
+            if token is not None and not _match(request.headers.get(TOKEN_HEADER)):
+                return _unauthorized()
         return await call_next(request)
 
 
@@ -406,6 +502,14 @@ def create_app(
     @app.get("/", response_class=FileResponse)
     async def index() -> FileResponse:
         return FileResponse(_STATIC_DIR / "index.html")
+
+    # ---------- 会话(令牌 → HttpOnly cookie, 供 <video>/<img> 等带不了头的请求) ----------
+    @app.post("/api/session")
+    async def post_session() -> Response:
+        resp = JSONResponse({"ok": True, "token_required": app.state.web_token is not None})
+        if app.state.web_token is not None:  # 能走到这里说明 guard 已校验过 X-IVB-Token
+            resp.set_cookie(TOKEN_COOKIE, app.state.web_token, httponly=True, samesite="strict")
+        return resp
 
     # ---------- 配置 ----------
     @app.get("/api/settings")
@@ -528,15 +632,14 @@ def create_app(
                     if job.resume_dir is not None:
                         from .graph import resume_industry
 
-                        preset = Script.model_validate_json(
-                            (out_dir / "script.json").read_text(encoding="utf-8")
-                        )
+                        preset = load_script_file(out_dir / "script.json")
                         industry = resume_industry(out_dir) or industry
                     if job.params.stop_after == "script":
                         await _execute_script_stage(
                             job_settings, out_dir, industry,
                             job.params.topic_title, script_file,
                         )
+                        _write_generation_record(out_dir, job_settings)
                         _on_stage(stage_keys[0])
                     else:
                         await _execute_pipeline(
@@ -544,7 +647,7 @@ def create_app(
                             job.params.topic_title, script_file, _on_stage,
                             **({"script": preset} if preset is not None else {}),
                         )
-                    job.usage = summarize_usage(out_dir)
+                    job.usage = summarize_usage(out_dir, since=job.started_at)
                 job.current_stage = None
                 job.status = "done"
             except asyncio.CancelledError:
@@ -606,6 +709,7 @@ def create_app(
             "phase": "续跑中" if job.resume_dir is not None else "策划中",
         }
         root.mkdir(parents=True, exist_ok=True)
+        _write_generation_record(root, job_settings)
 
         def on_event(name: str, **p) -> None:
             s = job.series
@@ -638,7 +742,7 @@ def create_app(
                 await _execute_pipeline(
                     job_settings, out_dir, theme, None, None, on_stage, script=script,
                 )
-        job.usage = _sum_usage(root)
+        job.usage = _sum_usage(root, since=job.started_at)
 
     @app.get("/api/jobs/active")
     async def get_active_job() -> dict[str, Any] | None:
@@ -709,18 +813,27 @@ def create_app(
         ]
         return {"series": items}
 
+    def _resume_params(req: RegenerateRequest | None, rec: dict[str, str]) -> dict[str, Any]:
+        """请求显式值 > 上次生成记录 > .env; 记录的音色只在通道一致时沿用。"""
+        req = req or RegenerateRequest()
+        rec_provider = rec.get("provider") if rec.get("provider") in VOICES else None
+        provider = req.provider or rec_provider or settings.tts_provider
+        if provider not in VOICES:
+            raise HTTPException(400, f"未知 TTS 通道: {provider}")
+        voice = req.voice or (rec.get("voice") if provider == rec_provider else None)
+        aspect = req.aspect or (rec.get("aspect") if rec.get("aspect") in _ASPECTS else None)
+        return {"provider": provider, "voice": voice, "aspect": aspect}
+
     @app.post("/api/series/{root}/resume", status_code=202)
     async def resume_series(root: str, req: RegenerateRequest | None = None) -> dict[str, str]:
         """同 CLI ``ivb series --resume <root>``: 已完成的集/章不重跑, 已出片的分集跳过。"""
         d = _series_root(root)
-        req = req or RegenerateRequest()
-        provider = req.provider or settings.tts_provider
-        if provider not in VOICES:
-            raise HTTPException(400, f"未知 TTS 通道: {provider}")
+        eps = sorted(p for p in d.glob("ep[0-9][0-9]-*") if (p / "project.json").is_file())
+        params = _resume_params(req, _recorded_generation([*eps[:1], d]))
         _ensure_idle()
         job = Job(
             uuid.uuid4().hex[:8],
-            JobRequest(mode="series", provider=provider, voice=req.voice),
+            JobRequest(mode="series", **params),
             resume_dir=d.resolve(),
         )
         job.project = d.name
@@ -915,11 +1028,9 @@ def create_app(
         ):
             raise _Busy("该项目正在生成中, 请等任务结束再改脚本", manager.active_id)
         try:
-            script = Script.model_validate(payload)
+            script = validate_script(payload)
         except ValidationError as exc:
             raise HTTPException(422, f"脚本格式不合法: {_format_validation_error(exc)}") from exc
-        if not script.scenes:
-            raise HTTPException(422, "脚本格式不合法: scenes 不能为空")
         (d / "script.json").write_text(script.model_dump_json(indent=2), encoding="utf-8")
         return {"ok": True}
 
@@ -931,14 +1042,11 @@ def create_app(
         d = _project_dir(name, allow_draft=True)
         if not (d / "script.json").exists():
             raise HTTPException(400, "项目缺 script.json, 无法重新生成")
-        req = req or RegenerateRequest()
-        provider = req.provider or settings.tts_provider
-        if provider not in VOICES:
-            raise HTTPException(400, f"未知 TTS 通道: {provider}")
+        params = _resume_params(req, _recorded_generation([d]))
         _ensure_idle()
         job = Job(
             uuid.uuid4().hex[:8],
-            JobRequest(provider=provider, voice=req.voice),
+            JobRequest(**params),
             resume_dir=d.resolve(),
         )
         job.project = d.name

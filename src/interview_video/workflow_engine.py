@@ -179,7 +179,8 @@ class CompiledWorkflow(Generic[StateT]):
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            logger.exception("工作流节点 '%s' 执行失败: %s", node_name, exc)
+            # 只进日志文件(DEBUG): 终端由调用方统一报错一次, 避免同一错误重复刷屏
+            logger.debug("工作流节点 '%s' 执行失败: %s", node_name, exc, exc_info=True)
             raise
 
     async def _resolve_next(

@@ -42,3 +42,31 @@ def test_scan_allows_neutral_discussion():
 
 def test_single_source_of_truth():
     assert scan_redlines is boundary.scan_redlines
+
+
+def test_scan_allows_encouraging_or_neutral_phrases():
+    assert scan_redlines("35岁不要焦虑，经验就是优势") == []
+    assert scan_redlines("很多人想一次过，其实没必要") == []
+    assert scan_redlines("不要只盯着985的光环") == []
+    assert scan_redlines("没人能保证一次过，准备才是关键") == []
+    assert scan_redlines("评估维度包括通过率和稳定性") == []
+    assert scan_redlines("确保过程顺畅再提交") == []
+
+
+def test_scan_catches_redline_regressions():
+    assert "编造薪资数字" in scan_redlines("期望薪资可以说15k到20k之间吗")
+    assert "编造薪资数字" in scan_redlines("15K-20K的岗位")
+    assert "包过承诺" in scan_redlines("我们保证一次过")
+    assert "包过承诺" in scan_redlines("报名就包你上岸")
+    assert "歧视性表述" in scan_redlines("公司35岁以上不要")
+    assert "歧视性表述" in scan_redlines("这家公司明说了，35岁一律淘汰")
+    assert "歧视性表述" in scan_redlines("只招985")
+
+
+def test_exclusion_only_masks_overlapping_span():
+    assert "歧视性表述" in scan_redlines("35岁不要焦虑，但有的公司35岁就不要了")
+
+
+def test_negated_promise_passes_but_affirmative_blocks():
+    assert scan_redlines("谁能保证一次过呢") == []
+    assert "包过承诺" in scan_redlines("我们能保证一次过")

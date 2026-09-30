@@ -39,8 +39,10 @@ uv venv && uv pip install -e ".[dev]"
 # 2. 安装浏览器(画面渲染用)
 .venv/bin/playwright install chromium
 
-# 3. 配置(见下文 .env 说明)
-cp .env.example .env
+# 3. 配置(见下文 .env 说明): 生成 ~/.config/ivb/.env(权限 0600, OUT_ROOT=~/ivb-output 绝对路径),
+#    然后编辑填写 LLM_API_KEY 等; 之后在任意目录运行 ivb 都读这份配置
+.venv/bin/ivb init
+# 或仅在本项目目录使用: cp .env.example .env(当前目录的 ./.env 优先于用户级配置)
 
 # 4. 环境自检: ffmpeg/ffprobe、chromium、中文字体、.env、LLM/豆包/B站配置
 .venv/bin/ivb doctor            # --ping 额外发一次极小请求验证 LLM key/base_url
@@ -111,6 +113,23 @@ ivb generate --topic "应届生自我介绍" --aspect 9:16
 ivb generate --topic "应届生自我介绍" --bgm ~/music/lofi.mp3
 # 批量: 从选题库按顺序取 N 条未用选题逐个生成, 单条失败不影响后续, 最后打印汇总表
 ivb batch --industry 护理 -n 3 [--aspect 9:16] [--bgm bgm.mp3]
+# 无人值守: 选题不足 5 条先自动补充, 成片后上传并按每日 12:00/20:00 排定时发布
+ivb batch -i 护理 -n 2 --refill 5 --upload --slots 12:00,20:00 [--start 2026-10-05]
+```
+
+批量的失败处理:
+
+- 失败的选题会在选题库里记次数(`attempts`)和目录; 下次 `ivb batch` 自动续跑旧目录(复用 script.json, 不再付脚本费用);
+  连续失败 3 次后默认跳过, 加 `--retry-failed` 强制重试。
+- TTS 鉴权/额度、LLM 鉴权/预算超限、B站 cookie 失效这类「每条都会失败」的错误立即中止整批, 且不计入选题失败次数。
+- `--slots` 从 2 小时后到 15 天内挑下一个空闲时段, 已占用的时段读 `OUTPUT/*/upload.json` 的 `dtime`;
+  窗口内排满时该条只生成不上传, 之后可 `ivb upload <目录> --publish-at ...` 补传。
+- 选题库读写带跨进程文件锁; 同一时刻只允许一个 `ivb batch` 运行, cron 重叠触发时后来者直接退出。
+
+crontab 示例(每天 09:30 生成 2 条并排期发布; cron 环境 PATH 很少, 用绝对路径并 cd 到项目目录以读取 .env):
+
+```cron
+30 9 * * * cd /path/to/interview-video-bot && /path/to/interview-video-bot/.venv/bin/ivb batch -i 护理 -n 2 --refill 5 --upload --slots 12:00,20:00 >> output/cron.log 2>&1
 ```
 
 封面标题按长度自动缩放字号(108px → 最小 56px, 最多 3 行), 长标题不再溢出;
@@ -243,7 +262,9 @@ POST/PUT/DELETE/PATCH 的 Origin(无则 Referer)必须与 Host 同源, 跨站表
 完整清单(含全部可选项与说明)以 `.env.example` 为准, 下面是常用项速览(注释行仅作说明, 实际 `.env` 里注释须单独成行)。
 
 `.env` 按以下顺序查找, 首个存在者生效: `$IVB_ENV_FILE` → 当前目录 `./.env` → `~/.config/ivb/.env`
-(不在项目目录运行时放用户级配置即可)。`OUT_ROOT` 默认 `output`(相对当前目录), 可写绝对路径或 `~/...`。
+(不在项目目录运行时放用户级配置即可, `ivb init` 会生成它; 用户级目录可用 `IVB_CONFIG_DIR` 覆盖)。
+`OUT_ROOT` 默认 `output`(相对当前目录), 可写绝对路径或 `~/...`; 若读取的是用户级 `.env`,
+其中的相对 `OUT_ROOT` 按主目录解析(如 `OUT_ROOT=videos` → `~/videos`), 不随当前目录变化。
 实际读取的 `.env` 与输出目录会在 `ivb doctor` 以及 generate/series/web 启动时打印。
 
 > 注释请单独成行, 不要写在 `KEY=` 后面。空值与 `#` 开头的值会被视为未配置;
@@ -375,5 +396,5 @@ ruff + Python 3.10/3.11/3.12 全量离线单测, 另有安装 ffmpeg 的集成�
 - ~~定时发布 / 竖屏 / BGM / 选题库与批量生产~~(0.3.0 已落地: `--publish-at` / `--aspect` / `--bgm` / `ivb batch`)
 - 双音色对话(面试官/求职者交替配音, 更强代入感)
 - 真人数字人形象(替代 HTML 画面帧)
-- 无人值守定时投递(cron 定点跑 `ivb batch` + 自动上传)
+- ~~无人值守定时投递~~(已落地: `ivb batch --upload --slots` + crontab)
 - 系列策划人工审稿介入(策划确认后再跑全集)

@@ -67,7 +67,8 @@ _OUTLINE_PROMPT = ChatPromptTemplate.from_messages(
             "请为本集拆分章节大纲(本章是后续逐章生成的上下文切分单元)。\n"
             "要求:\n"
             "- 每章约 {chapter_sec} 秒, 章数 = 本集 target_sec / {chapter_sec} 取整;\n"
-            "- 第 1 章必须含开场钩子与自我介绍式引入, 最后一章含总结与关注引导;\n"
+            "- 第 1 章必须以开场钩子切入(痛点/反常识观点/具体数字, 不要问候和自报家门), "
+            "最后一章含总结、和本集主题相关的评论引导与关注引导;\n"
             "- 每章: title / goal(本章讲清什么) / key_points(2~5条) / est_sec;\n"
             "- 章节间有承接关系, 不重复讲同一要点。\n"
             "只输出 JSON: {{\"episode_index\": {episode_index}, \"title\": ..., "
@@ -90,7 +91,10 @@ _CHAPTER_PROMPT = ChatPromptTemplate.from_messages(
             "- 约 {scene_count} 个分镜, kind 只用 point 或 qa(开场/结尾由框架处理);\n"
             "- 每镜: kind / header(<=12字) / bullets(每条<=14字, 0~4条) / narration(口播 "
             "{min_narr}~{max_narr} 字, 口语化); qa 镜额外填 question 与 answer;\n"
-            "- 开头承接前文(若前文摘要为「无」则自然开场), 结尾留钩子给下一章;\n"
+            "- 开头承接前文; 若前文摘要为「无」, 第 1 镜第 1 句不超过 20 字, "
+            "禁止问候和自报家门(大家好/哈喽/嗨/我是/这里是), 直接用痛点、反常识观点或具体数字开场;\n"
+            "- 讲到面试回答时, 给出「错误回答 vs 正确回答」的原话示例, 不要空讲道理;\n"
+            "- 结尾留钩子给下一章;\n"
             "- summary 字段: 本章内容摘要 <=120 字(将传给下一章做上下文)。\n"
             "只输出 JSON: {{\"scenes\": [...], \"summary\": \"...\"}}, 不要其他文字。",
         ),
@@ -110,6 +114,7 @@ _REVIEW_PROMPT = ChatPromptTemplate.from_messages(
             "- 与前文摘要重复的整块内容删改;\n"
             "- narration 口语化、无书面语病, 超长句子拆开;\n"
             "- header/bullets 超长(12/14 字)的精简;\n"
+            "- 第 1 镜以问候或自报家门(大家好/哈喽/我是/这里是)开头的, 改成直接切入痛点;\n"
             "- 无问题则原样返回。\n"
             "只输出 JSON, 不要其他文字。",
         ),

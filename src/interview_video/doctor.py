@@ -65,7 +65,8 @@ def check_paths(settings: Settings) -> list[Check]:
     return [
         Check(".env", env is not None,
               str(env) if env is not None
-              else f"未找到(依次查找 {tried}); cp .env.example .env 或设 IVB_ENV_FILE",
+              else f"未找到(依次查找 {tried}); 运行 ivb init 生成用户级配置"
+                   f"{'并填写 LLM_API_KEY' if not settings.llm_ready() else ''}, 或设 IVB_ENV_FILE",
               required=False),
         Check("输出目录", writable,
               str(out_root) if writable else f"{out_root} 不可写; 改 OUT_ROOT(可用绝对路径)"),
@@ -110,6 +111,13 @@ def check_config(settings: Settings) -> list[Check]:
             "三件套齐全" if settings.bili_ready()
             else "BILI_UPLOAD_ENABLED=true 但 BILI_SESSDATA/BILI_JCT/BILI_BUVID3 不全",
             required=False,
+        ))
+        from .bilibili import tid_error, valid_tids
+
+        err = tid_error(settings.bili_tid)
+        out.append(Check(
+            "B站分区", err is None,
+            err or f"{settings.bili_tid}={valid_tids()[settings.bili_tid]}", required=False,
         ))
     return out
 

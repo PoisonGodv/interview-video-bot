@@ -22,18 +22,26 @@ REDLINE_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "编造薪资数字",
-        re.compile(r"\d+\s*[-~至到]\s*\d+\s*[kKwW万千](?:/月|/年|月薪|年薪)?"),
+        re.compile(r"\d+\s*[kKwW万千]?\s*[-~～至到]\s*\d+\s*[kKwW万千](?:/月|/年|月薪|年薪)?"),
         "严禁编造具体薪资范围，涉及薪资请用泛指或面议代替",
     ),
     (
         "包过承诺",
-        re.compile(r"(包过|必上岸|必定上岸|稳过|保\s?offer|稳拿\s?offer|保过|保证通过|一次过|100%通过|保录取|包录取|包就业)"),
+        re.compile(r"(包过|必上岸|必定上岸|稳过|保\s?offer|稳拿\s?offer|(?<!确)保过|100%通过|保录取|包录取|包就业)"),
+        "严禁做出『包过/必上岸』等绝对化结果承诺，可改为『帮助提高通过率』或『提升面试竞争力』",
+    ),
+    (
+        "包过承诺",
+        re.compile(
+            r"(?<![不没])(?<!不能)(?<!不会)(?<!不敢)(?<!没人能)(?<!没人敢)(?<!谁能)(?<!谁也)(?<!无法)(?<!难以)"
+            r"(?:保证|包(?![括装容含])|承诺|确保|肯定)\s*[^。,，！？!?\n]{0,4}(?:一次过|通过|上岸)"
+        ),
         "严禁做出『包过/必上岸』等绝对化结果承诺，可改为『帮助提高通过率』或『提升面试竞争力』",
     ),
     (
         "歧视性表述",
         re.compile(
-            r"(?:只要|不要|限制|限|只招|优先招|只录用|必须是)[^。,，\n]{0,8}"
+            r"(?:只要|限制|限|只招|优先招|只录用|必须是)[^。,，\n]{0,8}"
             r"(?:35岁|三十[一二三四五]?岁|男性|女性|男生|女生|985|211|双一流|本科以上|大专以下|非全日制不要|已婚已育)"
         ),
         "严禁含有年龄/性别/学历等任何歧视性表述，应保持客观中立与职业包容",
@@ -41,6 +49,11 @@ REDLINE_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
         "歧视性表述",
         re.compile(r"(?:35岁|三十[一二三四五]?岁)[^。,，\n]{0,6}(?:不要|pass|淘汰|劝退|下岗|危机不要|不招)"),
+        "严禁年龄歧视表述，探讨年龄应聚焦于经验优势与转型方法",
+    ),
+    (
+        "歧视性表述",
+        re.compile(r"(?:公司|企业|HR|招聘方?|单位)[^。\n]{0,6}(?:35岁|三十[一二三四五]?岁)[^。\n]{0,6}(?:不要|不招|pass|淘汰)"),
         "严禁年龄歧视表述，探讨年龄应聚焦于经验优势与转型方法",
     ),
     (
@@ -62,12 +75,31 @@ REDLINE_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
 ]
 
 
+# 劝慰类语境（如“35岁不要焦虑”）不属于歧视，命中片段落在这些区间内时放行
+REDLINE_EXCLUSIONS: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?:35岁|三十[一二三四五]?岁)[^。,，\n]{0,6}不要"
+        r"(?:焦虑|怕|慌|担心|紧张|灰心|放弃|恐慌|内耗|自我设限|着急|急)"
+    ),
+]
+
+
+def _search(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """返回第一个不落在白名单区间内的命中。"""
+    excluded = [m.span() for ex in REDLINE_EXCLUSIONS for m in ex.finditer(text)]
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if not any(start < ex_end and ex_start < end for ex_start, ex_end in excluded):
+            return match
+    return None
+
+
 def scan_text_redlines(text: str) -> list[tuple[str, str, str]]:
     """扫描单段纯文本中的红线，返回 (规则名, 匹配到的文本片段, 修复建议) 列表。"""
     hits: list[tuple[str, str, str]] = []
     seen_rules: set[str] = set()
     for rule_name, pattern, hint in REDLINE_PATTERNS:
-        match = pattern.search(text)
+        match = _search(pattern, text)
         if match:
             # 记录匹配到的具体文字，便于在反馈中展示
             matched_snippet = match.group(0)
@@ -80,7 +112,7 @@ def scan_redlines(text: str) -> list[str]:
     """向后兼容的纯文本红线扫描器，返回命中的红线规则名列表 (去重)。"""
     hits: list[str] = []
     for rule_name, pattern, _ in REDLINE_PATTERNS:
-        if rule_name not in hits and pattern.search(text):
+        if rule_name not in hits and _search(pattern, text):
             hits.append(rule_name)
     return hits
 

@@ -31,6 +31,25 @@ _SENTENCE_END_PUNCT = "，。！？；："
 # 超长字幕条细分时可断的位置(次级标点, 含半角; 不含 "." 以免拆开 3.5 之类数字)
 _SOFT_BREAK_PUNCT = _SENTENCE_END_PUNCT + "、,;!?）)》」”"
 
+# edge 词级 cue 对齐原文时: 词后紧跟的这些字符拼进该词; 词前的开括号/引号拼到词首
+_ATTACH_PUNCT = "，。！？、；：,.!?;:…）)》」』”’"
+_OPEN_PUNCT = "（(《「『“‘"
+# 某词对不上原文时, 向后找回同步点的窗口(字符数)
+_RESYNC_WINDOW = 30
+# merge_word_cues 断点: 句末标点必断; 逗号类在当前行 ≥ max_chars*0.5 时断
+_HARD_BREAK_PUNCT = "。！？!?"
+_COMMA_BREAK_PUNCT = "，；：,;:"
+# 判断断点时先剥掉行尾的闭引号/闭括号: "修好了。”" 仍算句末
+_CLOSE_PUNCT = "”’」』）)》"
+
+
+def _ends_with(text: str, puncts: str) -> bool:
+    return text.rstrip().rstrip(_CLOSE_PUNCT).endswith(tuple(puncts))
+
+# 字幕显示规则: 行尾去掉这些标点; 行中 "，" 换成空格; "。！？" 等保留
+_DISPLAY_STRIP_END = "，、；：,;:"
+_DISPLAY_MID_SPACE = "，"
+
 # 失败重试: 2 次重试(共 3 次尝试), 指数退避基数(秒)
 _MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 1.0
@@ -289,7 +308,65 @@ async def synthesize_text(
                 start = chunk["offset"] / _TICKS_PER_SECOND
                 end = start + chunk["duration"] / _TICKS_PER_SECOND
                 words.append(Cue(start=start, end=end, text=chunk["text"]))
-    return merge_word_cues(words)
+    return merge_word_cues(align_punctuation(words, text))
+
+
+def _match_at(source: str, pos: int, word: str) -> int | None:
+    """从 source[pos] 起逐字匹配 word(跳过空白, 大小写不敏感), 成功返回匹配末尾下标。"""
+    i, n = pos, len(source)
+    for ch in word:
+        if ch.isspace():
+            continue
+        while i < n and source[i].isspace():
+            i += 1
+        if i < n and source[i].casefold() == ch.casefold():
+            i += 1
+        else:
+            return None
+    return i
+
+
+def align_punctuation(words: list[Cue], source: str) -> list[Cue]:
+    """edge WordBoundary 词文本不带标点: 沿原文游标逐词对齐, 把词后紧跟的标点拼回词里。
+
+    词前的开引号/括号拼到词首, 词后有空白则保留一个空格(英文词间距)。
+    某词对不上时原样保留并在窗口内找回同步点; 词本身已带标点时幂等。
+    """
+    out: list[Cue] = []
+    cursor, n = 0, len(source)
+    for w in words:
+        text = w.text.strip()
+        if not text:
+            out.append(w)
+            continue
+        start = cursor
+        while start < n and (source[start].isspace() or source[start] in _OPEN_PUNCT):
+            start += 1
+        end = _match_at(source, start, text)
+        if end is None:
+            for s in range(cursor + 1, min(n, cursor + _RESYNC_WINDOW) + 1):
+                end = _match_at(source, s, text)
+                if end is not None:
+                    start = s
+                    break
+        if end is None:
+            out.append(w)
+            continue
+        lead_start = start
+        while lead_start > cursor and (
+            source[lead_start - 1] in _OPEN_PUNCT or source[lead_start - 1].isspace()
+        ):
+            lead_start -= 1
+        lead = "".join(ch for ch in source[lead_start:start] if ch in _OPEN_PUNCT)
+        j = end
+        while j < n and source[j] in _ATTACH_PUNCT:
+            j += 1
+        tail = source[end:j]
+        if j < n and source[j].isspace():
+            tail += " "
+        out.append(Cue(start=w.start, end=w.end, text=lead + text + tail))
+        cursor = j
+    return out
 
 
 def merge_word_cues(
@@ -301,45 +378,94 @@ def merge_word_cues(
     """词 cues → 字幕条 cues。
 
     断条规则(SPECS §3):
-    - 累计字数 > max_chars 断;
     - 词间 gap > max_gap 断(边界等于不断);
-    - 单条时长(首词 start → 末词 end) > max_dur 断;
-    - 当前条末词以中文标点(，。！？；：)结尾, 优先断;
+    - 当前条末词以句末标点(。！？)结尾必断; 以逗号类(，；：)结尾且当前条 ≥ max_chars*0.5 断;
+    - 累计字数 > max_chars 或单条时长 > max_dur 时, 往回找条内最后一个标点处断, 找不到才硬切;
     - 空文本词跳过; 超长单词独占一条。
     """
     bars: list[Cue] = []
     current: list[Cue] = []
+    min_head = max(max_chars // 4, 1)
+
+    def _chars(ws: list[Cue]) -> int:
+        return sum(len(x.text) for x in ws)
+
+    def _emit(ws: list[Cue]) -> None:
+        bars.append(
+            Cue(start=ws[0].start, end=ws[-1].end, text="".join(x.text for x in ws).strip())
+        )
 
     def _close() -> None:
         nonlocal current
         if current:
-            bars.append(
-                Cue(
-                    start=current[0].start,
-                    end=current[-1].end,
-                    text="".join(w.text for w in current),
-                )
-            )
+            _emit(current)
             current = []
+
+    def _over(w: Cue) -> bool:
+        return (
+            _chars(current) + len(w.text) > max_chars
+            or w.end - current[0].start > max_dur
+        )
+
+    def _split_back(w: Cue) -> None:
+        """在条内最后一个标点处断开, 标点后的词留给下一条; 无标点时若 w 收尾本分句,
+        把前一个词带到下一条(避免"技术|难题，"这种半截词组); 都不行则整条关闭。"""
+        nonlocal current
+        for k in range(len(current) - 1, 0, -1):
+            if (
+                current[k - 1].text.rstrip().endswith(tuple(_SOFT_BREAK_PUNCT))
+                and _chars(current[:k]) >= min_head
+            ):
+                _emit(current[:k])
+                current = current[k:]
+                return
+        if (
+            w.text.rstrip().endswith(tuple(_SOFT_BREAK_PUNCT))
+            and len(current) >= 2
+            and _chars(current[:-1]) >= min_head
+            and len(current[-1].text) + len(w.text) <= max_chars
+        ):
+            _emit(current[:-1])
+            current = current[-1:]
+            return
+        _close()
 
     for w in words:
         if not w.text.strip():
             continue  # 空文本跳过
         if current:
-            gap = w.start - current[-1].end
-            total_chars = sum(len(x.text) for x in current) + len(w.text)
-            total_dur = w.end - current[0].start
-            if gap > max_gap:
+            last = current[-1].text.rstrip()
+            if w.start - current[-1].end > max_gap:
                 _close()  # 词间停顿过大, 断条
-            elif current[-1].text.endswith(tuple(_SENTENCE_END_PUNCT)):
-                _close()  # 中文标点结尾优先断
-            elif total_chars > max_chars:
-                _close()  # 累计字数超限
-            elif total_dur > max_dur:
-                _close()  # 单条时长超限
+            elif _ends_with(last, _HARD_BREAK_PUNCT):
+                _close()  # 句末标点必断
+            elif _ends_with(last, _COMMA_BREAK_PUNCT) and _chars(current) >= max_chars * 0.5:
+                _close()  # 逗号类且当前条已够长
+            elif _over(w):
+                _split_back(w)
+                if current and _over(w):
+                    _close()
         current.append(w)
     _close()
     return bars
+
+
+def display_text(text: str) -> str:
+    """字幕显示文本: 行尾去掉 _DISPLAY_STRIP_END, 行中 "，" 换空格, 合并多余空白。幂等。"""
+    t = text.strip().rstrip(_DISPLAY_STRIP_END + " ")
+    for ch in _DISPLAY_MID_SPACE:
+        t = t.replace(ch, " ")
+    return " ".join(t.split())
+
+
+def format_display_cues(cues: list[Cue]) -> list[Cue]:
+    """按显示规则整理字幕条文本; 整理后为空的条丢弃。"""
+    out: list[Cue] = []
+    for c in cues:
+        t = display_text(c.text)
+        if t:
+            out.append(Cue(start=c.start, end=c.end, text=t))
+    return out
 
 
 def offset_cues(scene_media: list[SceneMedia]) -> list[Cue]:
@@ -467,6 +593,7 @@ async def synthesize_scenes(
     幂等缓存: mp3 与旁车 scene_%03d.cues.json 都在、且口播文本指纹与
     通道/音色键一致时直接复用(备用通道产物不命中主通道, 下次重试主通道)(断点续跑/失败重试不重复付 TTS 费); 删掉 mp3 或改了文本会重合成。
     duration 兜底 = 最后 cue end + 0.4s; 无 cue 时仅留 0.4s。
+    落盘/渲染的 cue 文本已按 format_display_cues 整理(行尾逗号去掉、行中逗号换空格)。
     """
     scenes_dir.mkdir(parents=True, exist_ok=True)
     primary_key = _voice_key(settings.tts_provider, settings)
@@ -476,11 +603,13 @@ async def synthesize_scenes(
         cached = _load_scene_cache(mp3_path, scene.narration, primary_key)
         if cached is not None:
             cues, duration = cached
+            cues = format_display_cues(cues)  # 旧缓存可能未整理, 幂等
             logger.info("场景 %d TTS 命中缓存, 跳过合成", i)
         else:
             cues, voice_key = await _synthesize_scene(i, scene.narration, mp3_path, settings)
             cues = split_long_cues(cues, settings.subtitle_max_chars)  # edge 超长单词/条再细分
             duration = cues[-1].end + _TAIL_PAD if cues else _TAIL_PAD
+            cues = format_display_cues(cues)
             _save_scene_cache(mp3_path, scene.narration, cues, duration, voice_key)
         media.append(SceneMedia(index=i, mp3=mp3_path, cues=cues, duration=duration))
     return media

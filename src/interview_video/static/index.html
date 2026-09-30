@@ -122,22 +122,26 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c =>
 // 项目名 → 合法 DOM id 片段(中文/字母数字/-_ 原样, 其余转码)
 const pid = (name) => encodeURIComponent(name).replace(/%/g, "_");
 let voices = {}, pollTimer = null, currentJobId = null;
-// 写操作令牌(绑非回环地址时必需): 启动链接 #token=xxx → sessionStorage, 随后从地址栏抹掉
+// 访问令牌(绑非回环地址时必需): 启动链接 #token=xxx → localStorage, 随后从地址栏抹掉;
+// 再换一个 HttpOnly cookie, 让 <video>/<img>/日志链接这类带不了请求头的加载也能过鉴权
 const tokenMatch = location.hash.match(/token=([^&]+)/);
 if (tokenMatch) {
-  sessionStorage.setItem("ivb-token", decodeURIComponent(tokenMatch[1]));
+  localStorage.setItem("ivb-token", decodeURIComponent(tokenMatch[1]));
   history.replaceState(null, "", location.pathname + location.search);
 }
-const ivbToken = sessionStorage.getItem("ivb-token") || "";
+const ivbToken = localStorage.getItem("ivb-token") || "";
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, opts.method ? {
-    headers: {"Content-Type": "application/json", ...(ivbToken ? {"X-IVB-Token": ivbToken} : {})}, ...opts,
+  const r = await fetch(path, {
+    ...opts,
+    headers: {...(opts.body ? {"Content-Type": "application/json"} : {}),
+              ...(ivbToken ? {"X-IVB-Token": ivbToken} : {})},
     body: opts.body ? JSON.stringify(opts.body) : undefined,
-  } : opts);
+  });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     const err = new Error(data.detail || `HTTP ${r.status}`);
+    err.status = r.status;
     err.jobId = data.job_id || null;  // 409: 正在跑的任务 id
     err.alreadyUploaded = !!data.already_uploaded;  // 409: 已有 bvid, 需确认后 force
     throw err;
@@ -147,7 +151,13 @@ async function api(path, opts = {}) {
 const msg = (id, text, cls = "") => { const el = $(id); el.textContent = text; el.className = "msg " + cls; };
 
 async function init() {
-  const s = await api("/api/settings");
+  if (ivbToken) await api("/api/session", {method: "POST"}).catch(() => {});
+  let s;
+  try { s = await api("/api/settings"); }
+  catch (e) {
+    msg("gen-msg", e.status === 401 ? "需要访问令牌: 请用启动时终端打印的带 #token= 的链接打开" : e.message, "err");
+    return;
+  }
   $("brand").textContent = s.brand + " · 操作台";
   const b = (id, ok, okText, noText) => {
     const el = $(id); el.textContent = ok ? okText : noText; el.className = "badge " + (ok ? "ok" : "warn");
@@ -266,9 +276,11 @@ async function pollJob(id) {
   currentJobId = id;
   $("stages").style.display = "flex";
   clearInterval(pollTimer);
+  let netErrors = 0;
   const tick = async () => {
     try {
       const j = await api("/api/jobs/" + id);
+      netErrors = 0;
       if (j.series) {
         const s = j.series;
         $("series-progress").textContent =
@@ -298,7 +310,20 @@ async function pollJob(id) {
         }
         $("btn-gen").disabled = false; loadProjects();
       }
-    } catch (e) { /* 轮询失败忽略, 下个周期重试 */ }
+    } catch (e) {
+      if (currentJobId !== id) return;
+      if (e.status === 404) {
+        clearInterval(pollTimer);
+        $("btn-cancel").style.display = "none";
+        msg("gen-msg", "服务已重启, 任务丢失(已完成的产物保留), 可在作品库里重新生成/续跑", "err");
+        $("btn-gen").disabled = false; loadProjects();
+      } else if (e.status === 401) {
+        clearInterval(pollTimer);
+        msg("gen-msg", e.message, "err"); $("btn-gen").disabled = false;
+      } else if (++netErrors >= 5) {
+        msg("gen-msg", `连不上服务(已连续失败 ${netErrors} 次: ${e.message}), 仍在重试…`, "err");
+      }
+    }
   };
   await tick();
   pollTimer = setInterval(tick, 1500);
@@ -311,11 +336,16 @@ $("btn-cancel").onclick = async () => {
   } catch (e) { msg("gen-msg", e.message, "err"); }
 };
 
+// 重新生成/续跑默认沿用作品自己的配音与画幅, 勾选「覆盖设置」才用表单当前值
+const overrideBody = (on) => on
+  ? {provider: $("provider").value, voice: $("voice").value, aspect: $("aspect").value} : {};
+
 async function loadSeries() {
   try {
     const d = await api("/api/series");
     const todo = d.series.filter(s => !s.complete);
-    $("series-resume").innerHTML = todo.length ? '<p class="sub">未完成系列(已完成的集/章不重跑)</p>' +
+    $("series-resume").innerHTML = todo.length ? '<p class="sub">未完成系列(已完成的集/章不重跑) '
+      + '<label><input type="checkbox" id="override-series"> 覆盖设置: 用上方选的配音/音色/画幅</label></p>' +
       todo.map(s => `
       <div class="row" style="margin-top:6px" data-root="${esc(s.root)}">
         <span class="msg">《${esc(s.title)}》${esc(s.root)} · 已出片 ${esc(s.done_episodes)}/${esc(s.episodes)} 集</span>
@@ -331,7 +361,7 @@ $("series-resume").addEventListener("click", async (ev) => {
   btn.disabled = true;
   try {
     const d = await api(`/api/series/${encodeURIComponent(root)}/resume`, {method: "POST",
-      body: {provider: $("provider").value, voice: $("voice").value}});
+      body: overrideBody($("override-series").checked)});
     msg("gen-msg", `续跑系列 ${root}…`); $("series-progress").textContent = "";
     $("btn-gen").disabled = true;
     pollJob(d.job_id);
@@ -398,6 +428,7 @@ async function toggleDetail(name) {
   el.innerHTML = metaHtml + `
     <div style="margin-top:14px"><label class="sub">脚本 script.json(改完保存; 重新生成会复用未改动场景的配音缓存)</label>
       <textarea class="code" id="s-${k}" spellcheck="false"></textarea></div>
+    <label class="sub"><input type="checkbox" id="ov-${k}"> 覆盖设置: 用上方「生成视频」里选的配音/音色/画幅(不勾则沿用该作品上次的设置)</label>
     <div class="row" style="margin-top:8px">
       <button class="ghost" data-act="save-script">保存脚本</button>
       <button data-act="regen">保存并重新生成</button>
@@ -436,7 +467,7 @@ async function saveScript(name, btn, regen) {
     await api(base + "/script", {method: "PUT", body});
     if (regen) {
       const d = await api(base + "/regenerate", {method: "POST",
-        body: {provider: $("provider").value, voice: $("voice").value}});
+        body: overrideBody($("ov-" + k).checked)});
       msg("sm-" + k, "已保存, 重新生成中(进度见上方「生成视频」)", "ok");
       msg("gen-msg", ""); $("btn-gen").disabled = true;
       pollJob(d.job_id);

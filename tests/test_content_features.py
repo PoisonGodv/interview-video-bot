@@ -72,7 +72,7 @@ def test_build_scene_clips_uses_portrait_size(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr(assemble_mod, "_run", lambda cmd, cwd, timeout=300: cmds.append(cmd))
     monkeypatch.setattr(assemble_mod, "ffprobe_duration", lambda p: 2.0)
     sm = SceneMedia(index=0, png=tmp_path / "a.png", mp3=tmp_path / "a.mp3", duration=2.0)
-    assemble_mod.build_scene_clips([sm], tmp_path / "clips", _s(tmp_path, video_aspect="9:16"))
+    assemble_mod.build_scene_clips([sm], tmp_path / "clips", _s(tmp_path, video_aspect="9:16", video_motion=False))
     vf = cmds[0][cmds[0].index("-vf") + 1]
     assert "scale=1080:1920" in vf and "pad=1080:1920" in vf
 

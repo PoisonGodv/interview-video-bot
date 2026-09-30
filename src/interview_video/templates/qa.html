@@ -56,13 +56,18 @@
 </div>
 <div class="qa-header"><span class="idx">{{ '%02d' % (index + 1) }}</span>{{ scene.header }}</div>
 <div class="qa-cards">
+  {% if scene.question %}
   <div class="qa-card q-card">
     <div class="tag">Q</div>
     <div class="body">{{ scene.question }}</div>
   </div>
+  {% endif %}
+  {% set answer_text = scene.answer or (scene.bullets | join('；')) %}
+  {% if answer_text %}
   <div class="qa-card a-card">
     <div class="tag">A</div>
-    <div class="body">{{ scene.answer }}</div>
+    <div class="body">{{ answer_text }}</div>
   </div>
+  {% endif %}
 </div>
 {% endblock %}

@@ -740,7 +740,8 @@ def test_non_loopback_bind_requires_token(settings):
     token = app.state.web_token
     assert token
     c = TestClient(app, base_url="http://192.168.1.5:8099")
-    assert c.get("/api/settings").status_code == 200  # 读不需要令牌
+    assert c.get("/api/settings").status_code == 401  # 启用令牌后读也要
+    assert c.get("/api/settings", headers={"X-IVB-Token": token}).status_code == 200
     assert c.post("/api/jobs", json={"provider": "xxx"}).status_code == 401
     assert c.post("/api/jobs", json={"provider": "xxx"},
                   headers={"X-IVB-Token": "wrong"}).status_code == 401
@@ -800,3 +801,167 @@ def test_upload_idempotent_with_force(settings, monkeypatch):
         r = client.post("/api/projects/proj/upload", json={"force": True})
         assert r.status_code == 200 and r.json()["bvid"] == "BV2" and calls[1][0] is True
     assert _json.loads((d / "upload.json").read_text("utf-8"))["bvid"] == "BV2"
+
+
+# ---------- 重生成/续跑沿用画幅与配音 ----------
+
+def _write_gen_manifest(out_dir: Path, provider: str, voice: str, aspect: str) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    m = ProjectManifest(
+        created_at=datetime.now(), industry="护理",
+        script=Script(title="竖屏", scenes=[{"header": "开场", "narration": "你好。"}]),
+        video=out_dir / "final.mp4", cover=out_dir / "cover.png", voice=voice,
+        generation={"tts_provider": provider, "video_aspect": aspect},
+    )
+    (out_dir / "project.json").write_text(m.model_dump_json(indent=2), encoding="utf-8")
+    (out_dir / "script.json").write_text(m.script.model_dump_json(), encoding="utf-8")
+
+
+def test_regenerate_keeps_recorded_aspect_provider_voice(portal_app, settings):
+    app, scheduled = portal_app
+    d = settings.out_root.resolve() / "vertical"
+    _write_gen_manifest(d, "doubao", "zh_female_vv_uranus_bigtts", "9:16")
+    with TestClient(app, base_url="http://localhost") as client:
+        assert client.post("/api/projects/vertical/regenerate").status_code == 202
+        job = scheduled.pop()[1][0]
+        assert job.params.aspect == "9:16"
+        assert job.params.provider == "doubao"
+        assert job.params.voice == "zh_female_vv_uranus_bigtts"
+
+
+def test_regenerate_explicit_override_and_voice_only_for_same_provider(portal_app, settings):
+    app, scheduled = portal_app
+    d = settings.out_root.resolve() / "vertical"
+    _write_gen_manifest(d, "doubao", "zh_female_vv_uranus_bigtts", "9:16")
+    with TestClient(app, base_url="http://localhost") as client:
+        r = client.post("/api/projects/vertical/regenerate", json={"aspect": "4:3"})
+        assert r.status_code == 422
+        # 换了通道: 记录的豆包音色不能套到 edge 上(用 edge 默认音色)
+        r = client.post("/api/projects/vertical/regenerate", json={"provider": "edge", "aspect": "16:9"})
+        assert r.status_code == 202
+        job = scheduled.pop()[1][0]
+        assert (job.params.provider, job.params.voice, job.params.aspect) == ("edge", None, "16:9")
+
+
+def test_regenerate_draft_uses_web_generation_record(portal_app, settings, monkeypatch):
+    """只生成脚本的草稿没有 project.json: 用任务落盘的 web_generation.json 沿用画幅/音色。"""
+    async def fake_script_stage(settings_, out_dir, industry, topic_title, script_file):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        s = Script(title="草稿", scenes=[{"header": "开场", "narration": "你好。"}])
+        (out_dir / "script.json").write_text(s.model_dump_json(), encoding="utf-8")
+        return s
+
+    monkeypatch.setattr("interview_video.web._execute_script_stage", fake_script_stage)
+    app, scheduled = portal_app
+    with TestClient(app, base_url="http://localhost") as client:
+        r = client.post("/api/jobs", json={"stop_after": "script", "aspect": "9:16",
+                                           "voice": "zh-CN-XiaoxiaoNeural", "topic_title": "竖屏草稿"})
+        _drive(client, scheduled)
+        job = _wait_job(client, r.json()["job_id"])
+        assert job["status"] == "done", job["error"]
+        assert client.post(f"/api/projects/{job['project']}/regenerate").status_code == 202
+        regen = scheduled.pop()[1][0]
+        assert regen.params.aspect == "9:16"
+        assert regen.params.provider == "edge"
+        assert regen.params.voice == "zh-CN-XiaoxiaoNeural"
+
+
+def test_series_resume_keeps_episode_generation(portal_app, settings):
+    root = _write_series_root(settings, "竖屏-series-20260101-0000", 2, 0)
+    _write_gen_manifest(root / "ep01-第1集", "edge", "zh-CN-YunjianNeural", "9:16")
+    app, scheduled = portal_app
+    with TestClient(app, base_url="http://localhost") as client:
+        assert client.post(f"/api/series/{root.name}/resume").status_code == 202
+        job = scheduled.pop()[1][0]
+        assert job.params.mode == "series"
+        assert (job.params.provider, job.params.voice, job.params.aspect) == (
+            "edge", "zh-CN-YunjianNeural", "9:16")
+
+
+def test_series_resume_uses_root_record_without_episodes(portal_app, settings):
+    root = _write_series_root(settings, "新系列-series-20260101-0000", 2, 0)
+    (root / "web_generation.json").write_text(
+        '{"provider": "doubao", "aspect": "9:16", "voice": "zh_male_m191_uranus_bigtts"}', "utf-8")
+    app, scheduled = portal_app
+    with TestClient(app, base_url="http://localhost") as client:
+        assert client.post(f"/api/series/{root.name}/resume").status_code == 202
+        job = scheduled.pop()[1][0]
+        assert (job.params.provider, job.params.voice, job.params.aspect) == (
+            "doubao", "zh_male_m191_uranus_bigtts", "9:16")
+
+
+# ---------- 令牌保护读请求 / cookie 会话 / 日志不外发 ----------
+
+def _token_app(settings):
+    s = Settings(_env_file=None, out_root=settings.out_root, web_token="s3cret")
+    d = s.out_root / "x"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "final.mp4").write_bytes(b"fake-mp4")
+    (d / "error-abc.log").write_text("trace", encoding="utf-8")
+    (s.out_root / "ivb.log").write_text("secret log", encoding="utf-8")
+    return create_app(s)
+
+
+def test_token_protects_reads_and_files(settings):
+    c = TestClient(_token_app(settings), base_url="http://localhost")
+    assert c.get("/").status_code == 200  # 首页本身不含数据, 放行
+    assert c.get("/api/settings").status_code == 401
+    assert c.get("/api/projects").status_code == 401
+    assert c.get("/files/x/final.mp4").status_code == 401
+    assert c.get("/api/settings", headers={"X-IVB-Token": "wrong"}).status_code == 401
+    assert c.get("/api/settings", headers={"X-IVB-Token": "s3cret"}).status_code == 200
+    assert c.get("/files/x/final.mp4", headers={"X-IVB-Token": "s3cret"}).status_code == 200
+
+
+def test_session_cookie_allows_media(settings):
+    c = TestClient(_token_app(settings), base_url="http://localhost")
+    assert c.post("/api/session").status_code == 401  # 换 cookie 也要先证明持有令牌
+    r = c.post("/api/session", headers={"X-IVB-Token": "s3cret"})
+    assert r.status_code == 200
+    set_cookie = r.headers["set-cookie"].lower()
+    assert "ivb_token=s3cret" in set_cookie and "httponly" in set_cookie
+    assert "samesite=strict" in set_cookie
+    # 之后不带头也能取文件(<video>/<img> 场景)
+    assert c.get("/files/x/final.mp4").status_code == 200
+    assert c.get("/api/projects").status_code == 200
+    # 写请求仍必须带头(cookie 会被跨站请求自动带上, 不能当写令牌)
+    assert c.post("/api/jobs", json={"provider": "xxx"}).status_code == 401
+
+
+def test_files_rejects_log(settings):
+    c = TestClient(_token_app(settings), base_url="http://localhost")
+    h = {"X-IVB-Token": "s3cret"}
+    assert c.get("/files/ivb.log").status_code in (401, 404)
+    assert c.get("/files/ivb.log", headers=h).status_code == 404
+    assert c.get("/files/IVB.LOG", headers=h).status_code == 404
+    # 作品库「查看错误日志」链接的失败现场日志仍可看
+    assert c.get("/files/x/error-abc.log", headers=h).status_code == 200
+
+
+def test_no_token_on_loopback_reads_open(client, settings):
+    d = settings.out_root / "x"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "final.mp4").write_bytes(b"v")
+    assert client.get("/files/x/final.mp4").status_code == 200
+    assert client.post("/api/session").json() == {"ok": True, "token_required": False}
+    (settings.out_root / "ivb.log").write_text("l", encoding="utf-8")
+    assert client.get("/files/ivb.log").status_code == 404
+
+
+def test_access_urls_lists_lan_ips(monkeypatch):
+    from interview_video import web as web_mod
+
+    monkeypatch.setattr(web_mod, "lan_ips", lambda: ["192.168.1.7"])
+    assert web_mod.access_urls("0.0.0.0", 8099, "t") == [
+        "http://127.0.0.1:8099/#token=t", "http://192.168.1.7:8099/#token=t"]
+    assert web_mod.access_urls("127.0.0.1", 8099, None) == ["http://127.0.0.1:8099/"]
+    assert web_mod.access_urls("::1", 80, None) == ["http://[::1]:80/"]
+
+
+def test_index_poll_handles_404_and_uses_local_storage():
+    from interview_video.web import _STATIC_DIR
+
+    html = (_STATIC_DIR / "index.html").read_text("utf-8")
+    assert "localStorage" in html and "sessionStorage" not in html
+    assert "/api/session" in html
+    assert "e.status === 404" in html

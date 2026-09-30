@@ -69,17 +69,24 @@ def test_merge_breaks_on_max_dur():
 
 def test_merge_breaks_after_chinese_punct():
     words = [_w(0.0, 0.4, "你好，"), _w(0.6, 1.0, "世界")]
-    bars = tts.merge_word_cues(words)
+    bars = tts.merge_word_cues(words, max_chars=6)
     assert len(bars) == 2
     assert bars[0].text == "你好，"
     assert bars[1].text == "世界"
 
 
-@pytest.mark.parametrize("punct", ["，", "。", "！", "？", "；", "："])
-def test_merge_all_punct_variants(punct: str):
+@pytest.mark.parametrize("punct", ["。", "！", "？"])
+def test_merge_sentence_end_always_breaks(punct: str):
     words = [_w(0.0, 0.4, f"甲{punct}"), _w(0.6, 1.0, "乙")]
     bars = tts.merge_word_cues(words)
     assert len(bars) == 2
+
+
+@pytest.mark.parametrize("punct", ["，", "；", "："])
+def test_merge_comma_breaks_only_when_half_full(punct: str):
+    words = [_w(0.0, 0.4, f"甲{punct}"), _w(0.6, 1.0, "乙")]
+    assert len(tts.merge_word_cues(words, max_chars=16)) == 1  # 2 < 8, 不断
+    assert len(tts.merge_word_cues(words, max_chars=4)) == 2  # 2 >= 2, 断
 
 
 def test_merge_non_punct_no_prefer_break():
@@ -113,7 +120,7 @@ def test_merge_multiple_breaks_order():
         _w(3.0, 3.3, "其次。"),  # 大 gap + 标点
         _w(3.5, 3.8, "最后"),
     ]
-    bars = tts.merge_word_cues(words, max_chars=8, max_gap=0.6, max_dur=4.0)
+    bars = tts.merge_word_cues(words, max_chars=6, max_gap=0.6, max_dur=4.0)
     texts = [b.text for b in bars]
     assert texts == ["首先，", "我们来看", "其次。", "最后"]
 

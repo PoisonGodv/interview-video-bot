@@ -129,17 +129,34 @@ def run_budget(settings: Any) -> Iterator[RunBudget | None]:
         _BUDGET.reset(token)
 
 
-def summarize_usage(out_dir: Path) -> dict[str, int]:
-    """汇总一次运行的 llm_calls.jsonl → token 总量(命令行/evals 汇报用)。"""
+def _parse_ts(value: Any) -> datetime | None:
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return ts if ts.tzinfo else ts.astimezone()
+
+
+def summarize_usage(out_dir: Path, since: datetime | None = None) -> dict[str, int]:
+    """汇总 llm_calls.jsonl → token 总量(命令行/evals 汇报用)。
+
+    since: 只统计 ts >= since 的记录(续跑时只算本次运行); naive 时间按本地时区。
+    """
     path = Path(out_dir) / "llm_calls.jsonl"
     totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     if not path.exists():
         return totals
+    if since is not None and since.tzinfo is None:
+        since = since.astimezone()
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if since is not None:
+            ts = _parse_ts(rec.get("ts"))
+            if ts is None or ts < since:
+                continue
         totals["calls"] += 1
         for k in ("input_tokens", "output_tokens", "total_tokens"):
             totals[k] += int(rec.get(k) or 0)

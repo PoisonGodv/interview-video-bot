@@ -6,18 +6,21 @@
 - 子进程经 procs.run 启动: 所在任务被取消时 terminate/kill, 不留孤儿 ffmpeg
 - 单次调用超时随媒体时长伸缩(下限 300s); 非零退出抛 RuntimeError 附 stderr 末尾 500 字
 - 字幕条按场景 clip 逐段烧录(cue 平移到场景本地时间), 再 concat(-c copy), 避免长视频单条巨型 filter
+- 可选画面动效(VIDEO_MOTION): 要点按口播时间逐条出现、缓慢放大、场景首尾各 0.15s 黑场过渡(不改时长)
 - 可选 BGM(BGM_FILE): 在最后一遍音频处理里循环铺满、压低音量、口播时 sidechain 闪避、结尾淡出
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
 from . import procs
 from .config import Settings
-from .models import Chapter, SceneMedia, Script, SubtitleBar
+from .models import Chapter, Cue, SceneMedia, Script, SubtitleBar
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,11 @@ _MIN_SLICE = 1e-3
 # BGM 结尾淡出时长(秒), 短片按总长 1/4 封顶
 _BGM_FADE_SEC = 3.0
 _AUDIO_FMT = "aformat=sample_rates=44100:channel_layouts=stereo"
+# 画面动效: 每场景从 1.00 缓慢放大到 1+_ZOOM; 首尾黑场淡入淡出各 _FADE_SEC(相邻场景合计 0.3s 过渡)
+_ZOOM = 0.04
+_FADE_SEC = 0.15
+# 要点匹配口播时忽略的字符(标点/空白)
+_NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
 
 
 def _timeout_for(duration: float) -> float:
@@ -84,6 +92,128 @@ def ffprobe_duration(path: Path) -> float:
     return float(proc.stdout.strip())
 
 
+def _norm(text: str) -> str:
+    return _NON_WORD.sub("", text).lower()
+
+
+def bullet_times(bullets: list[str], cues: list[Cue], duration: float) -> list[float]:
+    """每条要点在口播里首次出现的时间(场景本地秒), 单调不减。
+
+    在拼接后的 cue 文本里顺序查找要点(整条, 找不到再退到前 4/3 个字), 命中位置按所在
+    cue 内字数线性插值成时间; 找不到的要点在前后已知时间点之间均分(全找不到即整体均分)。
+    """
+    k = len(bullets)
+    if k == 0:
+        return []
+    text, spans = "", []  # spans: (起始字符位置, 字数, cue)
+    for c in cues:
+        t = _norm(c.text)
+        if t:
+            spans.append((len(text), len(t), c))
+            text += t
+
+    def time_at(pos: int) -> float:
+        for start, n, c in spans:
+            if pos < start + n:
+                return c.start + (c.end - c.start) * (pos - start) / n
+        return duration
+
+    found: list[float | None] = []
+    cursor = 0
+    for b in bullets:
+        nb, hit = _norm(b), -1
+        for key in [nb, nb[:4], nb[:3]] if len(nb) > 4 else [nb]:
+            hit = text.find(key, cursor) if key else -1
+            if hit >= 0:
+                break
+        if hit >= 0:
+            found.append(min(max(time_at(hit), 0.0), duration))
+            cursor = hit + 1
+        else:
+            found.append(None)
+
+    anchors = [(-1, 0.0)] + [(i, t) for i, t in enumerate(found) if t is not None] + [(k, duration)]
+    out = list(found)
+    for (i0, t0), (i1, t1) in zip(anchors, anchors[1:]):
+        for j in range(i0 + 1, i1):
+            out[j] = t0 + (t1 - t0) * (j - i0) / (i1 - i0)
+    return out  # type: ignore[return-value]
+
+
+def reveal_frame_counts(times: list[float], duration: float, fps: int) -> list[int]:
+    """分步帧(0..k 条要点)各自的帧数; 总和恒等于 round(duration*fps), 可为 0(跳过该步)。"""
+    total = max(round(duration * fps), 1)
+    cuts = [0] + [min(max(round(t * fps), 0), total) for t in times] + [total]
+    for i in range(1, len(cuts)):
+        cuts[i] = max(cuts[i], cuts[i - 1])
+    return [b - a for a, b in zip(cuts, cuts[1:])]
+
+
+def _reveal_steps(png: Path) -> tuple[list[str], list[Path]] | None:
+    """读 render 阶段写的分步帧清单; 缺失/损坏/帧文件不全返回 None(按单帧处理)。"""
+    sidecar = Path(png).with_suffix(".reveal.json")
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        bullets = [str(b) for b in data["bullets"]]
+        frames = [sidecar.parent / str(f) for f in data["frames"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if len(frames) != len(bullets) + 1 or not all(f.is_file() for f in frames):
+        return None
+    return bullets, frames
+
+
+def _motion_filter(counts: list[int], w: int, h: int, fps: int) -> str:
+    """分步帧(counts 均 > 0)按帧数截取 → concat → 缓慢放大(scale+居中 crop) → 首尾黑场淡入淡出, 出口 [vout]。"""
+    fit = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    parts = [
+        f"[{i}:v]{fit},trim=end_frame={n},setpts=PTS-STARTPTS[s{i}]" for i, n in enumerate(counts)
+    ]
+    labels = [f"[s{i}]" for i in range(len(counts))]
+    total = sum(counts)
+    denom = max(total - 1, 1)
+    fade_n = min(round(_FADE_SEC * fps), total // 4)
+    chain = (
+        f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0,"
+        f"scale=w='trunc({w}*(1+{_ZOOM}*n/{denom})/2)*2':h='trunc({h}*(1+{_ZOOM}*n/{denom})/2)*2'"
+        f":eval=frame,crop={w}:{h},setsar=1"
+    )
+    if fade_n > 0:
+        chain += f",fade=t=in:s=0:n={fade_n},fade=t=out:s={total - fade_n}:n={fade_n}"
+    parts.append(chain + ",format=yuv420p[vout]")
+    return ";".join(parts)
+
+
+def _motion_clip_cmd(
+    sm: SceneMedia, clip: Path, dur: float, anchor: Path, settings: Settings
+) -> list[str]:
+    (w, h), fps = settings.frame_size(), settings.fps
+    steps = _reveal_steps(sm.png)
+    if steps is None:
+        frames, counts = [Path(sm.png)], [max(round(dur * fps), 1)]
+    else:
+        bullets, frames = steps
+        counts = reveal_frame_counts(bullet_times(bullets, sm.cues, dur), dur, fps)
+        kept = [(f, n) for f, n in zip(frames, counts) if n > 0]
+        frames, counts = [f for f, _ in kept], [n for _, n in kept]
+    inputs: list[str] = []
+    for f in frames:
+        inputs += ["-loop", "1", "-framerate", str(fps), "-i", _rel(f, anchor)]
+    return [
+        "ffmpeg", "-y", *inputs,
+        "-i", _rel(sm.mp3, anchor),
+        "-filter_complex", _motion_filter(counts, w, h, fps),
+        "-map", "[vout]", "-map", f"{len(frames)}:a",
+        *_X264_ARGS,
+        "-r", str(fps),
+        "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+        "-t", f"{dur:.3f}",
+        _rel(clip, anchor),
+    ]
+
+
 def build_scene_clips(
     scene_media: list[SceneMedia], clips_dir: Path, settings: Settings
 ) -> list[Path]:
@@ -107,6 +237,11 @@ def build_scene_clips(
         dur = sm.duration
         if dur <= 0:
             dur = ffprobe_duration(sm.mp3)  # 兜底: 无估算时长时用音频时长
+        if settings.video_motion:
+            _run(_motion_clip_cmd(sm, clip, dur, anchor, settings), anchor, _timeout_for(dur))
+            sm.duration = ffprobe_duration(clip)
+            clips.append(clip)
+            continue
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1", "-framerate", str(fps), "-i", _rel(sm.png, anchor),
@@ -251,6 +386,21 @@ def finalize_video(
         _timeout_for(total),
     )
     return out_path
+
+
+def cleanup_intermediates(out_dir: Path, keep_clips: bool = False) -> None:
+    """成片落盘后删除中间文件: base.mp4、concat.list.txt, 以及(除非 keep_clips)clips/。
+
+    scenes/*.mp3 与 cue 缓存保留; clips/ 在 --resume 时由 clips 节点重新生成。
+    """
+    out_dir = Path(out_dir)
+    for name in ("base.mp4", "concat.list.txt"):
+        try:
+            (out_dir / name).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("清理中间文件失败 %s: %s", name, exc)
+    if not keep_clips:
+        shutil.rmtree(out_dir / "clips", ignore_errors=True)
 
 
 def bgm_filter(total: float, settings: Settings, loudnorm: str) -> str:

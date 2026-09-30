@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
@@ -29,6 +30,7 @@ from .models import (
     Script,
     SubtitleBar,
     Topic,
+    load_script_file,
 )
 from .workflow_engine import END, START, CompiledWorkflow, RunContext, WorkflowEngine
 
@@ -50,10 +52,24 @@ class PipelineState(TypedDict, total=False):
     video: Path
     chapters: list[Chapter]
     meta: BiliMeta | None
+    meta_error: str | None
+    regen_meta: bool
     manifest_path: Path
 
 
 STOP_AFTER_CHOICES = ("script",)
+
+# 节点 → 中文阶段名(按执行顺序; CLI 进度展示用)
+PIPELINE_STAGES: list[tuple[str, str]] = [
+    ("gen_script", "选题与脚本"),
+    ("tts", "配音合成"),
+    ("render", "画面渲染"),
+    ("clips", "片段合成"),
+    ("subs", "字幕生成"),
+    ("finalize", "视频合成"),
+    ("metadata", "B站元数据"),
+    ("manifest", "落盘收尾"),
+]
 
 
 def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWorkflow:
@@ -78,9 +94,7 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWo
             script = preset
             logger.info("使用预生成脚本: %s", script.title)
         elif script_file is not None:
-            script = Script.model_validate_json(
-                Path(script_file).read_text(encoding="utf-8")
-            )
+            script = load_script_file(script_file)
             logger.info("使用脚本文件: %s", script_file)
         else:
             from . import llm as llm_mod
@@ -186,23 +200,32 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWo
         两级降级, 均不中断流水线(final.mp4 已在手, 不能因元数据白做):
         1. get_chat_model 抛 RuntimeError(未配 key) → meta=None;
         2. write_metadata 本身失败(LLM 输出解析/网络) → logger.warning + meta=None。
+        续跑时: 旧 project.json 有 meta 且脚本未变 → 直接复用不调 LLM(regen_meta 强制重生成);
+        生成失败时有旧 meta 则保留旧的。失败原因写入 meta_error。
         """
         from . import assemble as assemble_mod
         from . import llm as llm_mod
         from .chains import metadata as metadata_mod
 
-        chapters = assemble_mod.build_chapters(
-            state["script"], state["scene_media"]
-        )
+        script = state["script"]
+        chapters = assemble_mod.build_chapters(script, state["scene_media"])
+        old_meta, old_script = _previous_meta(state["out_dir"])
+        if (
+            old_meta is not None and not state.get("regen_meta")
+            and old_script == script.model_dump(mode="json")
+        ):
+            logger.info("脚本未变, 复用已有 B站元数据(不调 LLM)")
+            return {"chapters": chapters, "meta": old_meta, "meta_error": None}
         try:
             llm = llm_mod.get_chat_model(settings)
         except Exception as exc:  # noqa: BLE001 —— 客户端构造失败也走降级(空 key/坏配置)
             logger.warning("metadata 降级为 meta=None(无法初始化 LLM): %s", exc)
-            return {"chapters": chapters, "meta": None}
+            return {
+                "chapters": chapters, "meta": old_meta,
+                "meta_error": f"无法初始化 LLM: {exc}",
+            }
         try:
-            meta = await metadata_mod.write_metadata(
-                llm, state["script"], chapters, settings
-            )
+            meta = await metadata_mod.write_metadata(llm, script, chapters, settings)
         except llm_mod.LLMBudgetExceededError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 元数据是可降级项
@@ -210,8 +233,11 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWo
                 "metadata 生成失败, 降级为 meta=None(%s: %s)",
                 type(exc).__name__, exc,
             )
-            meta = None
-        return {"chapters": chapters, "meta": meta}
+            return {
+                "chapters": chapters, "meta": old_meta,
+                "meta_error": f"{type(exc).__name__}: {exc}",
+            }
+        return {"chapters": chapters, "meta": meta, "meta_error": None}
 
     async def manifest_node(state: PipelineState) -> PipelineState:
         """第 8 节点: 落盘 project.json + subs/subtitles.srt(全局 cue 的标准 srt)。"""
@@ -225,29 +251,35 @@ def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledWo
         subs_dir.mkdir(parents=True, exist_ok=True)
         srt_path = subs_dir / "subtitles.srt"
         srt_path.write_text(tts_mod.build_srt(cues), encoding="utf-8")
+        generation = {
+            "llm_model": settings.llm_model,
+            "llm_temperature": str(settings.llm_temperature),
+            "tts_provider": settings.tts_provider,
+            "video_aspect": settings.video_aspect,
+            "prompt_versions": "topic1/script2/metadata2/series2",
+        }
+        if state.get("meta_error"):
+            generation["meta_error"] = str(state["meta_error"])
         manifest = ProjectManifest(
             created_at=datetime.now(),
             industry=state.get("industry", ""),
             script=script,
-            video=state["video"],
-            cover=state["render"].cover,
-            srt=srt_path,
+            video=Path(state["video"]).resolve(),
+            cover=Path(state["render"].cover).resolve(),
+            srt=srt_path.resolve(),
             chapters=state.get("chapters", []),
             meta=state.get("meta"),
-            voice=settings.tts_voice,
+            voice=settings.tts_doubao_voice if settings.tts_provider == "doubao" else settings.tts_voice,
             duration_total=sum(m.duration for m in scene_media),
-            generation={
-                "llm_model": settings.llm_model,
-                "llm_temperature": str(settings.llm_temperature),
-                "tts_provider": settings.tts_provider,
-                "video_aspect": settings.video_aspect,
-                "prompt_versions": "topic1/script2/metadata2/series2",
-            },
+            generation=generation,
         )
         manifest_path = out_dir / "project.json"
         manifest_path.write_text(
             manifest.model_dump_json(indent=2), encoding="utf-8"
         )
+        from . import assemble as assemble_mod
+
+        assemble_mod.cleanup_intermediates(out_dir, keep_clips=settings.keep_intermediates)
         topic_json = out_dir / "topic.json"
         if topic_json.exists():  # 选题来自 LLM/--topic/选题库时, 成片后在选题库标记已用
             from . import backlog as backlog_mod
@@ -305,6 +337,17 @@ def _safe_backlog(fn, *args) -> None:
         logger.warning("选题库更新失败(不影响本次生成): %s", exc)
 
 
+def _previous_meta(out_dir: Path) -> tuple[BiliMeta | None, dict | None]:
+    """旧 project.json 里的 (meta, script dump); 不存在/损坏返回 (None, None)。"""
+    try:
+        old = ProjectManifest.model_validate_json(
+            (Path(out_dir) / "project.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None, None
+    return old.meta, old.script.model_dump(mode="json")
+
+
 def resume_industry(out_dir: Path) -> str | None:
     """续跑目录里记录的行业: project.json 优先, 其次 topic.json; 都没有返回 None。"""
     for fname in ("project.json", "topic.json"):
@@ -352,10 +395,14 @@ async def run_pipeline(
     topic_title: str | None = None,
     script_file: Path | None = None,
     script: Script | None = None,
+    on_stage: Callable[[str, str], None] | None = None,
+    regen_meta: bool = False,
 ) -> ProjectManifest:
     """async 便捷入口: 跑完整流水线, 返回 ProjectManifest(已落盘 project.json)。
 
     script 预制传入时跳过 LLM 生成(系列模式 / --resume 用)。
+    on_stage(node, "start"|"done"): 逐节点进度回调(CLI 进度条用)。
+    regen_meta: 续跑时强制重新生成 B站元数据(默认脚本未变则复用旧 meta)。
     启动前先跑 doctor.preflight(ffmpeg/chromium/字体), 避免付费步骤后才发现缺依赖。
     """
     from . import doctor as doctor_mod
@@ -372,10 +419,32 @@ async def run_pipeline(
     }
     if script is not None:
         initial["script"] = script
+    if regen_meta:
+        initial["regen_meta"] = True
     from .llm_audit import LLMCallAudit, run_budget
 
+    order = [k for k, _ in PIPELINE_STAGES]
+
+    def _emit(node: str, status: str) -> None:
+        if on_stage is None:
+            return
+        try:
+            on_stage(node, status)
+        except Exception:  # noqa: BLE001 —— 进度展示失败不影响流水线
+            logger.debug("on_stage 回调失败", exc_info=True)
+
+    final: dict = dict(initial)
     with run_budget(settings):
-        final = await graph.run(initial, context=RunContext(audit=LLMCallAudit(out_dir)))
+        _emit(order[0], "start")
+        async for chunk in graph.stream(
+            initial, stream_mode="updates", context=RunContext(audit=LLMCallAudit(out_dir)),
+        ):
+            for node, output in chunk.items():
+                final.update(output)
+                _emit(node, "done")
+                i = order.index(node) if node in order else -1
+                if 0 <= i < len(order) - 1:
+                    _emit(order[i + 1], "start")
     manifest_path = Path(final["manifest_path"])
     return ProjectManifest.model_validate_json(
         manifest_path.read_text(encoding="utf-8")

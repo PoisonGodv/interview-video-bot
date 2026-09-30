@@ -58,4 +58,4 @@ jobs:
       - name: Install deps
         run: uv sync --extra dev --python 3.12
       - name: Test (ffmpeg integration)
-        run: uv run pytest -q --run-integration tests/test_assemble.py tests/test_content_features.py
+        run: uv run pytest -q --run-integration tests/test_assemble.py tests/test_content_features.py tests/test_motion.py
