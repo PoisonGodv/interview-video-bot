@@ -6,7 +6,10 @@
    - 首选 enforce_boundary: 执行 Schema、长度与结构、业务红线三重边界校验;
    - 初次违规时自动下调温度发起带第一现场与违规反馈的自修复重问;
    - 容错本地回退解析: 若触发边界违规但本地 fallback_parser 可补救，留痕日志后采用;
-   - 致命错误 (401/403/404) 熔断拦截，抛出 RuntimeError 不浪费重试。
+   - 红线闸门: 任何回退解析结果都会重扫业务红线, 命中即抛 RedlineGateError(ValueError);
+   - 致命错误 (401/403/404) 熔断拦截，抛出 RuntimeError 不浪费重试;
+   - 输出截断 (LLMTruncatedError, finish_reason=length) 原样抛出: 同参修复重问必然再截断;
+   - 运行预算超限 (LLMBudgetExceededError) 原样抛出, 不进修复/回退。
 2. 纯文本与审稿调用 (invoke_text):
    - 纯文本请求 + 本地容错解析 + 一次带错误反馈的修复重问。
 """
@@ -16,14 +19,16 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+import httpx
 from pydantic import BaseModel
 
 from ..boundary import (
     BoundaryRules,
     BoundaryViolationError,
     enforce_boundary,
+    scan_object_redlines,
 )
-from ..llm import is_fatal_error
+from ..llm import LLMBudgetExceededError, LLMError, LLMTruncatedError, is_fatal_error
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,27 @@ def _fatal_llm_error(exc: BaseException) -> bool:
         return isinstance(exc, fatal) if fatal else False
     except ImportError:
         return False
+
+
+def _transport_exhausted(exc: BaseException) -> bool:
+    """HTTP 客户端重试耗尽后抛出的传输层错误(429/5xx/超时): 上层不应再发起新一轮调用。"""
+    return isinstance(exc, (LLMError, httpx.HTTPError))
+
+
+class RedlineGateError(ValueError):
+    """回退解析结果命中业务红线; __cause__ 为带 violations 的 BoundaryViolationError。"""
+
+
+def _redline_gate(value: Any, stage: str, raw: str = "") -> Any:
+    """对回退/结构化解析结果做对象级红线重扫, 命中即抛 RedlineGateError。"""
+    violations = scan_object_redlines(value)
+    if not violations:
+        return value
+    detail = "; ".join(v.message for v in violations[:3])
+    err = BoundaryViolationError(
+        f"[{stage}] 输出命中业务红线: {detail}", violations=violations, raw_output=raw
+    )
+    raise RedlineGateError(f"[{stage}] LLM 输出命中业务红线: {detail}") from err
 
 
 def _msg_text(message: Any) -> str:
@@ -140,13 +166,15 @@ async def invoke_text(
         else:
             raise TypeError(f"llm 不支持调用: {type(llm)}")
         text = _msg_text(raw_res)
+    except (LLMTruncatedError, LLMBudgetExceededError):
+        raise
     except Exception as exc:
         if _fatal_llm_error(exc):
             raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误, 不重试: {exc}") from exc
         raise
 
     try:
-        return fallback_parser(text)
+        parsed = fallback_parser(text)
     except Exception as exc:
         logger.warning(
             "[%s] 文本解析失败(%s: %.200s), 修复重问一次",
@@ -156,11 +184,15 @@ async def invoke_text(
         )
         try:
             repaired = await _repair_reask(llm, messages, text, exc)
-            return fallback_parser(repaired)
+            parsed = fallback_parser(repaired)
+            text = repaired
+        except (LLMTruncatedError, LLMBudgetExceededError):
+            raise
         except Exception as exc2:
             if _fatal_llm_error(exc2):
                 raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误: {exc2}") from exc2
             raise ValueError(f"[{stage}] LLM 输出解析失败(文本+修复重试均失败)") from exc
+    return _redline_gate(parsed, stage, text)
 
 
 async def invoke_structured(
@@ -191,22 +223,28 @@ async def invoke_structured(
             else:
                 res = runner(messages)
             if isinstance(res, dict):
-                if res.get("parsed") is not None:
-                    return res["parsed"]
                 raw_text = _msg_text(res.get("raw"))
+                if res.get("parsed") is not None:
+                    return _redline_gate(res["parsed"], stage, raw_text)
                 first_exc = res.get("parsing_error") or ValueError("结构化输出 parsed 为空")
                 if raw_text:
                     try:
-                        return fallback_parser(raw_text)
+                        parsed = fallback_parser(raw_text)
                     except Exception as err:
                         first_exc = err
+                    else:
+                        return _redline_gate(parsed, stage, raw_text)
                 # 修复重问
                 repaired = await _repair_reask(llm, messages, raw_text, first_exc)
-                return fallback_parser(repaired)
-            return res
+                return _redline_gate(fallback_parser(repaired), stage, repaired)
+            return _redline_gate(res, stage)
+        except (RedlineGateError, LLMTruncatedError, LLMBudgetExceededError):
+            raise
         except Exception as exc:
             if _fatal_llm_error(exc):
                 raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误, 不重试: {exc}") from exc
+            if _transport_exhausted(exc):
+                raise
             logger.warning(
                 "[%s] with_structured_output 失败(%s: %.200s), 回退到边界检查主路径",
                 stage,
@@ -241,19 +279,27 @@ async def invoke_structured(
         if target:
             try:
                 val = fallback_parser(target)
+            except Exception:
+                val = None
+            if val is not None:
+                _redline_gate(val, stage, target)
                 logger.info("[%s] 本地回退解析成功救回", stage)
                 return val
-            except Exception:
-                pass
         raise ValueError(
             f"[{stage}] LLM 输出解析失败(边界检查与自修复重试均失败)"
         ) from b_err
+    except (LLMTruncatedError, LLMBudgetExceededError):
+        raise
     except Exception as exc:
         if _fatal_llm_error(exc):
             raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误, 不重试: {exc}") from exc
+        if _transport_exhausted(exc):
+            raise  # 客户端已按 Retry-After/退避重试并尝试过备用模型, 不再整轮重来
         # 尝试本地 fallback
         try:
             return await invoke_text(messages, llm, payload, fallback_parser, stage=stage)
+        except (RedlineGateError, LLMBudgetExceededError):
+            raise
         except Exception as exc2:
             if _fatal_llm_error(exc2):
                 raise RuntimeError(f"[{stage}] LLM 鉴权/配置错误: {exc2}") from exc2
@@ -263,6 +309,7 @@ async def invoke_structured(
 
 
 __all__ = [
+    "RedlineGateError",
     "invoke_structured",
     "invoke_text",
     "_fatal_llm_error",

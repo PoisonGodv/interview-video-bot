@@ -9,6 +9,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from . import procs
 from .config import Settings
 from .models import Cue, SubtitleBar
 
@@ -125,6 +126,7 @@ def render_subtitle_bars(
 
     bars: list[SubtitleBar] = []
     for index, cue in enumerate(cues):
+        procs.checkpoint()
         # 透明底画布(RGBA)
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)

@@ -16,7 +16,8 @@ from rich.panel import Panel
 
 from . import __version__
 from .config import Settings, load_settings
-from .graph import run_pipeline
+from .estimate import SERIES_MAX_EPISODE_MIN, SERIES_MAX_EPISODES, SERIES_MIN_EPISODE_MIN
+from .graph import STOP_AFTER_CHOICES, resume_industry, run_pipeline, run_script_stage
 from .logging_setup import setup_logging
 from .models import ProjectManifest, Topic
 
@@ -102,7 +103,9 @@ def topics(
 
 @app.command()
 def generate(
-    industry: str = typer.Option("互联网", "--industry", "-i", help="目标行业"),
+    industry: str | None = typer.Option(
+        None, "--industry", "-i", help="目标行业(默认 互联网; --resume 时默认沿用原目录记录)",
+    ),
     topic: str | None = typer.Option(None, "--topic", "-t", help="选题标题提示"),
     script_file: Path | None = typer.Option(None, "--script-file", help="跳过 LLM, 直接用现成脚本 JSON"),
     voice: str | None = typer.Option(None, "--voice", help="edge-tts 音色, 如 zh-CN-XiaoxiaoNeural"),
@@ -111,9 +114,19 @@ def generate(
         None, "--resume",
         help="断点续跑: 传上次的输出目录, 复用其 script.json(不再调 LLM)与 TTS 缓存",
     ),
+    stop_after: str | None = typer.Option(
+        None, "--stop-after",
+        help="只跑到指定阶段后停下; script=只生成 script.json, 人工审改后用 --resume 续跑",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="BILI_UPLOAD_ENABLED 时跳过上传确认"),
 ) -> None:
     """跑完整流水线生成视频。--script-file 模式全程不需要 LLM key。"""
+    if stop_after is not None and stop_after not in STOP_AFTER_CHOICES:
+        console.print(f"[red]--stop-after 仅支持: {', '.join(STOP_AFTER_CHOICES)}[/]")
+        raise typer.Exit(2)
+    if stop_after is not None and resume is not None:
+        console.print("[red]--stop-after 与 --resume 不能同时使用[/]")
+        raise typer.Exit(2)
     settings = load_settings()
     if voice:
         settings.tts_voice = voice
@@ -132,9 +145,26 @@ def generate(
         else:
             console.print(f"[yellow]断点续跑[/]: {out_dir} 无 script.json, 重新生成脚本")
     else:
-        out_dir = Path(out) if out else _default_out_dir(settings, script_file, topic, industry)
+        out_dir = Path(out) if out else _default_out_dir(settings, script_file, topic, industry or "互联网")
+    industry = industry or (resume_industry(out_dir) if resume is not None else None) or "互联网"
     out_dir.mkdir(parents=True, exist_ok=True)
     console.print(f"[bold]输出目录:[/] {out_dir}")
+
+    if stop_after == "script":
+        script = asyncio.run(
+            run_script_stage(
+                settings, out_dir, industry=industry,
+                topic_title=topic, script_file=script_file,
+            )
+        )
+        console.print(
+            Panel(
+                f"脚本: {out_dir / 'script.json'}  ({script.title}, {len(script.scenes)} 个场景)\n"
+                f"审改后继续生成视频:\n  ivb generate --resume {out_dir}",
+                title="脚本已生成(已停在配音前)", border_style="yellow",
+            )
+        )
+        return
 
     try:
         manifest: ProjectManifest = asyncio.run(
@@ -205,18 +235,41 @@ def upload(
 @app.command()
 def series(
     theme: str = typer.Argument(..., help="系列主题, 如 程序员面试通关"),
-    episodes: int = typer.Option(3, "--episodes", "-e", help="集数"),
-    duration: float = typer.Option(15.0, "--duration", "-d", help="每集目标时长(分钟)"),
+    episodes: int = typer.Option(
+        3, "--episodes", "-e", help=f"集数(1~{SERIES_MAX_EPISODES})",
+    ),
+    duration: float = typer.Option(
+        15.0, "--duration", "-d",
+        help=f"每集目标时长(分钟, {SERIES_MIN_EPISODE_MIN:g}~{SERIES_MAX_EPISODE_MIN:g})",
+    ),
     resume: Path | None = typer.Option(
         None, "--resume",
         help="断点续跑: 传上次系列的根目录(含 series.json), 已完成的集/章不重跑",
     ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="跳过费用预估确认"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印费用预估, 不调用 LLM/TTS"),
 ) -> None:
     """多 agent 系列长视频: 一个主题 → N 集 × M 分钟(策划/编剧/章节写手/审稿)。"""
     settings = load_settings()
     if resume is not None and not (resume / "series.json").exists():
         console.print(f"[red]--resume 目录缺 series.json: {resume}[/]")
         raise typer.Exit(1)
+    if resume is None:
+        from .estimate import estimate_series, validate_series_bounds
+
+        err = validate_series_bounds(episodes, duration)
+        if err:
+            console.print(f"[red]{err}[/]")
+            raise typer.Exit(2)
+        est = estimate_series(settings, episodes, duration)
+        console.print(Panel("\n".join(est.lines()), title="费用预估(粗估)", border_style="cyan"))
+        if dry_run:
+            return
+        if not yes and not typer.confirm("按以上预估开始生成?"):
+            raise typer.Abort()
+    elif dry_run:
+        console.print("[yellow]--dry-run 仅对新系列生成预估, 续跑无需预估[/]")
+        return
     from .doctor import preflight
 
     preflight(settings)
@@ -265,18 +318,28 @@ async def _series_main(
             / f"{_slug(theme)}-series-{datetime.now().strftime('%Y%m%d-%H%M')}"
         )
     root.mkdir(parents=True, exist_ok=True)
-    plan, scripts = await generate_series(
-        settings, theme, episodes=episodes,
-        episode_sec=int(duration_min * 60), on_event=on_event,
-        run_dir=root, resume=resume_dir is not None,
-    )
-    for i, script in enumerate(scripts):
-        out_dir = root / f"ep{i + 1:02d}-{_slug(script.title)}"
-        if (out_dir / "project.json").exists():
-            console.print(f"[yellow]第 {i + 1} 集已有成片, 跳过[/] → {out_dir}")
-            continue
-        console.print(f"[bold]第 {i + 1}/{len(scripts)} 集媒体合成[/] → {out_dir}")
-        await run_pipeline(settings, out_dir, industry=theme, script=script)
+    from .llm_audit import run_budget
+
+    try:
+        with run_budget(settings):  # 整个系列(脚本+各集元数据)共用一个 LLM 硬上限计数器
+            plan, scripts = await generate_series(
+                settings, theme, episodes=episodes,
+                episode_sec=int(duration_min * 60), on_event=on_event,
+                run_dir=root, resume=resume_dir is not None,
+            )
+            for i, script in enumerate(scripts):
+                out_dir = root / f"ep{i + 1:02d}-{_slug(script.title)}"
+                if (out_dir / "project.json").exists():
+                    console.print(f"[yellow]第 {i + 1} 集已有成片, 跳过[/] → {out_dir}")
+                    continue
+                console.print(f"[bold]第 {i + 1}/{len(scripts)} 集媒体合成[/] → {out_dir}")
+                await run_pipeline(settings, out_dir, industry=theme, script=script)
+    except Exception:
+        if (root / "series.json").exists():
+            console.print(
+                f"[yellow]已完成的集/章已落盘, 修复问题后续跑:[/] ivb series '{theme}' --resume {root}"
+            )
+        raise
     body = f"共 {len(scripts)} 集 → {root}"
     usage = _usage_line(root)
     if usage:

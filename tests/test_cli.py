@@ -267,3 +267,50 @@ def asyncio_run(coro):
 
     return asyncio.run(coro)
 
+
+
+def test_generate_stop_after_script_then_resume(
+    fake_media: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--stop-after script: 只落盘 script.json(不跑 TTS/预检), 提示续跑命令; 审改后 --resume 出片。"""
+    from interview_video import doctor as doctor_mod
+
+    def no_preflight(settings):
+        raise AssertionError("只生成脚本不应做媒体预检")
+
+    monkeypatch.setattr(doctor_mod, "preflight", no_preflight)
+    real_tts = tts_mod.synthesize_scenes
+
+    async def no_tts(*a, **kw):
+        raise AssertionError("只生成脚本不应调用 TTS")
+
+    monkeypatch.setattr(tts_mod, "synthesize_scenes", no_tts)
+    out_dir = tmp_path / "draft"
+    result = runner.invoke(
+        app, ["generate", "--script-file", str(SAMPLE_SCRIPT), "--out", str(out_dir),
+              "--stop-after", "script"],
+    )
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "script.json").exists()
+    assert not (out_dir / "project.json").exists() and not (out_dir / "scenes").exists()
+    flat = result.output.replace("\n", "").replace("│", "").replace(" ", "")
+    assert f"ivbgenerate--resume{out_dir}".replace(" ", "") in flat
+
+    data = json.loads((out_dir / "script.json").read_text(encoding="utf-8"))
+    data["title"] = "人工改过的标题"
+    (out_dir / "script.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(doctor_mod, "preflight", lambda settings: None)
+    monkeypatch.setattr(tts_mod, "synthesize_scenes", real_tts)
+    result = runner.invoke(app, ["generate", "--resume", str(out_dir)])
+    assert result.exit_code == 0, result.output
+    manifest = json.loads((out_dir / "project.json").read_text(encoding="utf-8"))
+    assert manifest["script"]["title"] == "人工改过的标题"
+
+
+def test_generate_stop_after_invalid_choice(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["generate", "--stop-after", "tts", "--out", str(tmp_path / "x")])
+    assert result.exit_code == 2 and "script" in result.output
+    result = runner.invoke(
+        app, ["generate", "--stop-after", "script", "--resume", str(tmp_path)]
+    )
+    assert result.exit_code == 2

@@ -3,7 +3,9 @@
 彻底移除 LangChain / LangGraph 依赖，具备:
 1. 纯净异步 HTTP 通信 (POST /chat/completions);
 2. 异常分类与快速失败: 401/403/404 鉴权与配置错误立即抛出，不浪费重试;
-3. 抖动与指数退避重试: 针对 429 限流 / 5xx 服务端错误 / 超时网络波动自动重试;
+3. 抖动与指数退避重试: 针对 429 限流 / 5xx 服务端错误 / 超时网络波动自动重试,
+   优先遵循 Retry-After(秒数或 HTTP-date, 上限 60s), 429 退避基数更大;
+   finish_reason=length 抛 LLMTruncatedError(不重试, 提示调大 LLM_MAX_TOKENS);
 4. 备用模型降级 (with_fallbacks): 主模型彻底失败时无缝切换到备用模型;
 5. 审计打点集成 (LLMCallAudit): 精确捕获耗时、Prompt/Response 字符数及 token 消耗;
 6. 测试替身 (fake_chat_model): 离线内存流式出参，支持 ainvoke 与 with_fallbacks。
@@ -11,9 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
 import logging
+import math
+import random
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,7 +27,7 @@ import httpx
 from pydantic import SecretStr
 
 from .config import Settings
-from .llm_audit import LLMCallAudit
+from .llm_audit import LLMBudgetExceededError, LLMCallAudit, current_budget
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +43,17 @@ class LLMError(Exception):
 class LLMAPIError(LLMError):
     """上游 API 响应异常。"""
 
-    def __init__(self, message: str, status_code: int = 500, response_text: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 500,
+        response_text: str = "",
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response_text = response_text
+        self.retry_after = retry_after
 
 
 class AuthenticationError(LLMAPIError):
@@ -67,12 +80,64 @@ class NotFoundError(LLMAPIError):
 class RateLimitError(LLMAPIError):
     """429 访问受限或触发并发/RPM配额。"""
 
-    def __init__(self, message: str = "LLM 访问受限或配额耗尽 (429)", response_text: str = "") -> None:
-        super().__init__(message, status_code=429, response_text=response_text)
+    def __init__(
+        self,
+        message: str = "LLM 访问受限或配额耗尽 (429)",
+        response_text: str = "",
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message, status_code=429, response_text=response_text, retry_after=retry_after)
+
+
+class LLMTruncatedError(LLMError):
+    """finish_reason=length: 输出触顶 max_tokens 被截断。同参重试/修复重问大概率再次截断, 不重试。"""
+
+    def __init__(self, message: str, content: str = "") -> None:
+        super().__init__(message)
+        self.content = content
 
 
 class LLMConnectionError(LLMError):
     """base_url 非法或服务不可达(配置类错误, 不重试)。"""
+
+
+_MAX_RETRY_AFTER = 60.0
+_BACKOFF_CAP = 60.0
+_BACKOFF_BASE = 0.5
+_RATE_LIMIT_BACKOFF_BASE = 2.0
+_CONNECT_TIMEOUT = 10.0
+
+
+def parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
+    """解析 Retry-After(秒数或 HTTP-date) → 等待秒数, 截断到 [0, 60]; 无法解析返回 None。"""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:  # 规范要求 GMT; 无时区的按 UTC 处理, 避免按本地时区偏移数小时
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        seconds = when.timestamp() - (time.time() if now is None else now)
+    if not math.isfinite(seconds):  # "nan"/"inf" 能被 float 解析, 不能当等待时长
+        return None
+    return min(max(seconds, 0.0), _MAX_RETRY_AFTER)
+
+
+def retry_delay(exc: BaseException, attempt: int, rand: Callable[[], float] = random.random) -> float:
+    """第 attempt(0 起) 次失败后的等待: Retry-After 优先, 否则指数退避 + 抖动(429 基数更大)。"""
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        return retry_after
+    base = _RATE_LIMIT_BACKOFF_BASE if isinstance(exc, RateLimitError) else _BACKOFF_BASE
+    ceiling = min(_BACKOFF_CAP, base * (2 ** attempt))
+    return ceiling / 2 + rand() * ceiling / 2
 
 
 def is_fatal_error(exc: BaseException) -> bool:
@@ -125,6 +190,9 @@ class HTTPChatClient:
         max_retries: int = 2,
         fallbacks: Sequence[HTTPChatClient] | None = None,
         audit: LLMCallAudit | None = None,
+        connect_timeout: float = _CONNECT_TIMEOUT,
+        sleep: Callable[[float], Awaitable[Any]] | None = None,
+        rand: Callable[[], float] | None = None,
     ) -> None:
         self.model = model
         self._raw_key = api_key.get_secret_value() if isinstance(api_key, SecretStr) else api_key
@@ -136,6 +204,9 @@ class HTTPChatClient:
         self.max_retries = max_retries
         self.fallbacks: list[HTTPChatClient] = list(fallbacks) if fallbacks else []
         self.audit = audit
+        self.connect_timeout = connect_timeout
+        self._sleep = sleep
+        self._rand = rand
 
     def with_fallbacks(self, fallbacks: Sequence[HTTPChatClient]) -> HTTPChatClient:
         """注册备用客户端序列。"""
@@ -149,6 +220,9 @@ class HTTPChatClient:
             max_retries=self.max_retries,
             fallbacks=fallbacks,
             audit=self.audit,
+            connect_timeout=self.connect_timeout,
+            sleep=self._sleep,
+            rand=self._rand,
         )
         return new_client
 
@@ -194,7 +268,9 @@ class HTTPChatClient:
                 **kwargs,
             )
         except Exception as exc:
-            if is_fatal_error(exc) and not isinstance(exc, LLMConnectionError):
+            if isinstance(exc, (LLMTruncatedError, LLMBudgetExceededError)) or (
+                is_fatal_error(exc) and not isinstance(exc, LLMConnectionError)
+            ):
                 raise
             if self.fallbacks:
                 logger.warning(
@@ -213,7 +289,7 @@ class HTTPChatClient:
                             **kwargs,
                         )
                     except Exception as fb_exc:
-                        if is_fatal_error(fb_exc):
+                        if is_fatal_error(fb_exc) or isinstance(fb_exc, LLMBudgetExceededError):
                             raise
                         logger.warning("备用模型 %s 同样失败: %s", fallback.model, fb_exc)
             raise
@@ -242,12 +318,16 @@ class HTTPChatClient:
 
         prompt_str = "\n".join(f"{m['role']}: {m['content']}" for m in norm_messages)
         last_error: BaseException | None = None
+        timeout = httpx.Timeout(self.timeout, connect=min(self.connect_timeout, self.timeout))
 
+        budget = current_budget()
         for attempt in range(self.max_retries + 1):
+            if budget is not None:
+                budget.acquire()  # 超限直接抛出, 不进重试/备用模型
             t0 = time.perf_counter()
             try:
                 try:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
                         resp = await client.post(endpoint, json=body, headers=headers)
                 except (httpx.InvalidURL, httpx.UnsupportedProtocol,
                         httpx.ConnectError, httpx.ConnectTimeout) as conn_exc:
@@ -280,13 +360,27 @@ class HTTPChatClient:
                         "total_tokens": raw_usage.get("total_tokens", 0),
                     }
 
+                    if budget is not None:
+                        budget.add_tokens(
+                            usage_dict["total_tokens"]
+                            or usage_dict["input_tokens"] + usage_dict["output_tokens"]
+                        )
+                    truncated = first_choice.get("finish_reason") == "length"
                     if self.audit:
                         self.audit.record_call(
                             model=self.model,
                             elapsed_ms=elapsed_ms,
                             prompt=prompt_str,
                             response=content,
+                            error="LLMTruncatedError: finish_reason=length" if truncated else None,
                             **usage_dict,
+                        )
+                    if truncated:
+                        raise LLMTruncatedError(
+                            f"LLM 输出触顶被截断(finish_reason=length, model={self.model}, "
+                            f"max_tokens={max_tokens or '网关默认'}, 已输出 {len(content)} 字); "
+                            "请调大 .env 的 LLM_MAX_TOKENS 后重试",
+                            content=content,
                         )
 
                     return ChatResponse(
@@ -303,15 +397,23 @@ class HTTPChatClient:
                     raise PermissionDeniedError(f"权限不足 (403): {resp_text[:200]}", response_text=resp_text)
                 if resp.status_code == 404:
                     raise NotFoundError(f"模型或地址不存在 (404): {resp_text[:200]}", response_text=resp_text)
+                retry_after = parse_retry_after(resp.headers.get("retry-after"))
                 if resp.status_code == 429:
-                    raise RateLimitError(f"触发限流 (429): {resp_text[:200]}", response_text=resp_text)
+                    raise RateLimitError(
+                        f"触发限流 (429): {resp_text[:200]}",
+                        response_text=resp_text,
+                        retry_after=retry_after,
+                    )
 
                 raise LLMAPIError(
                     f"上游服务异常 (HTTP {resp.status_code}): {resp_text[:200]}",
                     status_code=resp.status_code,
                     response_text=resp_text,
+                    retry_after=retry_after,
                 )
 
+            except LLMTruncatedError:
+                raise
             except Exception as exc:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 last_error = exc
@@ -326,15 +428,19 @@ class HTTPChatClient:
                     raise
 
                 if attempt < self.max_retries:
-                    backoff = (2 ** attempt) * 0.5
+                    backoff = retry_delay(exc, attempt, self._rand or random.random)
                     logger.warning(
-                        "LLM 调用第 %d 次失败(%s: %s)，将在 %.1fs 后重试...",
+                        "LLM[%s] 第 %d/%d 次失败(status=%s, %s: %.200s)，%.1fs 后重试%s",
+                        self.model,
                         attempt + 1,
+                        self.max_retries + 1,
+                        getattr(exc, "status_code", "-"),
                         type(exc).__name__,
                         exc,
                         backoff,
+                        "(遵循 Retry-After)" if getattr(exc, "retry_after", None) is not None else "",
                     )
-                    await asyncio.sleep(backoff)
+                    await (self._sleep or asyncio.sleep)(backoff)
                 else:
                     if self.audit:
                         self.audit.record_call(
@@ -422,6 +528,7 @@ def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTT
         base_url=base_url,
         temperature=settings.llm_temperature,
         timeout=settings.llm_timeout,
+        connect_timeout=settings.llm_connect_timeout,
         max_tokens=settings.llm_max_tokens,
         max_retries=settings.llm_max_retries,
         audit=audit,
@@ -436,6 +543,7 @@ def get_chat_model(settings: Settings, audit: LLMCallAudit | None = None) -> HTT
             base_url=fallback_base,
             temperature=settings.llm_temperature,
             timeout=settings.llm_timeout,
+            connect_timeout=settings.llm_connect_timeout,
             max_tokens=settings.llm_max_tokens,
             max_retries=settings.llm_max_retries,
             audit=audit,
@@ -453,7 +561,11 @@ __all__ = [
     "NotFoundError",
     "RateLimitError",
     "LLMConnectionError",
+    "LLMTruncatedError",
+    "LLMBudgetExceededError",
     "is_fatal_error",
+    "parse_retry_after",
+    "retry_delay",
     "ChatResponse",
     "HTTPChatClient",
     "FakeChatModel",

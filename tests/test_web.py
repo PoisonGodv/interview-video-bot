@@ -328,3 +328,296 @@ def test_series_job(portal_app, monkeypatch, settings):
         # 分集出现在作品库
         names = [p["name"] for p in client.get("/api/projects").json()["projects"]]
         assert any(n.startswith("ep01-") for n in names)
+
+
+# ---------- 脚本审改 → 重新生成 ----------
+
+def _sample_script_dict() -> dict:
+    return {"title": "改后标题", "scenes": [{"header": "开场", "narration": "大家好。"}]}
+
+
+def test_script_get_put_and_validation(portal_app, monkeypatch):
+    monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        job_id = client.post("/api/jobs", json={"industry": "汽修"}).json()["job_id"]
+        _drive(client, scheduled)
+        name = _wait_job(client, job_id)["project"]
+
+        # 老项目无 script.json: 回落到 project.json 里的脚本
+        assert client.get(f"/api/projects/{name}/script").json()["title"] == "测试标题"
+
+        r = client.put(f"/api/projects/{name}/script", json={"scenes": "bad"})
+        assert r.status_code == 422
+        assert "脚本格式不合法" in r.json()["detail"] and "title" in r.json()["detail"]
+        r = client.put(f"/api/projects/{name}/script", json={"title": "x", "scenes": []})
+        assert r.status_code == 422
+
+        assert client.put(f"/api/projects/{name}/script", json=_sample_script_dict()).json()["ok"]
+        assert client.get(f"/api/projects/{name}/script").json()["title"] == "改后标题"
+
+        assert client.get("/api/projects/..%2Fx/script").status_code in (400, 404)
+        assert client.put("/api/projects/nope/script", json=_sample_script_dict()).status_code == 404
+
+
+def test_stop_after_script_then_regenerate(portal_app, settings, monkeypatch):
+    """只生成脚本 → 作品库出现草稿 → 改脚本 → regenerate 复用同目录与改后的脚本。"""
+    calls: dict = {}
+
+    async def fake_script_stage(settings_, out_dir, industry, topic_title, script_file):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        s = Script(title="草稿", scenes=[{"header": "开场", "narration": "你好。"}])
+        (out_dir / "script.json").write_text(s.model_dump_json(), encoding="utf-8")
+        (out_dir / "topic.json").write_text(
+            Topic(title="草稿", industry=industry).model_dump_json(), encoding="utf-8")
+        return s
+
+    async def fake_execute(settings_, out_dir, industry, topic_title, script_file,
+                           on_stage, script=None):
+        calls.update(out_dir=out_dir, industry=industry, script=script, voice=settings_.tts_voice)
+        for node, _ in STAGES:
+            on_stage(node)
+        return _write_manifest(out_dir, settings_, industry)
+
+    monkeypatch.setattr("interview_video.web._execute_script_stage", fake_script_stage)
+    monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        r = client.post("/api/jobs", json={"industry": "护理", "stop_after": "script"})
+        _drive(client, scheduled)
+        job = _wait_job(client, r.json()["job_id"])
+        assert job["status"] == "done" and job["stop_after"] == "script"
+        assert not calls, "只生成脚本不应跑媒体流水线"
+        name = job["project"]
+        proj_dir = settings.out_root.resolve() / name
+        assert not (proj_dir / "project.json").exists()
+
+        draft = [p for p in client.get("/api/projects").json()["projects"] if p["name"] == name]
+        assert draft and draft[0]["draft"] is True and draft[0]["video_url"] is None
+        assert client.get(f"/api/projects/{name}").json()["script"]["title"] == "草稿"
+        assert client.post(f"/api/projects/{name}/upload").status_code == 404
+
+        client.put(f"/api/projects/{name}/script", json=_sample_script_dict())
+        r = client.post(f"/api/projects/{name}/regenerate",
+                        json={"provider": "edge", "voice": "zh-CN-XiaoxiaoNeural"})
+        assert r.status_code == 202
+        # 单飞: 重新生成任务未结束前, 新任务/再次重新生成都被拒
+        assert client.post(f"/api/projects/{name}/regenerate").status_code == 409
+        assert client.post("/api/jobs", json={}).status_code == 409
+        assert client.put(f"/api/projects/{name}/script",
+                          json=_sample_script_dict()).status_code == 409
+        _drive(client, scheduled)
+        job = _wait_job(client, r.json()["job_id"])
+        assert job["status"] == "done", job["error"]
+        assert job["project"] == name
+        assert calls["out_dir"] == proj_dir
+        assert calls["script"].title == "改后标题"
+        assert calls["industry"] == "护理"  # 沿用 topic.json 记录的行业
+        assert calls["voice"] == "zh-CN-XiaoxiaoNeural"
+        assert (proj_dir / "project.json").exists()
+
+
+def test_regenerate_guards(client):
+    assert client.post("/api/projects/nope/regenerate").status_code == 404
+    assert client.post("/api/projects/..%2Fx/regenerate").status_code in (400, 404)
+    r = client.post("/api/jobs", json={"mode": "series", "stop_after": "script"})
+    assert r.status_code == 400
+
+
+# ---------- 活动任务 / 系列续跑 ----------
+
+def test_active_job_and_409_carries_job_id(portal_app, monkeypatch):
+    monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        assert client.get("/api/jobs/active").json() is None
+        job_id = client.post("/api/jobs", json={"topic_title": "t"}).json()["job_id"]
+        active = client.get("/api/jobs/active").json()
+        assert active["id"] == job_id and active["status"] == "running"
+        r = client.post("/api/jobs", json={})
+        assert r.status_code == 409
+        assert r.json()["job_id"] == job_id and r.json()["detail"]
+        _drive(client, scheduled)
+        _wait_job(client, job_id)
+        assert client.get("/api/jobs/active").json() is None
+
+
+def _write_series_root(settings: Settings, name: str, n_eps: int, done: int) -> Path:
+    from interview_video.models import EpisodePlan, SeriesPlan
+
+    root = settings.out_root.resolve() / name
+    root.mkdir(parents=True, exist_ok=True)
+    plan = SeriesPlan(
+        theme="程序员面试", title="通关", synopsis="s",
+        episodes=[EpisodePlan(index=i + 1, title=f"第{i + 1}集", target_sec=600)
+                  for i in range(n_eps)],
+    )
+    (root / "series.json").write_text(plan.model_dump_json(), encoding="utf-8")
+    for i in range(done):
+        _write_manifest(root / f"ep{i + 1:02d}-第{i + 1}集", settings, "程序员面试")
+    return root
+
+
+def test_series_list_and_resume(portal_app, monkeypatch, settings):
+    from interview_video.models import Scene, Script
+
+    root = _write_series_root(settings, "程序员面试-series-20260101-0000", 2, 1)
+    _write_series_root(settings, "done-series-20260101-0000", 1, 1)
+    calls: dict = {}
+
+    async def fake_generate_series(settings_, theme, episodes, episode_sec,
+                                   on_event=None, run_dir=None, resume=False):
+        calls.update(theme=theme, episodes=episodes, episode_sec=episode_sec,
+                     run_dir=run_dir, resume=resume)
+        from interview_video.models import SeriesPlan
+
+        plan = SeriesPlan.model_validate_json((run_dir / "series.json").read_text("utf-8"))
+        return plan, [Script(title=ep.title, scenes=[Scene(header="h", narration="n。")])
+                      for ep in plan.episodes]
+
+    executed: list[str] = []
+
+    async def fake_execute(settings_, out_dir, industry, topic_title, script_file,
+                           on_stage, script=None):
+        executed.append(out_dir.name)
+        return _write_manifest(out_dir, settings_, industry)
+
+    monkeypatch.setattr("interview_video.series.generate_series", fake_generate_series)
+    monkeypatch.setattr("interview_video.web._execute_pipeline", fake_execute)
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        series = {s["root"]: s for s in client.get("/api/series").json()["series"]}
+        assert series[root.name]["complete"] is False
+        assert series[root.name]["done_episodes"] == 1
+        assert series["done-series-20260101-0000"]["complete"] is True
+
+        r = client.post(f"/api/series/{root.name}/resume")
+        assert r.status_code == 202
+        _drive(client, scheduled)
+        job = _wait_job(client, r.json()["job_id"])
+        assert job["status"] == "done", job["error"]
+        assert job["project"] == root.name
+        assert calls == {"theme": "程序员面试", "episodes": 2, "episode_sec": 600,
+                         "run_dir": root, "resume": True}
+        assert executed == ["ep02-第2集"]  # 已出片的第 1 集跳过
+        series = {s["root"]: s for s in client.get("/api/series").json()["series"]}
+        assert series[root.name]["complete"] is True
+
+
+def test_series_resume_guards(client, settings):
+    assert client.post("/api/series/nope/resume").status_code == 404
+    assert client.post("/api/series/..%2F..%2Fetc/resume").status_code in (400, 404)
+    assert client.post("/api/series/a.b/resume").status_code == 400
+    (settings.out_root / "plain").mkdir(parents=True)
+    assert client.post("/api/series/plain/resume").status_code == 404
+
+
+def test_corrupt_draft_does_not_break_library(client, settings):
+    good = settings.out_root.resolve() / "good"
+    _write_manifest(good, settings, "互联网")
+    bad = settings.out_root.resolve() / "bad"
+    bad.mkdir(parents=True)
+    (bad / "script.json").write_text('{"title": "x", "scenes": [', encoding="utf-8")
+    r = client.get("/api/projects")
+    assert r.status_code == 200
+    assert [p["name"] for p in r.json()["projects"]] == ["good"]
+    assert client.get("/api/projects/bad/script").status_code == 422
+
+
+def test_put_script_blocked_for_episode_of_running_series(portal_app, settings):
+    root = _write_series_root(settings, "s-series-20260101-0000", 2, 1)
+    ep = next(root.glob("ep01-*"))
+    app, scheduled = portal_app
+    with TestClient(app) as client:
+        job_id = client.post(f"/api/series/{root.name}/resume", json={}).json()["job_id"]
+        # 系列任务锁的是根目录, 其下分集的脚本同样不可改
+        r = client.put(f"/api/projects/{ep.name}/script", json=_sample_script_dict())
+        assert r.status_code == 409 and r.json()["job_id"] == job_id
+        assert scheduled
+
+
+def _sleeper_execute(pid_file: Path, calls: list | None = None):
+    """假流水线: 在工作线程里跑一个忽略 SIGTERM 的长子进程(模拟卡住的 ffmpeg)。"""
+    from proc_helpers import sleeper_cmd
+
+    from interview_video import procs
+
+    async def execute(settings_, out_dir, industry, topic_title, script_file,
+                      on_stage, script=None):
+        if calls is not None:
+            calls.append(out_dir.name)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        await procs.run_in_thread(
+            procs.run, sleeper_cmd(pid_file, ignore_term=True), cwd=out_dir, timeout=60
+        )
+
+    return execute
+
+
+def _real_task_scheduler(fn, *a):
+    import asyncio
+
+    return asyncio.get_running_loop().create_task(fn(*a))
+
+
+def test_cancel_kills_child_process_and_holds_lock_until_exit(settings, monkeypatch, tmp_path):
+    """取消: 子进程被 terminate→kill; 退出前锁仍被占(409), 退出后才释放。"""
+    from proc_helpers import alive, wait_pid
+
+    from interview_video import procs
+
+    monkeypatch.setattr(procs, "TERMINATE_GRACE", 1.0)
+    pid_file = tmp_path / "pid"
+    monkeypatch.setattr("interview_video.web._execute_pipeline", _sleeper_execute(pid_file))
+    app = create_app(settings, scheduler=_real_task_scheduler)
+    with TestClient(app) as client:
+        job_id = client.post("/api/jobs", json={"industry": "互联网"}).json()["job_id"]
+        pid = wait_pid(pid_file)
+        assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 200
+        # 宽限期内: 子进程(忽略 SIGTERM)仍活着 → 任务仍占锁, 新任务 409
+        j = client.get(f"/api/jobs/{job_id}").json()
+        assert j["status"] == "running" and j["cancelling"] and not j["cancellable"]
+        assert client.get("/api/jobs/active").json()["id"] == job_id
+        assert client.post("/api/jobs", json={"industry": "x"}).status_code == 409
+
+        job = _wait_job(client, job_id, timeout=10)
+        assert job["status"] == "cancelled" and "取消" in job["error"]
+        assert not alive(pid)
+        assert client.get("/api/jobs/active").json() is None
+        monkeypatch.setattr("interview_video.web._execute_pipeline", _fake_execute)
+        assert client.post("/api/jobs", json={"industry": "x"}).status_code == 202
+
+
+def test_cancel_series_stops_between_episodes(settings, monkeypatch, tmp_path):
+    """系列取消: 第 1 集媒体合成中被取消 → 子进程被杀, 第 2 集不再开跑, 规划保留可续跑。"""
+    from proc_helpers import alive, wait_pid
+
+    from interview_video import procs
+    from interview_video.models import EpisodePlan, Scene, SeriesPlan
+
+    monkeypatch.setattr(procs, "TERMINATE_GRACE", 0.3)
+    plan = SeriesPlan(theme="t", title="T", synopsis="s", episodes=[
+        EpisodePlan(index=1, title="一"), EpisodePlan(index=2, title="二")])
+
+    async def fake_generate_series(settings_, theme, episodes, episode_sec,
+                                   on_event=None, run_dir=None, resume=False):
+        return plan, [Script(title=e.title, scenes=[Scene(header="h", narration="n。")])
+                      for e in plan.episodes]
+
+    pid_file = tmp_path / "pid"
+    calls: list[str] = []
+    monkeypatch.setattr("interview_video.series.generate_series", fake_generate_series)
+    monkeypatch.setattr("interview_video.web._execute_pipeline", _sleeper_execute(pid_file, calls))
+    app = create_app(settings, scheduler=_real_task_scheduler)
+    with TestClient(app) as client:
+        job_id = client.post("/api/jobs", json={"mode": "series", "theme": "t"}).json()["job_id"]
+        pid = wait_pid(pid_file)
+        client.post(f"/api/jobs/{job_id}/cancel")
+        job = _wait_job(client, job_id, timeout=10)
+        assert job["status"] == "cancelled"
+        assert not alive(pid)
+        assert len(calls) == 1 and calls[0].startswith("ep01-")
+        root = settings.out_root.resolve() / job["project"]
+        assert (root / "series.json").exists()
+        st = {s["root"]: s for s in client.get("/api/series").json()["series"]}
+        assert st[root.name]["complete"] is False

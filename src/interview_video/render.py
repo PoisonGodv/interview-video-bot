@@ -3,6 +3,7 @@
 按 SPECS §4: viewport 与 settings.video_width/height 一致(默认 1920x1080),
 kind→模板映射 point→scene.html / qa→qa.html / ending→ending.html,
 产出 scenes/scene_%03d.png + cover.png, 返回 RenderResult。
+任务取消时在帧间检查点中止, 并确保关闭 chromium。
 """
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from playwright.sync_api import sync_playwright
 
+from . import procs
 from .config import Settings
 from .models import RenderResult, Script
 
@@ -101,6 +103,7 @@ def render_project(
             page = browser.new_page(viewport={"width": width, "height": height})
             # 复用同一页面顺序截图, 避免每场景开关浏览器
             for index, scene in enumerate(script.scenes):
+                procs.checkpoint()  # 任务取消 → 抛出, finally 关浏览器
                 template_name = KIND_TEMPLATES[scene.kind]
                 html = _render_html(
                     env,
@@ -118,6 +121,7 @@ def render_project(
                 frames.append(frame_path)
 
             # 封面帧
+            procs.checkpoint()
             cover_html = env.get_template("cover.html").render(
                 brand=settings.brand,
                 title=script.title,

@@ -15,9 +15,12 @@ input_tokens / output_tokens / total_tokens / error。
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -165,6 +168,67 @@ class LLMCallAudit:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as exc:
             logger.debug("llm_calls.jsonl 写入失败(忽略): %s", exc)
+
+
+class LLMBudgetExceededError(RuntimeError):
+    """本次运行 LLM 调用次数/token 超过 LLM_MAX_CALLS_PER_RUN / LLM_MAX_TOKENS_PER_RUN。"""
+
+
+class RunBudget:
+    """单次运行的 LLM 硬上限计数器(进程内, 续跑重新计数)。"""
+
+    def __init__(self, max_calls: int | None = None, max_tokens: int | None = None) -> None:
+        self.max_calls = max_calls
+        self.max_tokens = max_tokens
+        self.calls = 0
+        self.tokens = 0
+
+    def acquire(self) -> None:
+        """每次发 HTTP 请求前调用: 已达上限即抛 LLMBudgetExceededError, 否则计一次调用。"""
+        hint = "已完成的产物已落盘, 调大上限后可续跑(不重复付费)"
+        if self.max_calls is not None and self.calls >= self.max_calls:
+            raise LLMBudgetExceededError(
+                f"LLM 预算超限: 本次运行已调用 {self.calls} 次, "
+                f"达到 LLM_MAX_CALLS_PER_RUN={self.max_calls}; {hint}"
+            )
+        if self.max_tokens is not None and self.tokens >= self.max_tokens:
+            raise LLMBudgetExceededError(
+                f"LLM 预算超限: 本次运行已用 {self.tokens} tokens, "
+                f"达到 LLM_MAX_TOKENS_PER_RUN={self.max_tokens}; {hint}"
+            )
+        self.calls += 1
+
+    def add_tokens(self, total_tokens: int) -> None:
+        self.tokens += max(0, int(total_tokens or 0))
+
+
+_BUDGET: contextvars.ContextVar[RunBudget | None] = contextvars.ContextVar(
+    "llm_run_budget", default=None
+)
+
+
+def current_budget() -> RunBudget | None:
+    return _BUDGET.get()
+
+
+@contextmanager
+def run_budget(settings: Any) -> Iterator[RunBudget | None]:
+    """在一次运行(单集/系列/Web 任务)范围内启用 LLM 硬上限; 未配置上限则不计数。
+
+    已在某个运行范围内(如系列内逐集跑流水线)时沿用外层计数器, 不重新计数。
+    """
+    outer = _BUDGET.get()
+    if outer is not None:
+        yield outer
+        return
+    max_calls = getattr(settings, "llm_max_calls_per_run", None)
+    max_tokens = getattr(settings, "llm_max_tokens_per_run", None)
+    budget = RunBudget(max_calls, max_tokens) if (max_calls or max_tokens) else None
+    token = _BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _BUDGET.reset(token)
 
 
 def summarize_usage(out_dir: Path) -> dict[str, int]:

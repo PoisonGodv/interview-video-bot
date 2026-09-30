@@ -52,12 +52,24 @@ class DoubaoTTSError(RuntimeError):
     """豆包 TTS 远端/协议错误, message 已含错误码与官方 message。"""
 
 
+class TTSAuthError(DoubaoTTSError):
+    """鉴权/权限/额度类错误: 重试无意义, 直接失败或走备用通道。"""
+
+
+# 远端错误消息中提示鉴权/权限/额度问题的关键词(小写匹配)
+_FATAL_HINTS = (
+    "unauthorized", "forbidden", "invalid api key", "invalid access", "access denied",
+    "not granted", "permission", "authenticat", "quota exceeded", "insufficient balance",
+    "鉴权", "权限", "欠费", "余额不足",
+)
+
+
 def _require_doubao_credentials(settings: Settings) -> None:
     if settings.tts_doubao_api_key:
         return
     if settings.tts_doubao_app_key and settings.tts_doubao_access_key:
         return
-    raise RuntimeError(
+    raise TTSAuthError(
         "豆包 TTS 缺少凭证: TTS_DOUBAO_API_KEY(新版控制台,推荐,一个 key 即可)"
         "或 TTS_DOUBAO_APP_KEY+TTS_DOUBAO_ACCESS_KEY(旧版);写入 .env"
     )
@@ -119,6 +131,8 @@ async def _doubao_audio_bytes(text: str, settings: Settings) -> bytes:
         ) as resp:
             if resp.status_code != 200:
                 body = (await resp.aread()).decode("utf-8", "ignore")
+                if resp.status_code in (401, 403):
+                    raise TTSAuthError(f"HTTP {resp.status_code}: {body[:300]}")
                 raise DoubaoTTSError(f"HTTP {resp.status_code}: {body[:300]}")
             async for line in resp.aiter_lines():
                 line = line.strip()
@@ -314,24 +328,87 @@ def build_srt(cues: list[Cue]) -> str:
     return "\n\n".join(blocks) + "\n"
 
 
-async def _synthesize_with_retry(
-    index: int, text: str, mp3_path: Path, settings: Settings
+def _is_fatal_tts_error(err: Exception) -> bool:
+    """鉴权/权限/额度类错误重试无意义, 直接失败(或走备用通道)。"""
+    if isinstance(err, TTSAuthError):
+        return True
+    if isinstance(err, OSError):
+        return False  # 本地文件错误(如 Permission denied)不是远端鉴权问题
+    msg = str(err).lower()
+    if "concurrency" in msg:
+        return False  # 并发配额超限是瞬时的, 可重试
+    return any(h in msg for h in _FATAL_HINTS)
+
+
+def _voice_key(provider: str, settings: Settings) -> str:
+    """缓存键的通道部分: 通道+音色+语速, 备用通道音频不会冒充主通道缓存。"""
+    if provider == "doubao":
+        return f"doubao:{settings.tts_doubao_voice}:{settings.tts_doubao_rate}"
+    return f"edge:{settings.tts_voice}:{settings.tts_rate}"
+
+
+async def _synthesize_once(
+    provider: str, text: str, mp3_path: Path, settings: Settings
 ) -> list[Cue]:
-    """单场景合成, 失败重试 2 次(指数退避), 仍失败抛带场景序号的 RuntimeError。"""
+    if provider == "doubao":
+        return await synthesize_text_doubao(text, mp3_path, settings)
+    return await synthesize_text(text, mp3_path, settings.tts_voice, settings.tts_rate)
+
+
+async def _synthesize_with_retry(
+    index: int, text: str, mp3_path: Path, settings: Settings, provider: str | None = None
+) -> list[Cue]:
+    """单场景单通道合成, 失败重试 2 次(指数退避); 鉴权类错误不重试。
+
+    仍失败抛带场景序号的 RuntimeError(鉴权类为 TTSAuthError)。
+    """
+    provider = provider or settings.tts_provider
     last_err: Exception | None = None
-    for attempt in range(_MAX_ATTEMPTS):
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            if settings.tts_provider == "doubao":
-                return await synthesize_text_doubao(text, mp3_path, settings)
-            return await synthesize_text(
-                text, mp3_path, settings.tts_voice, settings.tts_rate
-            )
+            return await _synthesize_once(provider, text, mp3_path, settings)
         except Exception as err:  # noqa: BLE001 —— 网络错误类型不可枚举, 统一重试
             last_err = err
-            if attempt < _MAX_ATTEMPTS - 1:
-                delay = _RETRY_BASE_DELAY * (2**attempt)
+            if _is_fatal_tts_error(err):
+                logger.error("TTS[%s] 场景 %d 鉴权/额度错误, 不重试: %s", provider, index, err)
+                raise TTSAuthError(
+                    f"场景 {index} TTS[{provider}] 鉴权/权限/额度错误(不重试), "
+                    f"请检查凭证与账户余额: {err}"
+                ) from err
+            if attempt < _MAX_ATTEMPTS:
+                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "TTS[%s] 场景 %d 第 %d/%d 次失败, %.1fs 后重试: %s",
+                    provider, index, attempt, _MAX_ATTEMPTS, delay, err,
+                )
                 await asyncio.sleep(delay)
-    raise RuntimeError(f"场景 {index} TTS 合成失败(已重试 {_MAX_ATTEMPTS - 1} 次): {last_err}")
+    raise RuntimeError(
+        f"场景 {index} TTS[{provider}] 合成失败(已重试 {_MAX_ATTEMPTS - 1} 次): {last_err}"
+    )
+
+
+async def _synthesize_scene(
+    index: int, text: str, mp3_path: Path, settings: Settings
+) -> tuple[list[Cue], str]:
+    """主通道合成, 失败且配了 TTS_FALLBACK_PROVIDER 时换备用通道; 返回 (cues, 实际通道缓存键)。"""
+    primary = settings.tts_provider
+    fallback = settings.tts_fallback_provider
+    try:
+        cues = await _synthesize_with_retry(index, text, mp3_path, settings, primary)
+        return cues, _voice_key(primary, settings)
+    except Exception as err:
+        if not fallback or fallback == primary:
+            raise
+        logger.warning("TTS 场景 %d 主通道 %s 失败, 回退到 %s: %s", index, primary, fallback, err)
+        try:
+            cues = await _synthesize_with_retry(index, text, mp3_path, settings, fallback)
+        except Exception as fb_err:
+            raise RuntimeError(
+                f"场景 {index} TTS 主通道 {primary} 与备用通道 {fallback} 均失败: "
+                f"{err} | {fb_err}"
+            ) from fb_err
+        logger.warning("TTS 场景 %d 已由备用通道 %s 合成(音色与主通道不同)", index, fallback)
+        return cues, _voice_key(fallback, settings)
 
 
 async def synthesize_scenes(
@@ -339,22 +416,23 @@ async def synthesize_scenes(
 ) -> list[SceneMedia]:
     """顺序合成所有场景(避免并发被限流), 产出 scene_%03d.mp3 与 merge 后 cues。
 
-    幂等缓存: mp3 与旁车 scene_%03d.cues.json 都在、且口播文本指纹一致时
-    直接复用(断点续跑/失败重试不重复付 TTS 费); 删掉 mp3 或改了文本会重合成。
+    幂等缓存: mp3 与旁车 scene_%03d.cues.json 都在、且口播文本指纹与
+    通道/音色键一致时直接复用(备用通道产物不命中主通道, 下次重试主通道)(断点续跑/失败重试不重复付 TTS 费); 删掉 mp3 或改了文本会重合成。
     duration 兜底 = 最后 cue end + 0.4s; 无 cue 时仅留 0.4s。
     """
     scenes_dir.mkdir(parents=True, exist_ok=True)
+    primary_key = _voice_key(settings.tts_provider, settings)
     media: list[SceneMedia] = []
     for i, scene in enumerate(script.scenes):
         mp3_path = scenes_dir / f"scene_{i:03d}.mp3"
-        cached = _load_scene_cache(mp3_path, scene.narration)
+        cached = _load_scene_cache(mp3_path, scene.narration, primary_key)
         if cached is not None:
             cues, duration = cached
             logger.info("场景 %d TTS 命中缓存, 跳过合成", i)
         else:
-            cues = await _synthesize_with_retry(i, scene.narration, mp3_path, settings)
+            cues, voice_key = await _synthesize_scene(i, scene.narration, mp3_path, settings)
             duration = cues[-1].end + _TAIL_PAD if cues else _TAIL_PAD
-            _save_scene_cache(mp3_path, scene.narration, cues, duration)
+            _save_scene_cache(mp3_path, scene.narration, cues, duration, voice_key)
         media.append(SceneMedia(index=i, mp3=mp3_path, cues=cues, duration=duration))
     return media
 
@@ -374,13 +452,14 @@ def _narration_fingerprint(narration: str) -> str:
 
 
 def _save_scene_cache(
-    mp3_path: Path, narration: str, cues: list[Cue], duration: float
+    mp3_path: Path, narration: str, cues: list[Cue], duration: float, voice_key: str
 ) -> None:
     try:
         _cache_path(mp3_path).write_text(
             json.dumps(
                 {
                     "narration_sha1": _narration_fingerprint(narration),
+                    "voice_key": voice_key,
                     "duration": duration,
                     "cues": [c.model_dump() for c in cues],
                 },
@@ -392,8 +471,10 @@ def _save_scene_cache(
         pass  # 缓存写失败不影响本次合成, 只失去复用
 
 
-def _load_scene_cache(mp3_path: Path, narration: str) -> tuple[list[Cue], float] | None:
-    """mp3 + 旁车都在且口播指纹一致 → (cues, duration); 否则 None。"""
+def _load_scene_cache(
+    mp3_path: Path, narration: str, voice_key: str
+) -> tuple[list[Cue], float] | None:
+    """mp3 + 旁车都在且口播指纹、通道/音色键一致 → (cues, duration); 否则 None。"""
     if not mp3_path.exists() or mp3_path.stat().st_size == 0:
         return None
     cache = _cache_path(mp3_path)
@@ -403,6 +484,8 @@ def _load_scene_cache(mp3_path: Path, narration: str) -> tuple[list[Cue], float]
         data = json.loads(cache.read_text(encoding="utf-8"))
         if data.get("narration_sha1") != _narration_fingerprint(narration):
             return None  # 文本变了, 缓存失效
+        if data.get("voice_key", voice_key) != voice_key:
+            return None  # 换了通道/音色, 或是备用通道产物(无此字段的旧旁车视为匹配)
         cues = [Cue.model_validate(c) for c in data.get("cues", [])]
         return cues, float(data.get("duration", 0.0))
     except (json.JSONDecodeError, ValueError, KeyError):

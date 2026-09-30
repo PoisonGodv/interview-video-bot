@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from ..config import Settings
+from ..llm import LLMBudgetExceededError
 from ..models import (
     ChapterDraft,
     ChapterSpec,
@@ -220,6 +221,8 @@ async def review_chapter(
         if isinstance(reviewed, ChapterDraft) and reviewed.scenes:
             return _fix_draft(reviewed)
         logger.warning("[series.review] 审稿返回空草稿, 使用原草稿")
+    except LLMBudgetExceededError:
+        raise
     except Exception as exc:
         logger.warning(
             "[series.review] 审稿未生效, 使用未审稿草稿(%s: %.200s)",

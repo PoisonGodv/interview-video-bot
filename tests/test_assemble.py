@@ -12,8 +12,12 @@ from pathlib import Path
 
 import pytest
 
+from interview_video import assemble as assemble_mod
 from interview_video.assemble import (
+    _bars_by_clip,
     _fmt_t,
+    _overlay_filter,
+    _timeout_for,
     _write_concat_list,
     build_chapters,
     build_scene_clips,
@@ -77,6 +81,81 @@ def test_fmt_t_keeps_two_to_three_decimals() -> None:
     assert _fmt_t(2.05) == "2.05"
     assert _fmt_t(12.345) == "12.345"
     assert _fmt_t(1.0) == "1"
+
+
+def _bar(i: int, start: float, end: float) -> SubtitleBar:
+    return SubtitleBar(index=i, png=Path(f"subs/bar_{i:03d}.png"), start=start, end=end, text="x")
+
+
+def test_bars_by_clip_shifts_to_local_time_and_splits_boundary() -> None:
+    """字幕条按 clip 分配并平移为本地时间; 跨边界的条切成两段; 越界/零长碎片丢弃。"""
+    bars = [_bar(0, 0.1, 1.0), _bar(1, 1.5, 2.5), _bar(2, 3.0, 3.9), _bar(3, 4.0, 4.0)]
+    slots = _bars_by_clip(bars, [2.0, 2.0])
+    assert [(b.index, s, e) for b, s, e in slots[0]] == [(0, 0.1, 1.0), (1, 1.5, 2.0)]
+    assert [(b.index, round(s, 6), round(e, 6)) for b, s, e in slots[1]] == [
+        (1, 0.0, 0.5), (2, 1.0, 1.9),
+    ]
+
+
+def test_bars_by_clip_empty_clip_gets_no_bars() -> None:
+    slots = _bars_by_clip([_bar(0, 0.0, 1.0)], [1.0, 3.0])
+    assert len(slots[0]) == 1 and slots[1] == []
+
+
+def test_overlay_filter_chain_and_passthrough() -> None:
+    """有条时链式 overlay 出 [vout]; 无条时仅 format 直通。"""
+    f = _overlay_filter([(_bar(0, 0, 1), 0.1, 1.0), (_bar(1, 0, 1), 1.5, 2.0)])
+    assert f == (
+        "[0:v][1:v]overlay=0:0:enable='between(t,0.1,1)'[v1];"
+        "[v1][2:v]overlay=0:0:enable='between(t,1.5,2)',format=yuv420p[vout]"
+    )
+    assert _overlay_filter([]) == "[0:v]format=yuv420p[vout]"
+
+
+def test_timeout_scales_with_duration_with_floor() -> None:
+    assert _timeout_for(0) == 300
+    assert _timeout_for(10) == 300
+    assert _timeout_for(20 * 60) > 3000  # 20 分钟一集远超旧的固定 600s
+
+
+def test_finalize_burns_per_clip_then_concat_copy(tmp_path: Path, monkeypatch) -> None:
+    """桩 ffmpeg: 每 clip 一次小 overlay(本地时间), concat 直拷, 最后仅音频 loudnorm; 超时随时长伸缩。"""
+    calls: list[tuple[list[str], float]] = []
+    monkeypatch.setattr(assemble_mod, "_run", lambda cmd, cwd, timeout=300: calls.append((cmd, timeout)))
+    monkeypatch.setattr(assemble_mod, "ffprobe_duration", lambda p: 600.0)
+    clips = [tmp_path / "clips" / f"scene_{i:03d}.mp4" for i in range(2)]
+    bars = [_bar(0, 1.0, 2.0), _bar(1, 599.0, 601.0)]
+
+    finalize_video(clips, bars, tmp_path / "final.mp4", Settings())
+
+    burns = [c for c, _ in calls if "-filter_complex" in c]
+    assert len(burns) == 2
+    fc0 = burns[0][burns[0].index("-filter_complex") + 1]
+    fc1 = burns[1][burns[1].index("-filter_complex") + 1]
+    assert "between(t,1,2)" in fc0 and "between(t,599,600)" in fc0
+    assert fc1.count("overlay") == 1 and "between(t,0,1)" in fc1
+    for b in burns:
+        assert b[b.index("-c:a") + 1] == "copy"
+        assert b[b.index("-preset") + 1] == "faster"
+    concat = next(c for c, _ in calls if "concat" in c)
+    assert concat[concat.index("-c") + 1] == "copy"
+    listing = (tmp_path / "concat.list.txt").read_text(encoding="utf-8")
+    assert "subbed/scene_000.mp4" in listing and "subbed/scene_001.mp4" in listing
+    final_cmd, final_timeout = calls[-1]
+    assert final_cmd[final_cmd.index("-c:v") + 1] == "copy" and "-af" in final_cmd
+    assert final_timeout == _timeout_for(1200.0)
+
+
+def test_finalize_without_bars_concats_original_clips(tmp_path: Path, monkeypatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(assemble_mod, "_run", lambda cmd, cwd, timeout=300: calls.append(cmd))
+    monkeypatch.setattr(assemble_mod, "ffprobe_duration", lambda p: 2.0)
+    clips = [tmp_path / "clips" / "scene_000.mp4"]
+
+    finalize_video(clips, [], tmp_path / "final.mp4", Settings())
+
+    assert len(calls) == 2 and not any("-filter_complex" in c for c in calls)
+    assert "clips/scene_000.mp4" in (tmp_path / "concat.list.txt").read_text(encoding="utf-8")
 
 
 # ---------- integration(需 ffmpeg; lavfi 造素材, 不联网) ----------
@@ -194,4 +273,46 @@ def test_finalize_with_bars_stream_params(tmp_path: Path) -> None:
     a = _ffprobe_stream(out, "a:0")
     assert a["codec_name"] == "aac"
     # overlay 不应明显改变总时长(≈ 4s)
+    assert abs(ffprobe_duration(out) - 4.0) < 0.9
+
+
+def _pixel_at(video: Path, t: float, x: int, y: int) -> tuple[int, int, int]:
+    """抽取 t 秒处一帧的像素 RGB。"""
+    frame = video.parent / f"frame_{t:.2f}.png"
+    _ffmpeg(["-ss", f"{t}", "-i", str(video), "-frames:v", "1", str(frame)])
+    from PIL import Image
+
+    return Image.open(frame).convert("RGB").getpixel((x, y))
+
+
+@requires_ffmpeg
+@pytest.mark.integration
+def test_finalize_bars_appear_at_global_times(tmp_path: Path) -> None:
+    """逐 clip 烧录后, 字幕条仍出现在全局时间窗内(含跨场景边界的条), 窗外不出现。"""
+    from PIL import Image
+
+    scenes_dir, clips_dir, subs_dir = tmp_path / "scenes", tmp_path / "clips", tmp_path / "subs"
+    for d in (scenes_dir, clips_dir, subs_dir):
+        d.mkdir()
+    media: list[SceneMedia] = []
+    for i in range(2):
+        png, mp3 = scenes_dir / f"scene_{i:03d}.png", scenes_dir / f"scene_{i:03d}.mp3"
+        Image.new("RGB", (1920, 1080), (0, 0, 0)).save(png)
+        _make_mp3(mp3)
+        media.append(SceneMedia(index=i, png=png, mp3=mp3, duration=2.0))
+    clips = build_scene_clips(media, clips_dir, Settings())
+    bar_png = subs_dir / "bar_000.png"
+    img = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+    img.paste((255, 0, 0, 255), (0, 900, 1920, 1080))
+    img.save(bar_png)
+    bars = [SubtitleBar(index=0, png=bar_png, start=1.5, end=3.0, text="跨界")]
+
+    out = finalize_video(clips, bars, tmp_path / "final.mp4", Settings())
+
+    assert _pixel_at(out, 0.5, 960, 1000)[0] < 60
+    for t in (1.8, 2.5):
+        r, g, b = _pixel_at(out, t, 960, 1000)
+        assert r > 180 and g < 80, (t, r, g, b)
+    assert _pixel_at(out, 3.5, 960, 1000)[0] < 60
+    assert not (tmp_path / "subbed").exists()
     assert abs(ffprobe_duration(out) - 4.0) < 0.9

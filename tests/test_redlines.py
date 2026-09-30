@@ -1,6 +1,7 @@
-"""红线扫描器测试: 保守正则, 宁可漏报不误伤。"""
+"""红线扫描器测试: chains.redlines 复用 boundary 的唯一规则源。"""
 from __future__ import annotations
 
+from interview_video import boundary
 from interview_video.chains.redlines import RED_LINES, scan_redlines
 
 
@@ -21,8 +22,8 @@ def test_scan_allows_vague_salary():
 
 
 def test_scan_catches_promise():
-    assert "承诺结果" in scan_redlines("跟着做必上岸")
-    assert "承诺结果" in scan_redlines("三天包过")
+    assert "包过承诺" in scan_redlines("跟着做必上岸")
+    assert "包过承诺" in scan_redlines("三天包过")
 
 
 def test_scan_allows_normal_promise():
@@ -37,3 +38,7 @@ def test_scan_catches_discrimination():
 def test_scan_allows_neutral_discussion():
     assert scan_redlines("35岁转型并不晚, 关键是方法") == []
     assert scan_redlines("学历只是敲门砖之一") == []
+
+
+def test_single_source_of_truth():
+    assert scan_redlines is boundary.scan_redlines

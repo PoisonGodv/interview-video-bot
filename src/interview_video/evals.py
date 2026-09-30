@@ -2,7 +2,7 @@
 
 单测(fake 模型)保障的是"代码不崩", 本模块保障的是"内容合格":
 - check_script_contract: 对 write_script 产物做机械契约检查(分镜数/字数/结尾镜);
-- scan_redlines: 红线词表扫描(prompt 只是叮嘱, 这里才是闸门);
+- scan_redlines: 红线扫描(规则源 boundary.REDLINE_PATTERNS, 与生成闸门同源);
 - judge_script: 同模型 LLM-as-judge, 对钩子强度/口语化 1~5 打分(可选);
 - run_evals: 跑 golden 用例集, 汇总报告(供 ``ivb eval`` 与回归对比)。
 """

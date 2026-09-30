@@ -12,11 +12,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
 
+from . import procs
 from .config import Settings
 from .models import (
     BiliMeta,
@@ -51,8 +53,16 @@ class PipelineState(TypedDict, total=False):
     manifest_path: Path
 
 
-def build_graph(settings: Settings) -> CompiledStateGraph:
-    """构建编译后的线性流水线图。节点闭包捕获 settings。"""
+STOP_AFTER_CHOICES = ("script",)
+
+
+def build_graph(settings: Settings, stop_after: str | None = None) -> CompiledStateGraph:
+    """构建编译后的线性流水线图。节点闭包捕获 settings。
+
+    stop_after="script": gen_script 后直接结束(落盘 script.json 供人工审改, 再 --resume 续跑)。
+    """
+    if stop_after is not None and stop_after not in STOP_AFTER_CHOICES:
+        raise ValueError(f"stop_after 仅支持 {STOP_AFTER_CHOICES}, 收到 {stop_after!r}")
 
     async def gen_script(state: PipelineState) -> PipelineState:
         """第 1 节点: 拿到 Script 并落盘 script.json。
@@ -110,7 +120,7 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
         from . import render as render_mod
 
         # playwright 同步 API 不能在 async 节点的事件循环里跑, 放到工作线程
-        result = await asyncio.to_thread(
+        result = await procs.run_in_thread(
             render_mod.render_project,
             state["script"], state["out_dir"], settings,
             industry=state.get("industry", ""),
@@ -131,7 +141,7 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
 
         clips_dir = state["out_dir"] / "clips"
         clips_dir.mkdir(parents=True, exist_ok=True)
-        clips = await asyncio.to_thread(
+        clips = await procs.run_in_thread(
             assemble_mod.build_scene_clips,
             state["scene_media"], clips_dir, settings,
         )
@@ -145,7 +155,7 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
         cues = tts_mod.offset_cues(state["scene_media"])
         subs_dir = state["out_dir"] / "subs"
         subs_dir.mkdir(parents=True, exist_ok=True)
-        bars = await asyncio.to_thread(
+        bars = await procs.run_in_thread(
             bars_mod.render_subtitle_bars, cues, subs_dir, settings
         )
         return {"bars": bars}
@@ -155,7 +165,7 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
         from . import assemble as assemble_mod
 
         out_path = state["out_dir"] / "final.mp4"
-        video = await asyncio.to_thread(
+        video = await procs.run_in_thread(
             assemble_mod.finalize_video,
             state["clips"], state["bars"], out_path, settings,
         )
@@ -184,6 +194,8 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
             meta = await metadata_mod.write_metadata(
                 llm, state["script"], chapters, settings
             )
+        except llm_mod.LLMBudgetExceededError:
+            raise
         except Exception as exc:  # noqa: BLE001 —— 元数据是可降级项
             logger.warning(
                 "metadata 生成失败, 降级为 meta=None(%s: %s)",
@@ -239,6 +251,9 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
     graph.add_node("manifest", manifest_node)
     # 线性边
     graph.add_edge(START, "gen_script")
+    if stop_after == "script":
+        graph.add_edge("gen_script", END)
+        return graph.compile()
     for prev, nxt in [
         ("gen_script", "tts"),
         ("tts", "render"),
@@ -251,6 +266,48 @@ def build_graph(settings: Settings) -> CompiledStateGraph:
         graph.add_edge(prev, nxt)
     graph.add_edge("manifest", END)
     return graph.compile()
+
+
+def resume_industry(out_dir: Path) -> str | None:
+    """续跑目录里记录的行业: project.json 优先, 其次 topic.json; 都没有返回 None。"""
+    for fname in ("project.json", "topic.json"):
+        f = Path(out_dir) / fname
+        if f.exists():
+            try:
+                industry = json.loads(f.read_text(encoding="utf-8")).get("industry")
+            except (OSError, ValueError):
+                continue
+            if industry:
+                return str(industry)
+    return None
+
+
+async def run_script_stage(
+    settings: Settings,
+    out_dir: Path,
+    industry: str = "互联网",
+    topic_title: str | None = None,
+    script_file: Path | None = None,
+) -> Script:
+    """只跑 gen_script 节点(落盘 topic.json/script.json)后停下, 不需要媒体依赖。"""
+    from .llm_audit import LLMCallAudit
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    graph = build_graph(settings, stop_after="script")
+    initial: PipelineState = {
+        "out_dir": out_dir,
+        "industry": industry,
+        "topic_title": topic_title,
+        "script_file": Path(script_file) if script_file is not None else None,
+    }
+    from .llm_audit import run_budget
+
+    with run_budget(settings):
+        final = await graph.ainvoke(
+            initial, config={"callbacks": [LLMCallAudit(out_dir)]}
+        )
+    return final["script"]
 
 
 async def run_pipeline(
@@ -280,11 +337,12 @@ async def run_pipeline(
     }
     if script is not None:
         initial["script"] = script
-    from .llm_audit import LLMCallAudit
+    from .llm_audit import LLMCallAudit, run_budget
 
-    final = await graph.ainvoke(
-        initial, config={"callbacks": [LLMCallAudit(out_dir)]}
-    )
+    with run_budget(settings):
+        final = await graph.ainvoke(
+            initial, config={"callbacks": [LLMCallAudit(out_dir)]}
+        )
     manifest_path = Path(final["manifest_path"])
     return ProjectManifest.model_validate_json(
         manifest_path.read_text(encoding="utf-8")

@@ -12,7 +12,7 @@ Script ──tts.py(edge-tts / 火山豆包双通道)──▶ 每场景 mp3 + c
 Script ──render.py(Jinja2+Playwright)──▶ cover.png + scene_XXX.png (1920x1080)
         ──assemble.py(build_scene_clips)──▶ 每场景 mp4(ffprobe 回填精确时长)
 全局cues(tts.offset_cues)──subtitle_bars.py(Pillow)──▶ 每 cue 一张 1920x1080 透明字幕条 PNG
-clips + bars ──assemble.py(finalize_video)──▶ final.mp4(concat + overlay + loudnorm)
+clips + bars ──assemble.py(finalize_video)──▶ final.mp4(逐 clip overlay 字幕条 → concat 直拷 → loudnorm)
 Script + chapters ──chains/metadata.py──▶ BiliMeta(标题/简介/标签)
         ──▶ project.json(manifest); 可选 bilibili.py 上传 B站
 ```
@@ -69,6 +69,9 @@ ivb generate --industry 互联网 \
 ivb generate --script-file examples/sample_script.json --out output/demo
 # 中途失败(ffmpeg/渲染/TTS)后断点续跑: 复用该目录的 script.json 与 TTS 缓存, 不再付 LLM 费用
 ivb generate --resume output/self-intro
+# 先审稿再出片: 只生成 script.json(停在配音前), 手改后用 --resume 续跑
+ivb generate --topic "应届生自我介绍" --stop-after script --out output/self-intro
+ivb generate --resume output/self-intro
 
 # ③ 读 project.json 上传 B站(需开启 BILI_UPLOAD_ENABLED 并配置 cookie)
 ivb upload output/demo --yes
@@ -81,6 +84,10 @@ ivb upload output/demo --yes
 ```bash
 # 生成 3 集 × 每集约 15 分钟的系列(主题自拟)
 ivb series "程序员面试通关" --episodes 3 --duration 15
+
+# 开跑前会打印费用预估(LLM 调用次数/token、TTS 字数, 配了单价再显示金额)并要求确认;
+# --dry-run 只看预估不调用任何服务, --yes 跳过确认(脚本/CI 用)
+ivb series "程序员面试通关" --episodes 3 --duration 15 --dry-run
 
 # 中途失败(断网/限流/解析失败)后断点续跑: 已完成的集与章节不重跑、
 # 已有成片的分集跳过媒体合成, 不再重复付 LLM/TTS 费用
@@ -101,6 +108,13 @@ ivb series "程序员面试通关" --resume output/程序员面试通关-series-
 `chains/_invoke.py` 统一兜底(结构化输出 → 本地重解析 → 带错误反馈的修复重问,
 鉴权类错误立即失败, 所有回退留痕日志)。
 
+**成本护栏**: 集数限 1~12、每集 3~30 分钟(CLI 与 Web 同一套边界, 越界直接拒绝);
+预估按实际调用结构计算(策划 1 次 + 每集编剧 1 次 + 每章写手/审稿各 1 次 + 每集元数据 1 次,
+「最坏」按每次都触发一次修复重问 ×2), token 按中文字符粗估, 仅作量级参考。
+另可在 `.env` 设单次运行硬上限 `LLM_MAX_CALLS_PER_RUN` / `LLM_MAX_TOKENS_PER_RUN`(默认不限):
+整个系列(含各集元数据)共用一个计数器, 超限时在发出下一次请求前抛 `LLMBudgetExceededError` 停下,
+不重试也不切备用模型; 已完成的集/章已落盘, 调大上限后 `--resume` 续跑(续跑重新计数)。
+
 每集脚本写完即走完整媒体流水线(配音→渲染→合成→字幕→元数据),
 产物在 `output/<主题>-series-<时间戳>/ep01-*/ …`, 系列规划存 `series.json`;
 作品库会把系列分集展开列出, 可逐集播放/编辑元数据/上传 B站。
@@ -117,7 +131,14 @@ ivb series "程序员面试通关" --resume output/程序员面试通关-series-
 - **Web 失败诊断**: 任务失败时堆栈与所在阶段落盘 `error-<jobid>.log`;
 - **生成溯源**: `project.json` 的 `generation` 块记录模型/温度/TTS 通道/prompt 版本;
 - **TTS 幂等缓存**: mp3 与 `scene_XXX.cues.json` 旁车(口播指纹)命中则跳过合成,
-  重跑不重复付费; **备用模型**: 配 `LLM_FALLBACK_*` 三个变量即可主备自动切换。
+  重跑不重复付费(缓存键含通道/音色, 换音色或备用通道产物不会误命中);
+  **TTS 重试与回退**: 每次重试 WARNING 留痕; 401/403/凭证无效/额度耗尽不重试直接报错;
+  配 `TTS_FALLBACK_PROVIDER=edge` 后豆包失败的场景自动改用 edge-tts 合成并告警;
+  **备用模型**: 配 `LLM_FALLBACK_*` 三个变量即可主备自动切换;
+  **LLM 限流与超时**: 429/5xx 优先遵循 `Retry-After`(秒数或 HTTP-date, 单次上限 60s), 否则指数退避+抖动
+  (429 基数 2s), 每次重试 WARNING 记录状态码/次数/等待; 建连超时 `LLM_CONNECT_TIMEOUT`(默认 10s)与读超时
+  `LLM_TIMEOUT` 分开; 输出触顶 `max_tokens`(finish_reason=length)直接报错提示调大 `LLM_MAX_TOKENS`,
+  不再把截断 JSON 送去修复重问。
 
 ## 生成质量评测
 
@@ -127,7 +148,7 @@ ivb eval --no-judge           # 关掉 LLM-as-judge(钩子/口语化/连贯 1~5 
 ivb eval -o eval-report.json  # 报告落盘, 改 prompt 后对比基线
 ```
 
-红线词表(`chains/redlines.py`)prompt 与评测共用: prompt 只是叮嘱, 扫描器才是闸门。
+红线规则唯一来源为 `boundary.REDLINE_PATTERNS`(`chains/redlines.py` 仅保留 prompt 文本并复用该扫描器), 生成闸门与评测共用: prompt 只是叮嘱, 扫描器才是闸门。任何回退解析路径的结果都会重扫红线, 命中即报错。
 
 ## Web 操作台
 
@@ -141,12 +162,27 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
 2. **生成视频**: 模式可选**单集短视频**或**系列长视频(多agent)**(填系列主题、集数、每集分钟数),
    选 TTS 通道(edge-tts 免费 / 豆包火山)与音色 → 开始生成,
    8 个节点进度实时可见(选题→配音→渲染→合成→字幕→合成→元数据→落盘), 完成后显示 LLM token 用量;
-   系列模式额外显示「第 x/N 集 · 阶段 · 第 y/M 章」;
-   生成单飞(同时只跑一个任务, 避免 TTS 限流), 并发提交返回 409;
+   系列模式在表单下实时显示费用预估(`GET/POST /api/series/estimate`), 点开始时弹窗确认预估后才提交,
+   运行中额外显示「第 x/N 集 · 阶段 · 第 y/M 章」;
+   生成单飞(同时只跑一个任务, 避免 TTS 限流), 并发提交返回 409(响应体带运行中任务的 `job_id`);
+   刷新页面后自动通过 `GET /api/jobs/active` 接回运行中任务的进度;
+   勾选「只生成脚本」则停在配音前(同 `--stop-after script`), 作品库出现「仅脚本」草稿;
 3. **作品库**: 封面墙(系列分集自动展开为独立条目) → 详情里可播放成片、
-   编辑 B站标题/简介/标签(写回 project.json)、一键上传(未配 cookie 三件套会返回指引)。
+   编辑 B站标题/简介/标签(写回 project.json)、一键上传(未配 cookie 三件套会返回指引);
+   详情里还有**脚本编辑器**(script.json 格式化 JSON): 「保存脚本」/「保存并重新生成」,
+   重新生成复用原目录与改后的脚本(同 `--resume`, 未改动场景复用配音缓存), 占用同一把单飞锁。
+   未全部出片的系列列在作品库顶部「未完成系列」, 点**续跑**同 `ivb series --resume <root>`
+   (沿用磁盘上的主题/集数/时长, 已完成的集/章不重跑, 已出片分集跳过)。
 
-生成中的长任务可点**取消任务**(或 `POST /api/jobs/{id}/cancel`), 不必杀进程;
+脚本相关接口: `GET/PUT /api/projects/{name}/script`(PUT 按 Script 模型校验, 不合法返回 422 与字段级原因)、
+`POST /api/projects/{name}/regenerate`(body 可选 `{provider, voice}`, 返回 job_id)。
+系列续跑接口: `GET /api/series`(系列根目录及完成度)、`POST /api/series/{root}/resume`(body 可选 `{provider, voice}`);
+`GET /api/jobs/active` 返回运行中任务或 `null`。
+
+生成中的长任务可点**取消任务**(或 `POST /api/jobs/{id}/cancel`), 不必杀进程:
+后台 ffmpeg/ffprobe 会被终止(SIGTERM, 3s 不退则 SIGKILL), 渲染中的 chromium 在帧间关闭, 系列任务不再开下一集;
+子进程全部退出前任务显示「正在取消」并继续占用单飞锁, 之后状态变为 `cancelled`。
+已完成的产物保留: 单集可在作品库「重新生成」, 系列可在「未完成系列」续跑;
 任务失败时堆栈与所在阶段落盘到该任务产物目录的 `error-<jobid>.log`;
 `GET /api/doctor` 返回与 `ivb doctor` 相同的环境自检结果。
 
@@ -164,11 +200,20 @@ ivb web                 # 默认 http://127.0.0.1:8099(--host/--port 可改)
 LLM_API_KEY=sk-...
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
+# LLM_TIMEOUT=300            # 读超时(秒)
+# LLM_CONNECT_TIMEOUT=10     # 建连超时(秒)
+# LLM_MAX_TOKENS=8192        # 输出被截断(finish_reason=length)时调大
+# LLM_MAX_CALLS_PER_RUN=     # 单次运行 LLM 调用硬上限(默认不限), 超限停下可续跑
+# LLM_MAX_TOKENS_PER_RUN=    # 单次运行 token 硬上限(默认不限)
+# LLM_PRICE_INPUT_PER_1K=    # 费用预估单价(可选): 输入/输出每千 token、TTS 每万字
+# LLM_PRICE_OUTPUT_PER_1K=
+# TTS_PRICE_PER_10K_CHARS=
 
 # TTS / 内容 / 视频(均有默认值, 可省略)
 TTS_PROVIDER=edge          # edge(免费) | doubao(火山引擎豆包 seed-tts-2.0)
 TTS_VOICE=zh-CN-YunxiNeural
 TTS_RATE=+6%
+# TTS_FALLBACK_PROVIDER=edge  # 主通道重试耗尽/鉴权失败时该场景改用备用通道(默认不回退)
 # doubao 通道凭证(TTS_PROVIDER=doubao 时必填, 火山引擎控制台→豆包语音→API Key):
 # TTS_DOUBAO_API_KEY=
 # TTS_DOUBAO_VOICE=zh_male_m191_uranus_bigtts   # 女声: zh_female_vv_uranus_bigtts

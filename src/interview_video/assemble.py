@@ -3,28 +3,45 @@
 要点:
 - 本机 ffmpeg 无 libass, 字幕绝不烧录, 只走 overlay 透明 PNG 字幕条方案
 - 所有 ffmpeg 调用以 ``cwd=out_dir`` + 相对路径传参, 避免转义地狱
-- 单次调用超时 >= 300s; 非零退出抛 RuntimeError 附 stderr 末尾 500 字
+- 子进程经 procs.run 启动: 所在任务被取消时 terminate/kill, 不留孤儿 ffmpeg
+- 单次调用超时随媒体时长伸缩(下限 300s); 非零退出抛 RuntimeError 附 stderr 末尾 500 字
+- 字幕条按场景 clip 逐段烧录(cue 平移到场景本地时间), 再 concat(-c copy), 避免长视频单条巨型 filter
 """
 from __future__ import annotations
 
 import os
-import subprocess
+import shutil
 from pathlib import Path
 
+from . import procs
 from .config import Settings
 from .models import Chapter, SceneMedia, Script, SubtitleBar
 
-# 单次 ffmpeg 调用超时(秒), SPECS 要求 >= 300
-_FFMPEG_TIMEOUT = 600
+# 单次 ffmpeg 调用超时(秒): max(下限, 固定开销 + 媒体时长 × 系数), SPECS 要求 >= 300
+_FFMPEG_TIMEOUT_FLOOR = 300.0
+_FFMPEG_TIMEOUT_BASE = 60.0
+_FFMPEG_TIMEOUT_PER_SEC = 3.0
 # 错误信息里保留的 stderr 末尾长度
 _STDERR_TAIL = 500
+# 所有重编码共用同一组视频编码参数, 保证烧录后的 clip 可 concat -c copy
+_X264_ARGS = [
+    "-c:v", "libx264", "-preset", "faster", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+]
+# 跨场景边界的字幕条切片后, 短于此值(秒)的碎片丢弃
+_MIN_SLICE = 1e-3
 
 
-def _run(cmd: list[str], cwd: Path) -> None:
-    """执行 ffmpeg 命令; 非零退出抛 RuntimeError(附 stderr 末尾 500 字)。"""
-    proc = subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, timeout=_FFMPEG_TIMEOUT
+def _timeout_for(duration: float) -> float:
+    """按媒体时长估算单次 ffmpeg 调用超时(秒), 不低于下限。"""
+    return max(
+        _FFMPEG_TIMEOUT_FLOOR,
+        _FFMPEG_TIMEOUT_BASE + max(duration, 0.0) * _FFMPEG_TIMEOUT_PER_SEC,
     )
+
+
+def _run(cmd: list[str], cwd: Path, timeout: float = _FFMPEG_TIMEOUT_FLOOR) -> None:
+    """执行 ffmpeg 命令; 非零退出抛 RuntimeError(附 stderr 末尾 500 字)。"""
+    proc = procs.run(cmd, cwd=cwd, timeout=timeout)
     if proc.returncode != 0:
         tail = (proc.stderr or "")[-_STDERR_TAIL:]
         raise RuntimeError(
@@ -45,14 +62,14 @@ def _fmt_t(t: float) -> str:
 
 def ffprobe_duration(path: Path) -> float:
     """ffprobe 读取媒体时长(秒, 精确值)。"""
-    proc = subprocess.run(
+    proc = procs.run(
         [
             "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(path),
         ],
-        capture_output=True, text=True, timeout=60,
+        timeout=60,
     )
     if proc.returncode != 0:
         tail = (proc.stderr or "")[-_STDERR_TAIL:]
@@ -87,14 +104,14 @@ def build_scene_clips(
             "ffmpeg", "-y",
             "-loop", "1", "-framerate", str(fps), "-i", _rel(sm.png, anchor),
             "-i", _rel(sm.mp3, anchor),
-            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+            *_X264_ARGS,
             "-r", str(fps),
             "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
             "-vf", vf,
             "-t", f"{dur:.3f}",
             _rel(clip, anchor),
         ]
-        _run(cmd, anchor)
+        _run(cmd, anchor, _timeout_for(dur))
         sm.duration = ffprobe_duration(clip)  # 回填精确值, 供后续 chapters/overlay 用
         clips.append(clip)
     return clips
@@ -107,66 +124,113 @@ def _write_concat_list(clips: list[Path], list_path: Path, anchor: Path) -> Path
     return list_path
 
 
+def _bars_by_clip(
+    bars: list[SubtitleBar], durations: list[float]
+) -> list[list[tuple[SubtitleBar, float, float]]]:
+    """把全局字幕条分配到各 clip, 时间平移为 clip 本地; 跨边界的条按边界切开。"""
+    out: list[list[tuple[SubtitleBar, float, float]]] = []
+    offset = 0.0
+    for dur in durations:
+        clip_end = offset + dur
+        slot: list[tuple[SubtitleBar, float, float]] = []
+        for bar in bars:
+            start, end = max(bar.start, offset), min(bar.end, clip_end)
+            if end - start > _MIN_SLICE:
+                slot.append((bar, start - offset, end - offset))
+        out.append(slot)
+        offset = clip_end
+    return out
+
+
+def _overlay_filter(slices: list[tuple[SubtitleBar, float, float]]) -> str:
+    """单个 clip 的链式 overlay filter(每条一个 overlay, enable 限定本地时间窗), 出口 [vout]。"""
+    if not slices:
+        return "[0:v]format=yuv420p[vout]"
+    parts: list[str] = []
+    prev = "0:v"
+    for i, (_, start, end) in enumerate(slices, start=1):
+        label = "vout" if i == len(slices) else f"v{i}"
+        chain = (
+            f"[{prev}][{i}:v]overlay=0:0:enable='between(t,{_fmt_t(start)},{_fmt_t(end)})'"
+        )
+        chain += f",format=yuv420p[{label}]" if label == "vout" else f"[{label}]"
+        parts.append(chain)
+        prev = label
+    return ";".join(parts)
+
+
+def _burn_clip(
+    clip: Path,
+    slices: list[tuple[SubtitleBar, float, float]],
+    dest: Path,
+    duration: float,
+    out_dir: Path,
+) -> None:
+    """单 clip 烧录字幕条: 视频按统一参数重编码, 音频直拷。"""
+    inputs = ["-i", _rel(clip, out_dir)]
+    for bar, _, _ in slices:
+        inputs += ["-i", _rel(bar.png, out_dir)]
+    _run(
+        ["ffmpeg", "-y", *inputs,
+         "-filter_complex", _overlay_filter(slices),
+         "-map", "[vout]", "-map", "0:a",
+         *_X264_ARGS,
+         "-c:a", "copy",
+         _rel(dest, out_dir)],
+        out_dir,
+        _timeout_for(duration),
+    )
+
+
 def finalize_video(
     clips: list[Path], bars: list[SubtitleBar], out_path: Path, settings: Settings
 ) -> Path:
-    """concat(-c copy) → 有 bars 时单条命令链式 overlay → loudnorm → final.mp4。
+    """有 bars 时逐 clip 烧录字幕条 → concat(-c copy) → 视频直拷 + loudnorm → final.mp4。
 
-    无 bars 时跳过 overlay, 视频流直拷、仅音频响度归一。
+    每个 clip 只叠加落在自身时间窗内的字幕条(平移为本地时间), 与在整片上按全局时间
+    overlay 等价; 所有 clip 统一重编码参数, 保证 concat 可直拷。
     """
     out_path = Path(out_path)
     out_dir = out_path.parent.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ① concat demuxer 出 base.mp4(不重编码)
+    durations = [ffprobe_duration(c) for c in clips]
+    total = sum(durations)
+
+    sources = list(clips)
+    burn_dir = out_dir / "subbed"
+    if bars:
+        burn_dir.mkdir(parents=True, exist_ok=True)
+        sources = []
+        for clip, dur, slices in zip(clips, durations, _bars_by_clip(bars, durations)):
+            dest = burn_dir / f"{Path(clip).stem}.mp4"
+            _burn_clip(clip, slices, dest, dur, out_dir)
+            sources.append(dest)
+
+    # concat demuxer 出 base.mp4(不重编码)
     list_path = out_dir / "concat.list.txt"
-    _write_concat_list(clips, list_path, out_dir)
+    _write_concat_list(sources, list_path, out_dir)
     base = out_dir / "base.mp4"
     _run(
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path.name,
          "-c", "copy", base.name],
         out_dir,
+        _timeout_for(total),
     )
+    if bars:
+        shutil.rmtree(burn_dir, ignore_errors=True)
 
     loudnorm = (
         f"loudnorm=I={settings.loudness_i}:TP={settings.loudness_tp}"
         f":LRA={settings.loudness_lra}"
     )
-
-    if not bars:
-        # 无字幕条: 视频直拷, 仅音频响度归一
-        _run(
-            ["ffmpeg", "-y", "-i", base.name,
-             "-c:v", "copy", "-af", loudnorm,
-             "-c:a", "aac", "-b:a", "160k", out_path.name],
-            out_dir,
-        )
-        return out_path
-
-    # ② 单条命令链式 overlay 全部字幕条(每 bar 一个 overlay, enable 限定时间窗)
-    inputs: list[str] = ["-i", base.name]
-    for bar in bars:
-        inputs += ["-i", _rel(bar.png, out_dir)]
-    parts: list[str] = []
-    prev = "0:v"
-    for i, bar in enumerate(bars, start=1):
-        label = f"v{i}"
-        start, end = _fmt_t(bar.start), _fmt_t(bar.end)
-        chain = f"[{prev}][{i}:v]overlay=0:0:enable='between(t,{start},{end})'"
-        # 末段标签接 format=yuv420p 后作为最终视频流出, 避免空链
-        chain += f",format=yuv420p[{label}]" if i == len(bars) else f"[{label}]"
-        parts.append(chain)
-        prev = label
-    filter_complex = ";".join(parts)
+    # 视频直拷, 仅音频响度归一(loudnorm 内部上采样到 192k, 输出钉回 44.1k)
     _run(
-        ["ffmpeg", "-y"] + inputs +
-        ["-filter_complex", filter_complex,
-         "-map", f"[v{len(bars)}]", "-map", "0:a",   # 最后标签 + 原音频
-         "-af", loudnorm,
-         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-b:a", "160k",
-         out_path.name],
+        ["ffmpeg", "-y", "-i", base.name,
+         "-c:v", "copy", "-af", loudnorm,
+         "-c:a", "aac", "-b:a", "160k", "-ar", "44100", out_path.name],
         out_dir,
+        _timeout_for(total),
     )
     return out_path
 

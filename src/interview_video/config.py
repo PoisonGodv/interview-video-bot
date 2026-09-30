@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
-    llm_timeout: int = 300
+    llm_timeout: int = 300              # 单次请求读超时(秒), 长章节生成需要足够大
+    llm_connect_timeout: float = 10.0   # 建连超时(秒), 与读超时分开, 网络不通时快速失败重试
     llm_temperature: float = 0.7
     llm_max_tokens: int | None = None   # None=用网关默认; 显式设置可防长输出截断
     llm_max_retries: int = 2            # 客户端层网络/限流重试次数
@@ -25,11 +26,20 @@ class Settings(BaseSettings):
     llm_fallback_model: str | None = None
     llm_fallback_base_url: str | None = None
     llm_fallback_api_key: SecretStr | None = None
+    # 单次运行(一集/一个系列/一个 Web 任务)的 LLM 硬上限; None=不限制。超限抛预算错误并停下, 可续跑
+    llm_max_calls_per_run: int | None = Field(default=None, ge=1)
+    llm_max_tokens_per_run: int | None = Field(default=None, ge=1)
+    # 费用预估单价(可选, 币种随你的账单); 未配置时预估只显示调用次数/token/字符数
+    llm_price_input_per_1k: float | None = Field(default=None, ge=0)
+    llm_price_output_per_1k: float | None = Field(default=None, ge=0)
+    tts_price_per_10k_chars: float | None = Field(default=None, ge=0)
 
     # ---- TTS ----
     tts_provider: Literal["edge", "doubao"] = "edge"  # 拼错直接配置报错, 不再静默回退
     tts_voice: str = "zh-CN-YunxiNeural"
     tts_rate: str = "+6%"
+    # 主通道重试耗尽/鉴权失败时的备用通道; None=不回退(常用 doubao→edge, edge 免凭证)
+    tts_fallback_provider: Literal["edge", "doubao"] | None = None
 
     # ---- 豆包 TTS(TTS_PROVIDER=doubao 时生效, seed-tts-2.0 HTTP 单向流式) ----
     tts_doubao_api_key: SecretStr | None = None   # 新版控制台一个 key 即可
@@ -81,7 +91,9 @@ class Settings(BaseSettings):
     @field_validator(
         "llm_api_key", "llm_base_url", "llm_max_tokens",
         "llm_fallback_model", "llm_fallback_base_url", "llm_fallback_api_key",
-        "tts_doubao_api_key", "tts_doubao_app_key", "tts_doubao_access_key",
+        "llm_max_calls_per_run", "llm_max_tokens_per_run",
+        "llm_price_input_per_1k", "llm_price_output_per_1k", "tts_price_per_10k_chars",
+        "tts_fallback_provider", "tts_doubao_api_key", "tts_doubao_app_key", "tts_doubao_access_key",
         "subtitle_font_path", "bili_sessdata", "bili_jct", "bili_buvid3",
         mode="before",
     )

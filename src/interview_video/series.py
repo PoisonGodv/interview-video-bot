@@ -277,10 +277,9 @@ async def generate_series(
     if resume and run_dir is not None and (run_dir / "series.json").exists():
         initial.update(_restore_state(run_dir, episodes))
     graph = build_series_graph(settings, on_event, run_dir=run_dir)
-    config = None
-    if run_dir is not None:
-        from .llm_audit import LLMCallAudit
+    from .llm_audit import LLMCallAudit, run_budget
 
-        config = {"callbacks": [LLMCallAudit(run_dir)]}
-    final = await graph.ainvoke(initial, config=config)
+    config = {"callbacks": [LLMCallAudit(run_dir)]} if run_dir is not None else None
+    with run_budget(settings):  # 超限抛 LLMBudgetExceededError; 已完成章节已落盘, 可 resume
+        final = await graph.ainvoke(initial, config=config)
     return final["plan"], final["scripts"]

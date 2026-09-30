@@ -121,3 +121,35 @@ def test_fatal_llm_error_with_openai_shim(monkeypatch: pytest.MonkeyPatch):
     fake_mod.AuthenticationError = _FakeAuthError
     monkeypatch.setitem(sys.modules, "openai", fake_mod)
     assert _fatal_llm_error(_FakeAuthError("401")) is True
+
+
+# ---------- 红线闸门: 回退解析结果同样重扫 ----------
+
+REDLINE = '{"name": "跟着学三天包过"}'
+
+
+async def test_invoke_text_redline_gate():
+    from interview_video.chains._invoke import RedlineGateError
+
+    llm = fake_chat_model([REDLINE])
+    with pytest.raises(RedlineGateError) as excinfo:
+        await invoke_text(PROMPT, llm, {"x": "测试"}, _parse, stage="t")
+    assert "包过承诺" in str(excinfo.value)
+
+
+async def test_invoke_structured_local_reparse_redline_gate():
+    """结构化桩 raw 可本地解析但命中红线 → 不得绕过闸门。"""
+    stub = _StubStructuredLLM(bad_text=REDLINE)
+    with pytest.raises(ValueError, match="红线"):
+        await invoke_structured(PROMPT, stub, {"x": "测试"}, _Item, _parse, stage="t")
+
+
+async def test_invoke_structured_boundary_fallback_redline_gate():
+    """enforce_boundary 因红线失败后, fallback_parser 救回的结果也必须拦截。"""
+    from interview_video.boundary import BoundaryViolationError
+
+    llm = fake_chat_model([REDLINE, REDLINE])
+    with pytest.raises(ValueError, match="红线") as excinfo:
+        await invoke_structured(PROMPT, llm, {"x": "测试"}, _Item, _parse, stage="t")
+    assert isinstance(excinfo.value.__cause__, BoundaryViolationError)
+    assert any(v.category == "redline" for v in excinfo.value.__cause__.violations)

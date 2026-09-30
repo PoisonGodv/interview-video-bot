@@ -965,7 +965,9 @@ async def enforce_boundary(
                 caller, repair_messages, temperature=repair_temperature, **kwargs
             )
         except Exception as exc:
-            if _fatal_llm_error(exc):
+            from .llm import LLMBudgetExceededError, LLMTruncatedError
+
+            if _fatal_llm_error(exc) or isinstance(exc, (LLMTruncatedError, LLMBudgetExceededError)):
                 raise
             logger.warning("自修复重问调用未完成(%s: %s)，退出修复循环", type(exc).__name__, exc)
             break
