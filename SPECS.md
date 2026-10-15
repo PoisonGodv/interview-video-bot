@@ -6,7 +6,7 @@
 
 ## 0. 环境
 
-- 项目根: `/Users/liningwei/Selfproj/interview-video-bot`
+- 项目根: 仓库根目录(`interview-video-bot/`)
 - Python ≥3.10(本机 3.14, CI 跑 3.10/3.11/3.12), venv 在 `.venv/`, `pip install -e ".[dev]"` / `uv sync --extra dev`
 - 运行时依赖: httpx / edge-tts / jinja2 / playwright / Pillow / typer / rich / pydantic(-settings) /
   bilibili-api-python / fastapi / uvicorn; **不依赖任何 LLM 编排框架**
